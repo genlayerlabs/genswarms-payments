@@ -28,4 +28,9 @@ Check.check(f, "RPC error object becomes {:error, _}",
 Check.check(f, "curl failure becomes {:error, _}",
   match?({:error, _}, Rpc.call(chain, "eth_blockNumber", [], runner: fn _, _ -> {:error, :curl_28} end)))
 
+not_json_runner = fn _, _ -> {:ok, "This request to https://mainnet.base.org/v2/SECRETKEY failed"} end
+{:error, {:not_json, slice}} = Rpc.call(chain, "eth_blockNumber", [], runner: not_json_runner)
+Check.check(f, "error output scrubs URL (no SECRETKEY in :not_json slice)",
+  not String.contains?(slice, "SECRETKEY"))
+
 Check.finish(f)

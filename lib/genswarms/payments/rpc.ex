@@ -16,19 +16,22 @@ defmodule Genswarms.Payments.Rpc do
     config_path =
       Path.join(System.tmp_dir!(), "gsp-rpc-#{:erlang.unique_integer([:positive])}.conf")
 
-    File.write!(config_path, ~s(url = "#{chain.rpc_url}"\n))
-    File.chmod!(config_path, 0o600)
-
-    args = [
-      "--config", config_path, "--silent", "--show-error", "--fail-with-body",
-      "--max-time", Integer.to_string(timeout_s),
-      "-H", "content-type: application/json",
-      "-X", "POST", "--data", body
-    ]
-
     try do
+      File.touch!(config_path)
+      File.chmod!(config_path, 0o600)
+      File.write!(config_path, ~s(url = "#{chain.rpc_url}"\n))
+
+      args = [
+        "--config", config_path, "--silent", "--show-error", "--fail-with-body",
+        "--max-time", Integer.to_string(timeout_s),
+        "-H", "content-type: application/json",
+        "-X", "POST", "--data", body
+      ]
+
       case runner.(args, config_path) do
-        {:ok, out} -> parse(out)
+        {:ok, out} ->
+          scrubbed = String.replace(out, chain.rpc_url, "[rpc-url]")
+          parse(scrubbed)
         {:error, why} -> {:error, why}
       end
     after
@@ -36,10 +39,21 @@ defmodule Genswarms.Payments.Rpc do
     end
   end
 
-  defp run_curl(args, _config_path) do
+  defp run_curl(args, config_path) do
     case System.cmd("curl", args, stderr_to_stdout: true) do
-      {out, 0} -> {:ok, out}
-      {out, code} -> {:error, {:curl, code, String.slice(out, 0, 200)}}
+      {out, 0} ->
+        {:ok, out}
+
+      {out, code} ->
+        # Read the URL from the config to scrub it from error output
+        rpc_url = File.read!(config_path) |> String.split("\n") |> Enum.find_value(fn line ->
+          case String.split(line, " = ") do
+            [_key, value] -> String.trim(value, "\"")
+            _ -> nil
+          end
+        end)
+        scrubbed_out = if rpc_url, do: String.replace(out, rpc_url, "[rpc-url]"), else: out
+        {:error, {:curl, code, String.slice(scrubbed_out, 0, 200)}}
     end
   end
 
