@@ -62,6 +62,66 @@ defmodule Genswarms.Payments.HD do
     defp index58(unquote(c)), do: unquote(i)
   end
 
+  @doc """
+  Ethereum address for external-chain child `m/<xpub>/0/<index>` (BIP44 change
+  level 0). Non-hardened public derivation only — hardened is impossible
+  without the private key, reject loudly.
+  """
+  @spec address(map(), non_neg_integer()) :: {:ok, String.t()} | {:error, atom()}
+  def address(%{chain_code: _, pubkey: _} = parsed, index)
+      when is_integer(index) and index >= 0 do
+    if index >= 0x80000000 do
+      {:error, :hardened_index}
+    else
+      with {:ok, change} <- ckd_pub(parsed, 0),
+           {:ok, child} <- ckd_pub(change, index) do
+        {:ok, eth_address(child.pubkey)}
+      end
+    end
+  end
+
+  # CKDpub: I = HMAC-SHA512(chain_code, serP(K_par) || ser32(i));
+  # child K = point(IL) + K_par  (BIP32)
+  defp ckd_pub(%{chain_code: cc, pubkey: pubkey}, i) do
+    <<il::binary-32, ir::binary-32>> =
+      :crypto.mac(:hmac, :sha512, cc, pubkey <> <<i::32>>)
+
+    parent = Curvy.Key.from_pubkey(pubkey)
+    tweak = Curvy.Key.from_privkey(il)
+    child_point = Curvy.Point.add(tweak.point, parent.point)
+
+    child_pub =
+      %Curvy.Key{point: child_point} |> Curvy.Key.to_pubkey(compressed: true)
+
+    {:ok, %{chain_code: ir, pubkey: child_pub}}
+  end
+
+  defp eth_address(compressed_pubkey) do
+    # uncompress via curvy, drop the 0x04 prefix, keccak, last 20 bytes
+    <<4, xy::binary-64>> =
+      compressed_pubkey
+      |> Curvy.Key.from_pubkey()
+      |> Curvy.Key.to_pubkey(compressed: false)
+
+    <<_::binary-12, raw::binary-20>> = Keccak.hash_256(xy)
+    eip55(raw)
+  end
+
+  defp eip55(<<raw::binary-20>>) do
+    hex = Base.encode16(raw, case: :lower)
+    hash = Keccak.hash_256(hex) |> Base.encode16(case: :lower)
+
+    cased =
+      hex
+      |> String.graphemes()
+      |> Enum.zip(String.graphemes(hash))
+      |> Enum.map_join(fn {c, h} ->
+        if h >= "8", do: String.upcase(c), else: c
+      end)
+
+    "0x" <> cased
+  end
+
   # keep Keccak referenced from Task 3 on (used by Task 4)
   @doc false
   def keccak_mod, do: Keccak
