@@ -212,12 +212,16 @@ of a hex string) can't crash the tick — that one chain's round is skipped
 (cursor untouched, retried next `tick`) while every other configured chain
 still proceeds. `Genswarms.Payments.Rpc` shells out to `curl` (the engine
 has no `:inets`); the RPC URL — which may embed a provider API key — rides
-a chmod-600 `--config` tempfile, never argv where `ps` would expose it, and
-is scrubbed from both successful and error output before it's logged.
-`init/1` also rejects (raises `ArgumentError`) any chain's `rpc_url`
-containing a quote, backslash, or control character, since the URL is
-written into that tempfile as `url = "#{rpc_url}"` and an unsanitized value
-could close the string early and inject config directives.
+a chmod-600, exclusively-created `--config` tempfile (random suffix, never
+reused), never argv where `ps` would expose it, and is scrubbed from both
+successful and error output (unified in `call/4`, not reparsed out of the
+config file) before it's logged. `init/1` requires `rpc_url` on every
+configured chain (raises `ArgumentError` if the key is missing, rather than
+booting and hitting a `KeyError` the first time a poll round runs) and also
+rejects (raises `ArgumentError`) any chain's `rpc_url` containing a quote,
+backslash, or control character, since the URL is written into that
+tempfile as `url = "#{rpc_url}"` and an unsanitized value could close the
+string early and inject config directives.
 
 ## Method behaviour
 

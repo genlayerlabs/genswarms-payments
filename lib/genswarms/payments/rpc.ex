@@ -4,6 +4,14 @@ defmodule Genswarms.Payments.Rpc do
   provider API key, so it rides a chmod-600 `--config` tempfile — never argv,
   where `ps` would expose it. The runner seam (`runner: fn args, config_path`)
   keeps checks off the network.
+
+  Scrubbing `chain.rpc_url` out of curl's output is unified HERE, in
+  `call/4`, for BOTH the `{:ok, out}` and `{:error, _}` runner return paths —
+  `chain` (and thus `rpc_url`) is already in scope here, so there is no need
+  for `run_curl/2` to reparse it back out of the config tempfile (a fragile
+  `" = "` string split that broke on any URL containing that substring).
+  `run_curl/2` returns its raw, unscrubbed output; `call/4` scrubs before
+  `parse/1` sees it (success path) or before returning it (error path).
   """
   require Logger
 
@@ -14,12 +22,16 @@ defmodule Genswarms.Payments.Rpc do
     body = Jason.encode!(%{jsonrpc: "2.0", id: 1, method: method, params: params})
 
     config_path =
-      Path.join(System.tmp_dir!(), "gsp-rpc-#{:erlang.unique_integer([:positive])}.conf")
+      Path.join(
+        System.tmp_dir!(),
+        "gsp-rpc-" <> (:crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)) <> ".conf"
+      )
 
     try do
-      File.touch!(config_path)
+      fd = File.open!(config_path, [:write, :exclusive])
       File.chmod!(config_path, 0o600)
-      File.write!(config_path, ~s(url = "#{chain.rpc_url}"\n))
+      IO.binwrite(fd, ~s(url = "#{chain.rpc_url}"\n))
+      File.close(fd)
 
       args = [
         "--config", config_path, "--silent", "--show-error", "--fail-with-body",
@@ -30,32 +42,35 @@ defmodule Genswarms.Payments.Rpc do
 
       case runner.(args, config_path) do
         {:ok, out} ->
-          scrubbed = String.replace(out, chain.rpc_url, "[rpc-url]")
-          parse(scrubbed)
-        {:error, why} -> {:error, why}
+          parse(scrub(out, chain.rpc_url))
+
+        {:error, why} ->
+          {:error, scrub_error(why, chain.rpc_url)}
       end
     after
       File.rm(config_path)
     end
   end
 
-  defp run_curl(args, config_path) do
+  defp run_curl(args, _config_path) do
     case System.cmd("curl", args, stderr_to_stdout: true) do
-      {out, 0} ->
-        {:ok, out}
-
-      {out, code} ->
-        # Read the URL from the config to scrub it from error output
-        rpc_url = File.read!(config_path) |> String.split("\n") |> Enum.find_value(fn line ->
-          case String.split(line, " = ") do
-            [_key, value] -> String.trim(value, "\"")
-            _ -> nil
-          end
-        end)
-        scrubbed_out = if rpc_url, do: String.replace(out, rpc_url, "[rpc-url]"), else: out
-        {:error, {:curl, code, String.slice(scrubbed_out, 0, 200)}}
+      {out, 0} -> {:ok, out}
+      {out, code} -> {:error, {:curl, code, out}}
     end
   end
+
+  defp scrub(str, url) when is_binary(str), do: String.replace(str, url, "[rpc-url]")
+  defp scrub(other, _url), do: other
+
+  # Only the {:curl, code, msg} shape run_curl/2 itself emits carries a
+  # string that could contain the URL — an injected custom runner may return
+  # any other opaque {:error, why} term (e.g. a plain atom), which is left
+  # untouched since there's nothing scrubbable in it.
+  defp scrub_error({:curl, code, msg}, url) when is_binary(msg) do
+    {:curl, code, scrub(msg, url) |> String.slice(0, 200)}
+  end
+
+  defp scrub_error(other, _url), do: other
 
   defp parse(out) do
     case Jason.decode(out) do

@@ -33,4 +33,16 @@ not_json_runner = fn _, _ -> {:ok, "This request to https://mainnet.base.org/v2/
 Check.check(f, "error output scrubs URL (no SECRETKEY in :not_json slice)",
   not String.contains?(slice, "SECRETKEY"))
 
+# ── 3a: scrubbing is unified in call/4 (BOTH the {:ok, out} and {:error, _}
+# runner paths), not reparsed out of the config file inside run_curl —
+# exercise the shape run_curl itself returns for a nonzero curl exit.
+curl_exit_runner = fn _args, _config_path ->
+  {:error, {:curl, 22, "curl: (22) https://mainnet.base.org/v2/SECRETKEY returned 500"}}
+end
+
+{:error, {:curl, 22, curl_exit_msg}} = Rpc.call(chain, "eth_blockNumber", [], runner: curl_exit_runner)
+
+Check.check(f, "curl-exit-nonzero error tuple has the rpc_url scrubbed",
+  is_binary(curl_exit_msg) and not String.contains?(curl_exit_msg, "SECRETKEY"))
+
 Check.finish(f)

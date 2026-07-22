@@ -150,19 +150,27 @@ defmodule Genswarms.Payments do
   # tempfile as `url = "#{rpc_url}"` — a quote lets it close that value
   # early and inject arbitrary curl config directives; a backslash or other
   # control character is equally unsanitary in that file format. Reject at
-  # init rather than let it reach curl.
-  defp validate_rpc_url!(%{rpc_url: url}) do
-    url = to_string(url)
+  # init rather than let it reach curl. rpc_url is REQUIRED on every chain —
+  # a chain missing the key entirely used to silently pass validation and
+  # only blow up later at runtime with a KeyError the first time Rpc.call
+  # tried chain.rpc_url; that's now an ArgumentError at init instead.
+  defp validate_rpc_url!(chain) do
+    case Map.fetch(chain, :rpc_url) do
+      {:ok, url} ->
+        url = to_string(url)
 
-    if String.contains?(url, ["\"", "\\"]) or String.match?(url, ~r/[\x00-\x1f\x7f]/) do
-      raise ArgumentError,
-            "payments: rpc_url contains a quote, backslash, or control character — refusing (curl --config injection guard)"
+        if String.contains?(url, ["\"", "\\"]) or String.match?(url, ~r/[\x00-\x1f\x7f]/) do
+          raise ArgumentError,
+                "payments: rpc_url contains a quote, backslash, or control character — refusing (curl --config injection guard)"
+        end
+
+        :ok
+
+      :error ->
+        raise ArgumentError,
+              "payments: chain #{inspect(Map.get(chain, :name, chain))} is missing required rpc_url"
     end
-
-    :ok
   end
-
-  defp validate_rpc_url!(_chain), do: :ok
 
   def handle_message(from, content, state) do
     case Jason.decode(content) do

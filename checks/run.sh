@@ -4,12 +4,14 @@ set -e
 cd "$(dirname "$0")/.."
 fail=0
 for f in checks/payments_*.exs; do
-  if mix run "$f" >/tmp/payments-check.out 2>&1; then
+  out=$(mktemp /tmp/payments-check.XXXXXX)
+  if mix run "$f" >"$out" 2>&1; then
     echo "ok   $f"
   else
     echo "FAIL $f"
-    tail -20 /tmp/payments-check.out
+    tail -20 "$out"
     fail=1
   fi
+  rm -f "$out"
 done
 exit $fail

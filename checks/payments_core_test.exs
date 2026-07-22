@@ -157,4 +157,20 @@ clean_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://m
 Check.check(f, "a clean rpc_url boots without raising",
   match?(%{}, Payments.init(clean_rpc_config)))
 
+# 3b: a chain missing rpc_url entirely must raise at init (ArgumentError),
+# not silently boot and blow up later at runtime with a KeyError the first
+# time Rpc.call tries chain.rpc_url.
+missing_rpc_config = Map.put(config, :chains, [%{name: "base", usdc_contract: "0x0"}])
+
+Check.check(f, "a chain missing rpc_url entirely raises ArgumentError at init",
+  match?(
+    {:error, %ArgumentError{}},
+    (try do
+       Payments.init(missing_rpc_config)
+       {:ok, :did_not_raise}
+     rescue
+       e -> {:error, e}
+     end)
+  ))
+
 Check.finish(f)
