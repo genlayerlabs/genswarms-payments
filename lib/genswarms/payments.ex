@@ -39,7 +39,7 @@ defmodule Genswarms.Payments do
       store_mod: store_mod,
       deliver_fn: Map.get(config, :deliver_fn, default_deliver_fn(Map.get(config, :swarm_name, "swarm"))),
       now_fn: Map.get(config, :now_fn, &DateTime.utc_now/0),
-      rpc_fn: Map.get(config, :rpc_fn),
+      rpc_fn: Map.get(config, :rpc_fn, &Genswarms.Payments.Rpc.call/3),
       chains: Map.get(config, :chains, []),
       methods: Map.get(config, :methods, [Genswarms.Payments.Usdc]),
       method_states: %{},
@@ -55,6 +55,9 @@ defmodule Genswarms.Payments do
     case Jason.decode(content) do
       {:ok, %{"action" => "health"}} ->
         {:reply, Jason.encode!(%{ok: true, bindings: map_size(state.bindings)}), state}
+
+      {:ok, %{"action" => "tick"}} ->
+        if trusted?(from, state), do: {:noreply, poll(state)}, else: {:noreply, state}
 
       {:ok, %{"action" => action} = msg} when action in ~w(deposit_address payment_status ingest_event) ->
         if trusted?(from, state) do
