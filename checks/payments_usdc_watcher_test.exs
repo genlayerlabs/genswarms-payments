@@ -85,6 +85,7 @@ Check.check(f, "settled exactly the one confirmed payment to a bound address",
 row = hd(ScanStore.rows())
 Check.check(f, "amount converted at 6 decimals", Decimal.equal?(row.amount_usd, Decimal.new("5")))
 Check.check(f, "beneficiary resolved from binding", row.beneficiary == "budget:abc")
+Check.check(f, "method is usdc_<chain>", row.method == "usdc_base")
 Check.check(f, "idempotency key is chain:tx:logIndex", row.idempotency_key == "base:0xT1:0")
 Check.check(f, "cursor advanced to safe_to (190), NOT latest",
   ScanStore.cursor("base") == 190)
@@ -104,6 +105,20 @@ Check.check(f, "getLogs filters on the USDC contract + transfer topic",
   Enum.all?(get_logs, fn p ->
     p["address"] == "0xCONTRACT" and hd(p["topics"]) == transfer_sig
   end))
+
+# a log from an unexpected contract address must never settle, even if
+# otherwise valid (right transfer topic, right bound to-address, confirmed
+# block) — a legit log in the same batch must still settle
+ScanStore.reset()
+fake_log = %{mk_log.(addr, 150, "0xFAKE", 0) | "address" => "0xEVILCONTRACT"}
+legit_log = mk_log.(addr, 150, "0xLEGIT", 0)
+
+state_evil = %{state0 | rpc_fn: canned.([fake_log, legit_log], 200)}
+_state_evil = Payments.poll(state_evil)
+
+Check.check(f, "log from an unexpected contract address is rejected while a legit log in the same batch settles",
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xLEGIT:0")) and
+    not Enum.any?(ScanStore.rows(), &(&1.ref == "0xFAKE:0")))
 
 # RPC failure ⇒ cursor does not advance
 ScanStore.reset()

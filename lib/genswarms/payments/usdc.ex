@@ -87,9 +87,14 @@ defmodule Genswarms.Payments.Usdc do
         # Defense in depth: don't trust the RPC provider to have honored the
         # toBlock bound — a log at or beyond the reorg-risk edge must wait
         # for a later, deeper round even if it comes back in this response.
+        # Likewise don't trust the address filter — a misbehaving/compromised
+        # RPC could hand back a Transfer-shaped log from an unrelated
+        # contract; only settle logs actually emitted by the configured USDC
+        # contract.
         settlements =
           logs
           |> Enum.filter(&(hex_int(&1["blockNumber"]) <= to))
+          |> Enum.filter(&same_contract?(&1, chain))
           |> Enum.flat_map(&to_settlement(&1, chain, watched))
 
         {:ok, settlements, to}
@@ -120,6 +125,10 @@ defmodule Genswarms.Payments.Usdc do
         {:error, why} -> {:halt, {:error, why}}
       end
     end)
+  end
+
+  defp same_contract?(log, chain) do
+    String.downcase(log["address"] || "") == String.downcase(chain.usdc_contract)
   end
 
   defp to_settlement(log, chain, watched) do
