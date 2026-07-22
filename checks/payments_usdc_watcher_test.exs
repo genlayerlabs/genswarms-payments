@@ -172,4 +172,80 @@ get_logs_calls = Agent.get(rpc_log2, &Enum.count(&1, fn m -> m == "eth_getLogs" 
 Check.check(f, "address_chunk splits 3 bound addresses into 2 eth_getLogs calls",
   get_logs_calls == 2)
 
+# ── B2: one malformed RPC field must not crash the whole tick.
+
+# (i) a real-world provider quirk: eth_blockNumber returns {:ok, nil}. This
+# used to blow up hex_int/1 (no matching clause) and crash the poll round;
+# now the chain's scan is caught and skipped, cursor left untouched.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+null_block_rpc = fn _chain, method, _params ->
+  case method do
+    "eth_blockNumber" -> {:ok, nil}
+    "eth_getLogs" -> {:ok, []}
+  end
+end
+
+state_null = %{state0 | rpc_fn: null_block_rpc}
+
+result =
+  try do
+    Payments.poll(state_null)
+    :ok
+  rescue
+    e -> {:raised, e}
+  end
+
+Check.check(f, "eth_blockNumber returning {:ok, nil} doesn't crash poll", result == :ok)
+Check.check(f, "cursor untouched after a bad-shape RPC response",
+  ScanStore.cursor("base") == nil)
+
+# (ii) two chains: chain 1's RPC returns garbage (crashes hex_int), chain 2's
+# RPC works fine ⇒ chain 2's payment still settles this round.
+ScanStore.reset()
+
+state_two_chain =
+  Payments.init(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"],
+    namespace: "llm_quota",
+    store_mod: ScanStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn _, _, _ -> :ok end,
+    chains: [
+      %{name: "bad_chain", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+        confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000},
+      %{name: "good_chain", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+        confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000}
+    ],
+    rpc_fn: nil
+  })
+
+{:reply, jt, state_two_chain} =
+  Payments.handle_message("ingress",
+    Jason.encode!(%{action: "deposit_address", beneficiary: "budget:twochain"}), state_two_chain)
+addr_two = Jason.decode!(jt)["address"]
+
+good_log = mk_log.(addr_two, 150, "0xGOOD", 0)
+
+mixed_rpc = fn chain, method, _params ->
+  case {chain.name, method} do
+    {"bad_chain", "eth_blockNumber"} -> {:ok, :not_a_hex_string}
+    {"bad_chain", "eth_getLogs"} -> {:ok, []}
+    {"good_chain", "eth_blockNumber"} -> {:ok, "0xc8"}
+    {"good_chain", "eth_getLogs"} -> {:ok, [good_log]}
+  end
+end
+
+state_two_chain = %{state_two_chain | rpc_fn: mixed_rpc}
+_state_two_chain = Payments.poll(state_two_chain)
+
+Check.check(f, "a chain with a bad RPC shape is skipped while the other chain still settles",
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "good_chain:0xGOOD:0")) and
+    ScanStore.cursor("bad_chain") == nil)
+
 Check.finish(f)

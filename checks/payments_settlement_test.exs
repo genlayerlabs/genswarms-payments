@@ -112,4 +112,127 @@ ok_dev =
 Check.check(f, "dev mode (no store): settles once, memory-dedups the repeat",
   d1 == 1 and d2 == 0)
 
+# ── B1(i): multi-target delivery isolation — a raise on one target must not
+# block delivery to the other (a disclosed gap the review called out).
+{:ok, raise_flag} = Agent.start_link(fn -> true end)
+{:ok, delivered2} = Agent.start_link(fn -> [] end)
+
+isolating_deliver = fn target, from, _content ->
+  if target == "flaky" and Agent.get(raise_flag, & &1) do
+    raise "boom"
+  else
+    Agent.update(delivered2, &[{target, from} | &1])
+    :ok
+  end
+end
+
+state_iso =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["flaky", "reliable"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: isolating_deliver
+  })
+
+s_iso = %{s | idempotency_key: "iso:1", ref: "iso:1"}
+{n_iso, state_iso} = Payments.settle([s_iso], state_iso)
+
+Check.check(f, "one target raising doesn't block delivery to the OTHER target",
+  n_iso == 1 and Agent.get(delivered2, & &1) == [{"reliable", :payments}])
+Check.check(f, "the raising target is queued in undelivered for retry",
+  Map.has_key?(state_iso.undelivered, "iso:1") and
+    state_iso.undelivered["iso:1"].targets == ["flaky"])
+
+# ── B1(ii): a GenServer-call-timeout-shaped EXIT must not crash the tick
+# either, and the delivery is retried (and cleared) on the next poll.
+exiting_deliver = fn target, _from, _content ->
+  if target == "flaky2", do: exit(:timeout), else: :ok
+end
+
+state_exit =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["flaky2"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: exiting_deliver
+  })
+
+s_exit = %{s | idempotency_key: "exitk:1", ref: "exitk:1"}
+{n_exit, state_exit} = Payments.settle([s_exit], state_exit)
+
+Check.check(f, "a delivery EXIT is caught (no crash); settlement still counts; entry queued",
+  n_exit == 1 and Map.has_key?(state_exit.undelivered, "exitk:1"))
+
+{:ok, retried} = Agent.start_link(fn -> [] end)
+
+working_deliver = fn target, from, _content ->
+  Agent.update(retried, &[{target, from} | &1])
+  :ok
+end
+
+state_exit = %{state_exit | deliver_fn: working_deliver}
+state_exit = Payments.poll(state_exit)
+
+Check.check(f, "poll retries undelivered entries and clears them once delivered",
+  Agent.get(retried, & &1) == [{"flaky2", :payments}] and state_exit.undelivered == %{})
+
+# ── B3: record-write-only isolation (disclosed gap) — payment_seen? healthy,
+# record_payment fails ⇒ held; heals ⇒ the SAME settlement settles.
+defmodule WriteOnlyDownStore do
+  def reset, do: :persistent_term.put({__MODULE__, :d}, %{seen: MapSet.new(), rows: [], down: true})
+  defp d, do: :persistent_term.get({__MODULE__, :d})
+  defp put(k, v), do: :persistent_term.put({__MODULE__, :d}, Map.put(d(), k, v))
+  def down!(flag), do: put(:down, flag)
+
+  def payment_seen?(key), do: {:ok, MapSet.member?(d().seen, key)}
+
+  def record_payment(row) do
+    if d().down do
+      {:error, :db_down}
+    else
+      put(:seen, MapSet.put(d().seen, row.idempotency_key))
+      put(:rows, [row | d().rows])
+      :ok
+    end
+  end
+
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_c), do: {:ok, nil}
+  def put_last_scanned_block(_c, _n), do: :ok
+  def rows, do: d().rows
+end
+
+WriteOnlyDownStore.reset()
+{:ok, delivered3} = Agent.start_link(fn -> [] end)
+
+state_wo =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["t"],
+    store_mod: WriteOnlyDownStore,
+    auto_tick: false,
+    deliver_fn: fn t, from, _c ->
+      Agent.update(delivered3, &[{t, from} | &1])
+      :ok
+    end
+  })
+
+s_wo = %{s | idempotency_key: "wo:1", ref: "wo:1"}
+{n_wo, state_wo} = Payments.settle([s_wo], state_wo)
+
+Check.check(f, "payment_seen? ok but record_payment fails ⇒ held (0 settled, 0 delivered)",
+  n_wo == 0 and Agent.get(delivered3, & &1) == [])
+
+WriteOnlyDownStore.down!(false)
+{n_wo2, _state_wo} = Payments.settle([s_wo], state_wo)
+
+Check.check(f, "after record_payment heals, the SAME settlement settles",
+  n_wo2 == 1 and length(WriteOnlyDownStore.rows()) == 1)
+
 Check.finish(f)

@@ -55,6 +55,7 @@ defmodule Genswarms.Payments do
       bindings: bindings,
       next_index: next_index,
       seen_keys: MapSet.new(),
+      undelivered: %{},
       cursor_mirror: %{},
       degraded_boot: degraded_boot?
     }
@@ -230,20 +231,80 @@ defmodule Genswarms.Payments do
             at: DateTime.to_iso8601(row.at)
           })
 
-        Enum.each(state.targets, fn target ->
-          try do
-            state.deliver_fn.(target, state.name, content)
-          rescue
-            e -> Logger.error("payments: delivery to #{target} raised: #{Exception.message(e)}")
-          end
-        end)
+        failed_targets =
+          Enum.filter(state.targets, fn target ->
+            deliver_one(state.deliver_fn, target, state.name, content) == :error
+          end)
 
-        {:settled, %{state | seen_keys: MapSet.put(state.seen_keys, key)}}
+        state = %{state | seen_keys: MapSet.put(state.seen_keys, key)}
+
+        state =
+          if failed_targets == [] do
+            state
+          else
+            Logger.error(
+              "payments: #{key} undelivered to #{inspect(failed_targets)} — queued for retry next tick"
+            )
+
+            %{
+              state
+              | undelivered: Map.put(state.undelivered, key, %{targets: failed_targets, content: content})
+            }
+          end
+
+        {:settled, state}
 
       {:error, why} ->
         Logger.error("payments: record_payment failed (#{inspect(why)}) — FAIL CLOSED, holding #{key}")
         {:skipped, state}
     end
+  end
+
+  # Recorded (settled = durable) is never undone by a delivery failure — this
+  # is at-least-once delivery for transient per-target failures. A per-target
+  # `catch kind, reason` (not `rescue`) is what actually stops these from
+  # escaping record_and_deliver: a `raise` surfaces as :error, but a
+  # GenServer-call-timeout-shaped failure surfaces as an EXIT, which `rescue`
+  # never catches — it would have escaped the object entirely, dropping the
+  # delivery forever (recorded but never delivered; dedup blocks
+  # re-presentation). The failed target is queued and retried at the start of
+  # every subsequent poll until it succeeds. This is NOT at-least-once across
+  # a process crash inside this window — if the process dies between
+  # record_payment and reaching this point the queued retry itself is lost
+  # with it (see README's delivery section for the honest guarantee).
+  defp deliver_one(deliver_fn, target, from, content) do
+    try do
+      deliver_fn.(target, from, content)
+      :ok
+    catch
+      kind, reason ->
+        Logger.error(
+          "payments: delivery to #{target} failed (#{kind}: #{inspect(reason)}) — will retry next tick"
+        )
+
+        :error
+    end
+  end
+
+  # Runs at the start of every poll round (never during degraded_boot — see
+  # poll/1) so a delivery queued by a previous round's failure gets another
+  # shot before this round's own settlements are attempted.
+  defp retry_undelivered(state) do
+    Enum.reduce(state.undelivered, state, fn {key, %{targets: targets, content: content}}, st ->
+      still_failed =
+        Enum.filter(targets, fn target ->
+          deliver_one(st.deliver_fn, target, st.name, content) == :error
+        end)
+
+      undelivered =
+        if still_failed == [] do
+          Map.delete(st.undelivered, key)
+        else
+          Map.put(st.undelivered, key, %{targets: still_failed, content: content})
+        end
+
+      %{st | undelivered: undelivered}
+    end)
   end
 
   @doc """
@@ -254,7 +315,7 @@ defmodule Genswarms.Payments do
   A no-op during `degraded_boot` (init couldn't establish the true watched
   set — see `init_bindings/1` — so scanning would silently miss deposits and
   advance nobody's cursor; only a restart against a recovered store clears
-  it).
+  it). Otherwise starts by retrying any previously-undelivered targets.
   """
   def poll(%{degraded_boot: true} = state) do
     Logger.error(
@@ -265,6 +326,8 @@ defmodule Genswarms.Payments do
   end
 
   def poll(state) do
+    state = retry_undelivered(state)
+
     core = %{
       chains: state.chains,
       rpc_fn: state.rpc_fn,

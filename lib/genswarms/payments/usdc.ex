@@ -28,7 +28,7 @@ defmodule Genswarms.Payments.Usdc do
 
     results =
       Enum.map(core.chains, fn chain ->
-        case scan_chain(chain, watched, core) do
+        case safe_scan_chain(chain, watched, core) do
           {:ok, settlements, safe_to} ->
             {chain, settlements, safe_to}
 
@@ -42,6 +42,20 @@ defmodule Genswarms.Payments.Usdc do
       end)
 
     {results, method_state}
+  end
+
+  # A misbehaving/nonconforming RPC provider can hand back a field this
+  # module's hex parsing can't make sense of (e.g. a real-world provider
+  # returning {:ok, nil} for eth_blockNumber instead of a hex string). One
+  # chain's malformed response must not crash the whole tick and take every
+  # other configured chain's round down with it — catch it here so only THIS
+  # chain's scan is skipped (cursor untouched, retried next tick).
+  defp safe_scan_chain(chain, watched, core) do
+    try do
+      scan_chain(chain, watched, core)
+    rescue
+      e -> {:error, {:bad_rpc_shape, Exception.message(e)}}
+    end
   end
 
   # Returns {:ok, settlements, safe_to_block} | {:error, why}. The CORE
