@@ -5,6 +5,15 @@ defmodule Genswarms.Payments do
   `payment_confirmed` delivery to allowlisted targets. Modalities implement
   `Genswarms.Payments.Method`; v1 ships USDC in-tree. Trust is fail-closed:
   no trusted_sources ⇒ nobody can act; no targets ⇒ nobody is credited.
+
+  Boot is fail-FLAGGED, not fail-crashed: if a configured store's
+  `list_address_bindings/0` errors or raises, `init/1` cannot know the true
+  watched-address set or the next free HD index, so it sets `degraded_boot:
+  true` rather than guessing. While degraded, `poll/1` is a no-op and
+  `deposit_address` is refused — it self-heals only via a restart (a
+  transient DB blip at pod boot shouldn't crash-loop the object, but it also
+  must never scan an empty watched set or hand out a reused address). See
+  `init_bindings/1`.
   """
 
   require Logger
@@ -18,13 +27,11 @@ defmodule Genswarms.Payments do
       end
 
     store_mod = Map.get(config, :store_mod)
+    validate_store_coherence!(store_mod)
 
-    bindings =
-      store_result(store_mod, :list_address_bindings, [], {:ok, []})
-      |> case do
-        {:ok, rows} -> Map.new(rows, fn b -> {b.beneficiary, Map.delete(b, :beneficiary)} end)
-        _ -> %{}
-      end
+    chains = Map.get(config, :chains, [])
+
+    {bindings, degraded_boot?} = init_bindings(store_mod)
 
     next_index =
       bindings |> Map.values() |> Enum.map(& &1.index) |> Enum.max(fn -> -1 end) |> Kernel.+(1)
@@ -40,21 +47,106 @@ defmodule Genswarms.Payments do
       deliver_fn: Map.get(config, :deliver_fn, default_deliver_fn(Map.get(config, :swarm_name, "swarm"))),
       now_fn: Map.get(config, :now_fn, &DateTime.utc_now/0),
       rpc_fn: Map.get(config, :rpc_fn, &Genswarms.Payments.Rpc.call/3),
-      chains: Map.get(config, :chains, []),
+      chains: chains,
       methods: Map.get(config, :methods, [Genswarms.Payments.Usdc]),
       method_states: %{},
       auto_tick: Map.get(config, :auto_tick, true),
       poll_interval_ms: Map.get(config, :poll_interval_ms, 60_000),
       bindings: bindings,
       next_index: next_index,
-      seen_keys: MapSet.new()
+      seen_keys: MapSet.new(),
+      cursor_mirror: %{},
+      degraded_boot: degraded_boot?
     }
+  end
+
+  # Boot-time binding load. FAIL-FLAGGED (not raised): when a CONFIGURED store's
+  # list_address_bindings errors or raises, we don't know the true watched set
+  # or the true next HD index — polling over an empty set would silently drop
+  # every in-flight deposit, and minting from index 0 would reuse an address
+  # already handed out. We refuse to guess: bindings come back empty and
+  # degraded_boot is set, which fail-closes poll/1 and deposit_address until a
+  # restart re-attempts boot against a (hopefully recovered) store. We chose
+  # flag-over-raise so a transient DB blip at pod boot doesn't crash-loop the
+  # object — see Store's moduledoc.
+  defp init_bindings(nil), do: {%{}, false}
+
+  defp init_bindings(mod) do
+    Code.ensure_loaded(mod)
+
+    if function_exported?(mod, :list_address_bindings, 0) do
+      try do
+        case apply(mod, :list_address_bindings, []) do
+          {:ok, rows} ->
+            {Map.new(rows, fn b -> {b.beneficiary, Map.delete(b, :beneficiary)} end), false}
+
+          {:error, why} ->
+            Logger.error(
+              "payments: list_address_bindings failed at boot (#{inspect(why)}) — DEGRADED BOOT: polling and allocation refused until restart"
+            )
+
+            {%{}, true}
+        end
+      rescue
+        e ->
+          Logger.error(
+            "payments: list_address_bindings raised at boot (#{Exception.message(e)}) — DEGRADED BOOT: polling and allocation refused until restart"
+          )
+
+          {%{}, true}
+      end
+    else
+      {%{}, false}
+    end
+  end
+
+  # Init-time coherence gate: a store that implements only HALF of a callback
+  # group is worse than one that implements none of it — with only
+  # put_address_binding (no list_address_bindings) every restart forgets the
+  # watched set and reuses HD indices already handed out; with only
+  # payment_seen? (no record_payment) every settlement dedup-checks against a
+  # ledger nothing ever writes to, i.e. it always looks unseen ⇒ double-credit.
+  # list_payments is read-only reporting, not part of either safety group.
+  defp validate_store_coherence!(nil), do: :ok
+
+  defp validate_store_coherence!(mod) do
+    Code.ensure_loaded(mod)
+    validate_group!(mod, [{:put_address_binding, 1}, {:list_address_bindings, 0}])
+
+    validate_group!(mod, [
+      {:payment_seen?, 1},
+      {:record_payment, 1},
+      {:get_last_scanned_block, 1},
+      {:put_last_scanned_block, 2}
+    ])
+
+    :ok
+  end
+
+  defp validate_group!(mod, funs) do
+    exported? = fn {f, a} -> function_exported?(mod, f, a) end
+
+    case funs |> Enum.map(exported?) |> Enum.uniq() do
+      [_all_same] ->
+        :ok
+
+      _mixed ->
+        names = Enum.map_join(funs, ", ", fn {f, a} -> "#{f}/#{a}" end)
+
+        raise ArgumentError,
+              "payments: store #{inspect(mod)} implements only part of the callback group [#{names}] — implement all of them or none (partial coverage silently causes address reuse or double-credit)"
+    end
   end
 
   def handle_message(from, content, state) do
     case Jason.decode(content) do
       {:ok, %{"action" => "health"}} ->
-        {:reply, Jason.encode!(%{ok: true, bindings: map_size(state.bindings)}), state}
+        {:reply,
+         Jason.encode!(%{
+           ok: true,
+           bindings: map_size(state.bindings),
+           degraded_boot: state.degraded_boot
+         }), state}
 
       {:ok, %{"action" => "tick"}} ->
         if trusted?(from, state), do: {:noreply, poll(state)}, else: {:noreply, state}
@@ -159,14 +251,30 @@ defmodule Genswarms.Payments do
   chain's cursor advances ONLY if all of that chain's settlements settled
   (skipped-by-dedup counts as settled; skipped-by-store-failure does not —
   the fail-closed rule keeps the cursor back so the next round re-presents).
+  A no-op during `degraded_boot` (init couldn't establish the true watched
+  set — see `init_bindings/1` — so scanning would silently miss deposits and
+  advance nobody's cursor; only a restart against a recovered store clears
+  it).
   """
+  def poll(%{degraded_boot: true} = state) do
+    Logger.error(
+      "payments: poll skipped — degraded_boot from a store failure at init; restart once the store recovers"
+    )
+
+    state
+  end
+
   def poll(state) do
     core = %{
       chains: state.chains,
       rpc_fn: state.rpc_fn,
       bindings: state.bindings,
       get_last_scanned_block: fn chain_name ->
-        store_result(state.store_mod, :get_last_scanned_block, [chain_name], {:ok, nil})
+        if state.store_mod && function_exported?(state.store_mod, :get_last_scanned_block, 1) do
+          store_result(state.store_mod, :get_last_scanned_block, [chain_name], {:ok, nil})
+        else
+          {:ok, Map.get(state.cursor_mirror, chain_name)}
+        end
       end
     }
 
@@ -189,13 +297,19 @@ defmodule Genswarms.Payments do
   # something to advance to (safe_to != nil) AND settle/2 got every one of
   # this chain's settlements durably recorded (or deduped). A settlement
   # STILL held after settle/2 (its idempotency_key missing from seen_keys)
-  # means the store failed on it — fail closed, leave the cursor put.
+  # means the store failed on it — fail closed, leave the cursor put. The
+  # in-memory mirror is updated on this same success path UNCONDITIONALLY —
+  # it stands in for durable storage whenever the store is absent or doesn't
+  # implement the cursor callbacks, so dev mode doesn't rescan the same
+  # window forever.
   defp apply_chain_result({chain, settlements, safe_to}, state) do
     {_n, new_state} = settle(settlements, state)
 
     held? = Enum.any?(settlements, &(not MapSet.member?(new_state.seen_keys, &1.idempotency_key)))
 
     if safe_to != nil and not held? do
+      new_state = %{new_state | cursor_mirror: Map.put(new_state.cursor_mirror, chain.name, safe_to)}
+
       case store_write(new_state.store_mod, :put_last_scanned_block, [chain.name, safe_to]) do
         :ok ->
           new_state
@@ -210,6 +324,10 @@ defmodule Genswarms.Payments do
   end
 
   defp trusted?(from, state), do: MapSet.member?(state.trusted_sources, to_string(from))
+
+  defp handle_action("deposit_address", %{"beneficiary" => _ben}, %{degraded_boot: true} = state) do
+    {:reply, Jason.encode!(%{ok: false, error: "degraded_boot"}), state}
+  end
 
   defp handle_action("deposit_address", %{"beneficiary" => ben}, state) when is_binary(ben) and ben != "" do
     case ensure_binding(ben, state) do

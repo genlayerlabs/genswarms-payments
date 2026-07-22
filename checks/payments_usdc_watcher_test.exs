@@ -10,6 +10,7 @@ defmodule ScanStore do
   defp put(k, v), do: :persistent_term.put({__MODULE__, :d}, Map.put(d(), k, v))
 
   def seed_binding(b), do: put(:bindings, [b | d().bindings])
+  def put_address_binding(b), do: put(:bindings, [b | d().bindings])
   def list_address_bindings, do: {:ok, d().bindings}
   def payment_seen?(k), do: {:ok, MapSet.member?(d().seen, k)}
   def record_payment(row) do

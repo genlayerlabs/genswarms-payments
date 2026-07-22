@@ -30,6 +30,9 @@ defmodule LedgerStore do
   end
 
   def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_chain), do: {:ok, nil}
+  def put_last_scanned_block(_chain, _n), do: :ok
 end
 
 LedgerStore.reset()
