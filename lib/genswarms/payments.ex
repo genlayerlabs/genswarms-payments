@@ -46,7 +46,8 @@ defmodule Genswarms.Payments do
       auto_tick: Map.get(config, :auto_tick, true),
       poll_interval_ms: Map.get(config, :poll_interval_ms, 60_000),
       bindings: bindings,
-      next_index: next_index
+      next_index: next_index,
+      seen_keys: MapSet.new()
     }
   end
 
@@ -69,6 +70,84 @@ defmodule Genswarms.Payments do
       {:error, _} ->
         Logger.warning("payments: undecodable message from #{inspect(from)}")
         {:noreply, state}
+    end
+  end
+
+  @doc """
+  Settle confirmed payments: durable-dedup each, record it, then deliver the
+  stamped `payment_confirmed` to every allowlisted target. FAIL CLOSED: if the
+  configured store errors on the dedup read OR the record write, the
+  settlement is skipped this round (the watcher will re-present it — the scan
+  cursor only advances on full success). Returns {settled_count, state}.
+  """
+  def settle(settlements, state) when is_list(settlements) do
+    Enum.reduce(settlements, {0, state}, fn s, {n, st} ->
+      case settle_one(s, st) do
+        {:settled, st} -> {n + 1, st}
+        {:skipped, st} -> {n, st}
+      end
+    end)
+  end
+
+  defp settle_one(%{idempotency_key: key} = s, state) do
+    seen_memory? = MapSet.member?(state.seen_keys, key)
+
+    case {seen_memory?, store_result(state.store_mod, :payment_seen?, [key], nil)} do
+      {true, _} ->
+        {:skipped, state}
+
+      {_, {:ok, true}} ->
+        {:skipped, %{state | seen_keys: MapSet.put(state.seen_keys, key)}}
+
+      {false, {:ok, false}} ->
+        record_and_deliver(s, state)
+
+      {false, nil} when is_nil(state.store_mod) ->
+        record_and_deliver(s, state)
+
+      {false, _error} ->
+        Logger.error("payments: dedup read failed for #{key} — FAIL CLOSED, holding settlement")
+        {:skipped, state}
+    end
+  end
+
+  defp record_and_deliver(%{idempotency_key: key} = s, state) do
+    row = %{
+      idempotency_key: key,
+      beneficiary: s.beneficiary,
+      amount_usd: s.amount_usd,
+      method: s.method,
+      ref: s.ref,
+      namespace: s.namespace,
+      at: state.now_fn.()
+    }
+
+    case store_write(state.store_mod, :record_payment, [row]) do
+      :ok ->
+        content =
+          Jason.encode!(%{
+            action: "payment_confirmed",
+            beneficiary: s.beneficiary,
+            amount_usd: Decimal.to_string(s.amount_usd),
+            method: s.method,
+            ref: s.ref,
+            namespace: s.namespace,
+            at: DateTime.to_iso8601(row.at)
+          })
+
+        Enum.each(state.targets, fn target ->
+          try do
+            state.deliver_fn.(target, state.name, content)
+          rescue
+            e -> Logger.error("payments: delivery to #{target} raised: #{Exception.message(e)}")
+          end
+        end)
+
+        {:settled, %{state | seen_keys: MapSet.put(state.seen_keys, key)}}
+
+      {:error, why} ->
+        Logger.error("payments: record_payment failed (#{inspect(why)}) — FAIL CLOSED, holding #{key}")
+        {:skipped, state}
     end
   end
 
