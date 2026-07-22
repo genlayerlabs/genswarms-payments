@@ -151,6 +151,61 @@ defmodule Genswarms.Payments do
     end
   end
 
+  @doc """
+  One watch round: every pull method scans, settlements settle, and each
+  chain's cursor advances ONLY if all of that chain's settlements settled
+  (skipped-by-dedup counts as settled; skipped-by-store-failure does not —
+  the fail-closed rule keeps the cursor back so the next round re-presents).
+  """
+  def poll(state) do
+    core = %{
+      chains: state.chains,
+      rpc_fn: state.rpc_fn,
+      bindings: state.bindings,
+      get_last_scanned_block: fn chain_name ->
+        store_result(state.store_mod, :get_last_scanned_block, [chain_name], {:ok, nil})
+      end
+    }
+
+    Enum.reduce(state.methods, state, fn method, st ->
+      Code.ensure_loaded(method)
+
+      if function_exported?(method, :poll, 2) do
+        method_state = Map.get(st.method_states, method, %{})
+        {per_chain, new_method_state} = method.poll(method_state, core)
+
+        st = %{st | method_states: Map.put(st.method_states, method, new_method_state)}
+        Enum.reduce(per_chain, st, &apply_chain_result/2)
+      else
+        st
+      end
+    end)
+  end
+
+  # Advances the cursor for one chain's scan result — but only when there was
+  # something to advance to (safe_to != nil) AND settle/2 got every one of
+  # this chain's settlements durably recorded (or deduped). A settlement
+  # STILL held after settle/2 (its idempotency_key missing from seen_keys)
+  # means the store failed on it — fail closed, leave the cursor put.
+  defp apply_chain_result({chain, settlements, safe_to}, state) do
+    {_n, new_state} = settle(settlements, state)
+
+    held? = Enum.any?(settlements, &(not MapSet.member?(new_state.seen_keys, &1.idempotency_key)))
+
+    if safe_to != nil and not held? do
+      case store_write(new_state.store_mod, :put_last_scanned_block, [chain.name, safe_to]) do
+        :ok ->
+          new_state
+
+        {:error, why} ->
+          Logger.error("payments: cursor write failed for #{chain.name}: #{inspect(why)}")
+          new_state
+      end
+    else
+      new_state
+    end
+  end
+
   defp trusted?(from, state), do: MapSet.member?(state.trusted_sources, to_string(from))
 
   defp handle_action("deposit_address", %{"beneficiary" => ben}, state) when is_binary(ben) and ben != "" do
