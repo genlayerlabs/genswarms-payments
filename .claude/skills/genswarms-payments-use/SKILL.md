@@ -7,9 +7,11 @@ description: >-
   multi-chain USDC watcher. Use when adding payment settlement to a swarm, or
   debugging "address not credited" (unwatched chain / cursor held by a store
   failure / below confirmations / wrong contract), "deposit_address
-  refused" (store down — fail closed — or untrusted source), or "tick does
-  nothing" (source not in trusted_sources, or the store's cursor read
-  failing). Importer's guide — for internals read the README and checks/.
+  refused" (store down — fail closed — or untrusted source, or
+  degraded_boot), "tick does nothing" (source not in trusted_sources, or the
+  store's cursor read failing), or "everything refused / poll does nothing"
+  (degraded_boot from a store outage at init — restart once the store
+  recovers). Importer's guide — for internals read the README and checks/.
 ---
 
 # genswarms-payments — using the package
@@ -33,10 +35,15 @@ Declare the object (see README for the full config block and every default):
   settlements still record durably but nobody is ever delivered
   `payment_confirmed`.
 - `store_mod` — optional, any subset of `Genswarms.Payments.Store` (8
-  optional callbacks). Without it: memory-only, resets on restart — fine in
-  dev, not in prod.
+  optional callbacks) — but two groups must be all-or-nothing or `init/1`
+  raises: `{put_address_binding, list_address_bindings}` and
+  `{payment_seen?, record_payment, get_last_scanned_block,
+  put_last_scanned_block}`. Without a store: memory-only, resets on restart
+  — fine in dev, not in prod.
 - `chains` — one map per EVM chain to watch (see README for every field);
   only relevant if `methods` includes the USDC watcher (the default).
+  `rpc_url` is validated at init — a quote, backslash, or control character
+  raises (it rides a curl `--config` tempfile; see below).
 
 A trusted source sends `{"action":"deposit_address","beneficiary":"..."}` to
 mint/fetch a stable address, and `{"action":"tick"}` to run one watch round.
@@ -67,13 +74,30 @@ schema/migrations.
   `usdc_contract` for that chain (a Transfer-shaped log from an unrelated
   contract is rejected by design, even from an otherwise-trusted RPC).
 - **"deposit_address refused"** (`{"ok": false, ...}`) — either the store is
-  down and allocation fails closed (never hand out an address whose binding
-  isn't durably persisted), or the source isn't in `trusted_sources` (in
-  which case there's no reply at all, not even a refusal).
+  down and *this* allocation fails closed (`"error": "store_unavailable"` —
+  never hand out an address whose binding isn't durably persisted), the
+  object is in `degraded_boot` (`"error": "degraded_boot"` — see below), or
+  the source isn't in `trusted_sources` (in which case there's no reply at
+  all, not even a refusal).
 - **"tick does nothing"** — the sending source isn't in `trusted_sources`
-  (silently ignored, same as any other untrusted message), or the store's
+  (silently ignored, same as any other untrusted message), the object is in
+  `degraded_boot` (poll is a no-op — see below), or the store's
   `get_last_scanned_block` read is failing (poll proceeds but each chain's
   scan can't compute its `from`, so nothing new is fetched that round).
+- **"everything refused / poll does nothing"** — check `{"action":
+  "health"}` for `"degraded_boot": true`. It means the CONFIGURED store's
+  `list_address_bindings/0` errored or raised at boot, so `init/1` couldn't
+  trust the true watched-address set or next HD index and refused to guess
+  — `poll/1` is a no-op and `deposit_address` is refused until the object is
+  **restarted** (it does not self-heal on its own; that's deliberate, so a
+  transient DB blip at boot doesn't crash-loop the object instead).
+- Delivery of `payment_confirmed` is at-least-once for transient per-target
+  failures (a raise, an EXIT, a throw) — a failing target is queued and
+  retried at the start of every subsequent `tick`, but the queue is
+  in-memory only, so a process crash between recording and delivering can
+  still drop a delivery (the settlement itself is never re-presented, since
+  it's already recorded — dedup by `idempotency_key`). Reconcile via
+  `payment_status`, not delivery receipt.
 - The RPC URL may embed a provider API key — it rides a chmod-600 tempfile,
   never argv, and is scrubbed from both success and error output. Don't
   "fix" logging or argument-passing around it.

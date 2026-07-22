@@ -67,17 +67,36 @@ interval; this package owns the settlement/watch logic, not the clock.
 
 ## Object protocol
 
-- `{"action": "health"}` — unauthenticated; `{"ok": true, "bindings": N}`.
+- `{"action": "health"}` — unauthenticated; `{"ok": true, "bindings": N,
+  "degraded_boot": bool}`.
 - `{"action": "tick"}` — trusted only; runs one poll round (every configured
   method scans, settlements settle, cursors advance per the fail-closed rule
-  below). No reply.
+  below). No reply. A no-op while `degraded_boot` (see below).
 - `{"action": "deposit_address", "beneficiary": "..."}` — trusted only;
   returns the beneficiary's stable address, minting one on first ask.
+  Refused with `{"ok": false, "error": "degraded_boot"}` while
+  `degraded_boot` (distinct from `{"ok": false, "error": "store_unavailable"}`,
+  which means boot was fine but *this* allocation's write just failed).
 - `{"action": "payment_status", "beneficiary": "..."}` — trusted only;
   returns the address plus recorded payments (empty list if unbound or the
   store has none).
 - `{"action": "ingest_event", ...}` — trusted only; reserved for future push
   methods, currently always refuses.
+
+## Degraded boot
+
+`init/1` needs `list_address_bindings/0` to succeed to know the true
+watched-address set and the next free HD index. If a **configured** store's
+`list_address_bindings/0` errors or raises, `init/1` doesn't guess — it sets
+`degraded_boot: true` on the state rather than falling back to an empty set
+(which would silently drop every in-flight deposit under an empty watched
+set, and reissue an already-handed-out address from index 0). While
+degraded: `poll/1` is a no-op (logs an error, changes nothing), and
+`deposit_address` is refused. This is fail-*flagged*, not fail-crashed, on
+purpose — a transient DB blip at pod boot shouldn't crash-loop the object —
+but it also means it does **not** self-heal on its own: recovering requires
+restarting the object once the store is healthy again. `health` reports the
+flag so operators can detect it externally.
 
 ## Custody model
 
@@ -93,7 +112,8 @@ misbehaving.
 ## Store contract (`Genswarms.Payments.Store`)
 
 Every callback is optional; missing ones fall back to an in-memory mirror
-(fine in dev, lost on restart).
+(fine in dev, lost on restart — including the scan cursor, via
+`cursor_mirror`, so dev mode doesn't rescan the same block window forever).
 
 | Callback | Purpose |
 |---|---|
@@ -112,6 +132,17 @@ round holds that settlement rather than risk crediting it twice or losing
 it. No store at all is a legitimate dev mode — memory dedup still works
 within a single run.
 
+**Coherence requirement**: `init/1` validates two callback groups —
+`{put_address_binding/1, list_address_bindings/0}` and `{payment_seen?/1,
+record_payment/1, get_last_scanned_block/1, put_last_scanned_block/2}` —
+and **raises `ArgumentError`** if a store implements only part of either
+group. A store that persists bindings but can never list them forgets the
+watched set (and reuses HD indices) on every restart; a store that can
+write settlements but never check `payment_seen?` (or vice versa) always
+looks unseen and double-credits. Implement all of a group's callbacks or
+none of them. `list_payments/1` and `get_address_binding/1` are independent
+reporting callbacks, not part of either group.
+
 ## Settlement fail-closed rule and the cursor invariant
 
 `settle/2` durably dedups each settlement before recording it, then delivers
@@ -128,6 +159,25 @@ re-scans and re-presents it. This is the invariant that makes the whole
 pipeline safe against a flaky store: nothing is ever double-credited, and
 nothing is ever silently skipped.
 
+## Delivery guarantee
+
+Once a settlement is **recorded** (durably written via `record_payment`),
+delivering `payment_confirmed` to targets is **at-least-once** for transient
+per-target failures: a target's delivery runs under `catch kind, reason`
+(covering a raise, an EXIT such as a GenServer call timeout, and a throw),
+so one target failing never blocks the others in the same round and never
+crashes the tick. A target that fails is queued (keyed by
+`idempotency_key`) and retried at the start of every subsequent `tick`,
+dropped once it succeeds — the queue itself is never durable (in-memory
+only). This is **not** at-least-once across a process crash inside the
+record→deliver window: if the object dies between `record_payment`
+succeeding and the delivery queue being updated, that delivery is lost with
+it, and because the settlement is already recorded (dedup by
+`idempotency_key`), it will never be re-presented by the watcher either.
+Downstream consumers should treat delivery as best-effort and reconcile via
+`payment_status` for the source of truth; the credit they apply on receipt
+should itself be idempotent.
+
 ## In-tree USDC watcher
 
 `Genswarms.Payments.Usdc` is a pull method: per `tick`, per configured
@@ -140,10 +190,18 @@ the RPC is asked to filter: logs are re-filtered by `blockNumber <= to`
 (never trust a provider to honor `toBlock`) and by exact contract address
 match (never trust a `Transfer`-shaped log to actually be USDC — a
 misbehaving or compromised RPC could hand back logs from an unrelated
-contract). `Genswarms.Payments.Rpc` shells out to `curl` (the engine has no
-`:inets`); the RPC URL — which may embed a provider API key — rides a
-chmod-600 `--config` tempfile, never argv where `ps` would expose it, and is
-scrubbed from both successful and error output before it's logged.
+contract). A chain's whole scan is also wrapped so a malformed RPC response
+shape (e.g. a provider returning `{:ok, nil}` for `eth_blockNumber` instead
+of a hex string) can't crash the tick — that one chain's round is skipped
+(cursor untouched, retried next `tick`) while every other configured chain
+still proceeds. `Genswarms.Payments.Rpc` shells out to `curl` (the engine
+has no `:inets`); the RPC URL — which may embed a provider API key — rides
+a chmod-600 `--config` tempfile, never argv where `ps` would expose it, and
+is scrubbed from both successful and error output before it's logged.
+`init/1` also rejects (raises `ArgumentError`) any chain's `rpc_url`
+containing a quote, backslash, or control character, since the URL is
+written into that tempfile as `url = "#{rpc_url}"` and an unsanitized value
+could close the string early and inject config directives.
 
 ## Method behaviour
 
