@@ -1,0 +1,12 @@
+{
+  "module": "Genswarms.Payments",
+  "files": [
+    "lib/genswarms/payments/keccak.ex",
+    "lib/genswarms/payments/hd.ex",
+    "lib/genswarms/payments/store.ex",
+    "lib/genswarms/payments/method.ex",
+    "lib/genswarms/payments/rpc.ex",
+    "lib/genswarms/payments/usdc.ex",
+    "lib/genswarms/payments.ex"
+  ]
+}
