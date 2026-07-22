@@ -89,10 +89,10 @@ defmodule Genswarms.Payments do
 
             {%{}, true}
         end
-      rescue
-        e ->
+      catch
+        kind, reason ->
           Logger.error(
-            "payments: list_address_bindings raised at boot (#{Exception.message(e)}) — DEGRADED BOOT: polling and allocation refused until restart"
+            "payments: list_address_bindings #{kind}-ed at boot (#{inspect(reason)}) — DEGRADED BOOT: polling and allocation refused until restart"
           )
 
           {%{}, true}
@@ -207,7 +207,7 @@ defmodule Genswarms.Payments do
   defp settle_one(%{idempotency_key: key} = s, state) do
     seen_memory? = MapSet.member?(state.seen_keys, key)
 
-    case {seen_memory?, store_result(state.store_mod, :payment_seen?, [key], nil)} do
+    case {seen_memory?, payment_seen_lookup(state.store_mod, key)} do
       {true, _} ->
         {:skipped, state}
 
@@ -217,12 +217,30 @@ defmodule Genswarms.Payments do
       {false, {:ok, false}} ->
         record_and_deliver(s, state)
 
-      {false, nil} when is_nil(state.store_mod) ->
+      {false, :no_store} ->
         record_and_deliver(s, state)
 
-      {false, _error} ->
+      {false, {:error, _why}} ->
         Logger.error("payments: dedup read failed for #{key} — FAIL CLOSED, holding settlement")
         {:skipped, state}
+    end
+  end
+
+  # NOT-EXPORTED (nil store, or a configured store that simply doesn't
+  # implement payment_seen?/1 — legal per validate_store_coherence!/1 when
+  # the WHOLE settlement group is absent) means "no durable dedup available",
+  # which is exactly the nil-store memory-fallback situation — settle via
+  # memory dedup. EXPORTED-BUT-ERRORED (raised, exited, or returned
+  # {:error, _}) is the only case that fails closed.
+  defp payment_seen_lookup(mod, key) do
+    if exported?(mod, :payment_seen?, 1) do
+      case store_result(mod, :payment_seen?, [key], {:error, :store_failed}) do
+        {:ok, bool} -> {:ok, bool}
+        {:error, why} -> {:error, why}
+        _other -> {:error, :store_failed}
+      end
+    else
+      :no_store
     end
   end
 
@@ -352,8 +370,13 @@ defmodule Genswarms.Payments do
       rpc_fn: state.rpc_fn,
       bindings: state.bindings,
       get_last_scanned_block: fn chain_name ->
-        if state.store_mod && function_exported?(state.store_mod, :get_last_scanned_block, 1) do
-          store_result(state.store_mod, :get_last_scanned_block, [chain_name], {:ok, nil})
+        if exported?(state.store_mod, :get_last_scanned_block, 1) do
+          # Default is {:error, _}, NOT {:ok, nil} — a raising/exiting store
+          # must never be mistaken for "never scanned", which would silently
+          # rescan from start_block every tick (a getLogs storm). {:ok, nil}
+          # is reserved for a store that genuinely, successfully, reports no
+          # prior cursor.
+          store_result(state.store_mod, :get_last_scanned_block, [chain_name], {:error, :store_failed})
         else
           {:ok, Map.get(state.cursor_mirror, chain_name)}
         end
@@ -485,9 +508,9 @@ defmodule Genswarms.Payments do
     if function_exported?(mod, fun, length(args)) do
       try do
         apply(mod, fun, args)
-      rescue
-        e ->
-          Logger.error("payments: store #{fun} raised: #{Exception.message(e)}")
+      catch
+        kind, reason ->
+          Logger.error("payments: store #{fun} #{kind}-ed: #{inspect(reason)}")
           default
       end
     else
@@ -505,12 +528,26 @@ defmodule Genswarms.Payments do
           {:error, why} -> {:error, why}
           other -> {:error, {:bad_return, other}}
         end
-      rescue
-        e -> {:error, {:raised, Exception.message(e)}}
+      catch
+        kind, reason -> {:error, {kind, reason}}
       end
     else
       :ok
     end
+  end
+
+  # Distinguishes NOT-EXPORTED (falls back to the memory path, same as a nil
+  # store) from EXPORTED-BUT-ERRORED (fails closed) for an optional read
+  # callback — used by settle_one/2's payment_seen? dedup and
+  # payment_status's list_payments so a coherence-legal store implementing
+  # only PART of the optional surface (e.g. bindings but not settlement)
+  # doesn't get treated as "erroring" forever on the half it doesn't
+  # implement.
+  defp exported?(nil, _fun, _arity), do: false
+
+  defp exported?(mod, fun, arity) do
+    Code.ensure_loaded(mod)
+    function_exported?(mod, fun, arity)
   end
 
   defp stringify(map), do: Map.new(map, fn {k, v} -> {to_string(k), to_string(v)} end)

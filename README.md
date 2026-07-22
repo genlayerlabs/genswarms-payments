@@ -132,6 +132,14 @@ round holds that settlement rather than risk crediting it twice or losing
 it. No store at all is a legitimate dev mode — memory dedup still works
 within a single run.
 
+This fail-closed rule is keyed on whether the callback is **exported**, not
+on whether `store_mod` is `nil`. A store that implements the bindings group
+but none of the settlement group (`payment_seen?/1`, `record_payment/1`, ...)
+is coherence-legal (see below) — for those NOT-EXPORTED callbacks it is
+treated exactly like a nil store: settlement falls back to in-memory dedup,
+never frozen. Only a callback that **is** exported and then raises, exits, or
+returns `{:error, _}` holds the settlement closed.
+
 **Coherence requirement**: `init/1` validates two callback groups —
 `{put_address_binding/1, list_address_bindings/0}` and `{payment_seen?/1,
 record_payment/1, get_last_scanned_block/1, put_last_scanned_block/2}` —
