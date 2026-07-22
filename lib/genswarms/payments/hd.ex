@@ -21,7 +21,7 @@ defmodule Genswarms.Payments.HD do
           if :binary.first(pubkey) in [2, 3] do
             {:ok, %{chain_code: chain_code, pubkey: pubkey, depth: depth}}
           else
-            {:error, :bad_length}
+            {:error, :not_an_xpub}
           end
 
         <<_version::binary-4, _rest::binary-74>> ->
