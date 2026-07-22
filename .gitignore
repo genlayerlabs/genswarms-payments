@@ -1,0 +1,6 @@
+_build/
+deps/
+mix.lock
+*.o
+erl_crash.dump
+.DS_Store
