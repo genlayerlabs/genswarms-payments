@@ -150,7 +150,7 @@ scrubbed from both successful and error output before it's logged.
 Future modalities (Stripe, x402, ...) ship as sibling packages implementing
 `Genswarms.Payments.Method`: `id/0`, `capabilities/0`, and either `poll/2`
 (pull: scan and return `{chain, settlements, safe_to}` per configured
-target) or `ingest_event/2` (push: verify then return settlements). Both
+chain) or `ingest_event/2` (push: verify then return settlements). Both
 callbacks are optional so a method can be pull-only or push-only.
 
 ## Verification
