@@ -6,6 +6,12 @@ defmodule Genswarms.Payments do
   `Genswarms.Payments.Method`; v1 ships USDC in-tree. Trust is fail-closed:
   no trusted_sources ⇒ nobody can act; no targets ⇒ nobody is credited.
 
+  `deliver_fn` contract: `fn target, from, content -> :ok | {:error, term()}`.
+  Only a literal `:ok` return counts as delivered — anything else (an
+  `{:error, _}` tuple, a raise, or an EXIT such as a GenServer call timeout)
+  is treated as a failure: logged, and the target queued in `undelivered` for
+  retry at the start of every subsequent poll.
+
   Boot is fail-FLAGGED, not fail-crashed: if a configured store's
   `list_address_bindings/0` errors or raises, `init/1` cannot know the true
   watched-address set or the next free HD index, so it sets `degraded_boot:
@@ -309,10 +315,26 @@ defmodule Genswarms.Payments do
   # a process crash inside this window — if the process dies between
   # record_payment and reaching this point the queued retry itself is lost
   # with it (see README's delivery section for the honest guarantee).
+  #
+  # Only a literal `:ok` return counts as delivered — deliver_fn's contract
+  # (see moduledoc + README) is `:ok | {:error, term()}`, and ANY non-:ok
+  # return (an {:error, _} tuple, or anything else) is a failure exactly like
+  # a raise or an EXIT: logged, and the target queued for retry. Treating a
+  # non-:ok return as success would silently lose the delivery forever (the
+  # settlement is already recorded, so dedup blocks re-presentation).
   defp deliver_one(deliver_fn, target, from, content) do
     try do
-      deliver_fn.(target, from, content)
-      :ok
+      case deliver_fn.(target, from, content) do
+        :ok ->
+          :ok
+
+        other ->
+          Logger.error(
+            "payments: delivery to #{target} returned #{inspect(other)} (not :ok) — will retry next tick"
+          )
+
+          :error
+      end
     catch
       kind, reason ->
         Logger.error(

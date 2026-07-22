@@ -248,4 +248,131 @@ Check.check(f, "a chain with a bad RPC shape is skipped while the other chain st
   Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "good_chain:0xGOOD:0")) and
     ScanStore.cursor("bad_chain") == nil)
 
+# ── 2b: pin the cursor fail-closed invariant (coverage-only — the adversarial
+# audit found this unpinned: a hand-applied mutation removing the `held?`
+# guard in apply_chain_result/2 passes the pre-existing suite). Also pins
+# the dedup-counts-as-settled leg of the same invariant.
+defmodule CursorInvariantStore do
+  def reset,
+    do:
+      :persistent_term.put(
+        {__MODULE__, :d},
+        %{seen: MapSet.new(), rows: [], cursor: %{}, bindings: [], down: false}
+      )
+
+  defp d, do: :persistent_term.get({__MODULE__, :d})
+  defp put(k, v), do: :persistent_term.put({__MODULE__, :d}, Map.put(d(), k, v))
+  def down!(flag), do: put(:down, flag)
+  def seed_seen(key), do: put(:seen, MapSet.put(d().seen, key))
+
+  def put_address_binding(b), do: put(:bindings, [b | d().bindings])
+  def list_address_bindings, do: {:ok, d().bindings}
+  def payment_seen?(k), do: {:ok, MapSet.member?(d().seen, k)}
+
+  def record_payment(row) do
+    if d().down do
+      {:error, :db_down}
+    else
+      put(:seen, MapSet.put(d().seen, row.idempotency_key))
+      put(:rows, [row | d().rows])
+      :ok
+    end
+  end
+
+  def get_last_scanned_block(chain), do: {:ok, Map.get(d().cursor, chain)}
+  def put_last_scanned_block(chain, n), do: put(:cursor, Map.put(d().cursor, chain, n))
+  def cursor(chain), do: Map.get(d().cursor, chain)
+  def rows, do: d().rows
+end
+
+CursorInvariantStore.reset()
+
+state_ci =
+  Payments.init(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"],
+    namespace: "llm_quota",
+    store_mod: CursorInvariantStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn _, _, _ -> :ok end,
+    chains: [
+      %{name: "cursorinv", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+        confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
+    ],
+    rpc_fn: nil
+  })
+
+{:reply, jci, state_ci} =
+  Payments.handle_message("ingress",
+    Jason.encode!(%{action: "deposit_address", beneficiary: "budget:ci"}), state_ci)
+addr_ci = Jason.decode!(jci)["address"]
+
+log_ci = mk_log.(addr_ci, 5, "0xCI1", 0)
+
+rpc_ci = fn _chain, method, _params ->
+  case method do
+    "eth_blockNumber" -> {:ok, "0xc8"}
+    "eth_getLogs" -> {:ok, [log_ci]}
+  end
+end
+
+CursorInvariantStore.down!(true)
+state_ci = %{state_ci | rpc_fn: rpc_ci}
+state_ci = Payments.poll(state_ci)
+
+Check.check(f, "2b: record_payment erroring holds the settlement — cursor stays nil, zero rows",
+  CursorInvariantStore.cursor("cursorinv") == nil and CursorInvariantStore.rows() == [])
+
+CursorInvariantStore.down!(false)
+state_ci = Payments.poll(state_ci)
+
+Check.check(f, "2b: after the store heals, the SAME payment settles and the cursor advances to safe_to",
+  length(CursorInvariantStore.rows()) == 1 and CursorInvariantStore.cursor("cursorinv") == 200)
+
+# dedup-counts-as-settled leg: a log already durably seen must still advance
+# the cursor even though record_payment is never invoked for it this round.
+CursorInvariantStore.reset()
+
+state_dedup =
+  Payments.init(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"],
+    namespace: "llm_quota",
+    store_mod: CursorInvariantStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn _, _, _ -> :ok end,
+    chains: [
+      %{name: "dedupchain", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+        confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
+    ],
+    rpc_fn: nil
+  })
+
+{:reply, jd, state_dedup} =
+  Payments.handle_message("ingress",
+    Jason.encode!(%{action: "deposit_address", beneficiary: "budget:dedup"}), state_dedup)
+addr_dedup = Jason.decode!(jd)["address"]
+
+log_dedup = mk_log.(addr_dedup, 5, "0xDEDUP", 0)
+CursorInvariantStore.seed_seen("dedupchain:0xDEDUP:0")
+
+rpc_dedup = fn _chain, method, _params ->
+  case method do
+    "eth_blockNumber" -> {:ok, "0xc8"}
+    "eth_getLogs" -> {:ok, [log_dedup]}
+  end
+end
+
+state_dedup = %{state_dedup | rpc_fn: rpc_dedup}
+state_dedup = Payments.poll(state_dedup)
+
+Check.check(f, "2b: a log already durably seen (dedup) still counts as settled — cursor advances",
+  CursorInvariantStore.cursor("dedupchain") == 200 and CursorInvariantStore.rows() == [])
+
 Check.finish(f)

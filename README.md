@@ -51,7 +51,7 @@ push method ships yet; `ingest_event` currently always replies
     }
   ],
   methods: [Genswarms.Payments.Usdc], # pluggable modalities (default [Genswarms.Payments.Usdc])
-  deliver_fn: fn target, from, content -> ... end,  # default dispatches via the host ObjectServer
+  deliver_fn: fn target, from, content -> :ok | {:error, term()} end,  # default dispatches via the host ObjectServer
   now_fn: &DateTime.utc_now/0,        # injection seam for checks (default)
   rpc_fn: &Genswarms.Payments.Rpc.call/3,  # injection seam for checks (default)
   auto_tick: true,                    # currently INERT — see below (default true)
@@ -169,12 +169,20 @@ nothing is ever silently skipped.
 
 ## Delivery guarantee
 
+`deliver_fn`'s return contract is `:ok | {:error, term()}`. Only a literal
+`:ok` counts as delivered — an `{:error, _}` return is treated exactly like
+a raise or an EXIT: logged and queued for retry. This matters because the
+settlement is already durably recorded by the time delivery is attempted;
+silently treating a non-`:ok` return as success would lose the delivery
+forever with no way to detect it (dedup blocks re-presentation).
+
 Once a settlement is **recorded** (durably written via `record_payment`),
 delivering `payment_confirmed` to targets is **at-least-once** for transient
 per-target failures: a target's delivery runs under `catch kind, reason`
 (covering a raise, an EXIT such as a GenServer call timeout, and a throw),
-so one target failing never blocks the others in the same round and never
-crashes the tick. A target that fails is queued (keyed by
+plus an explicit check that the return value is `:ok`, so one target failing
+never blocks the others in the same round and never crashes the tick. A
+target that fails is queued (keyed by
 `idempotency_key`) and retried at the start of every subsequent `tick`,
 dropped once it succeeds — the queue itself is never durable (in-memory
 only). This is **not** at-least-once across a process crash inside the

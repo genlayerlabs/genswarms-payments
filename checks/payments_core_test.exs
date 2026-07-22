@@ -79,6 +79,37 @@ Check.check(f, "health is unauthenticated and ok", Jason.decode!(h)["ok"] == tru
 Check.check(f, "malformed JSON ⇒ noreply",
   match?({:noreply, _}, Payments.handle_message("telegram_ingress", "{nope", state)))
 
+# ── 2c: untrusted "tick" is fully gated (coverage-only — the adversarial
+# audit found this unpinned). An untrusted source's tick must be a no-op:
+# {:noreply, _} AND poll must never actually run (rpc_fn never invoked).
+{:ok, rpc_calls_2c} = Agent.start_link(fn -> 0 end)
+
+counting_rpc_2c = fn _chain, _method, _params ->
+  Agent.update(rpc_calls_2c, &(&1 + 1))
+  {:ok, "0x1"}
+end
+
+state_2c =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: ["telegram_ingress"],
+    targets: ["llm_proxy"],
+    store_mod: nil,
+    auto_tick: false,
+    rpc_fn: counting_rpc_2c,
+    chains: [%{name: "base", rpc_url: "injected", usdc_contract: "0x0"}]
+  })
+
+tick_req = Jason.encode!(%{action: "tick"})
+
+Check.check(f, "2c: untrusted tick gets {:noreply, _}",
+  match?({:noreply, _}, Payments.handle_message("stranger", tick_req, state_2c)))
+
+Payments.handle_message("stranger", tick_req, state_2c)
+
+Check.check(f, "2c: untrusted tick never actually polls — rpc_fn is never invoked",
+  Agent.get(rpc_calls_2c, & &1) == 0)
+
 # C2: rpc_url validation — a curl --config tempfile is built from this value
 # as `url = "#{rpc_url}"`; a quote lets an attacker close that value early
 # and inject config directives, a backslash/control char is just as

@@ -180,6 +180,75 @@ state_exit = Payments.poll(state_exit)
 Check.check(f, "poll retries undelivered entries and clears them once delivered",
   Agent.get(retried, & &1) == [{"flaky2", :payments}] and state_exit.undelivered == %{})
 
+# ── 2a: an {:error, _} RETURN from deliver_fn (no raise, no exit) is a
+# delivered-loss bug on current code — deliver_one hardcodes :ok after
+# invoking deliver_fn, so an error-shaped return is silently treated as a
+# success: the credit is recorded, dedup blocks re-presentation, and the
+# target never actually got it. Only a literal :ok may count as delivered.
+error_return_deliver = fn target, _from, _content ->
+  if target == "down_by_return", do: {:error, :target_down}, else: :ok
+end
+
+state_2a =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["down_by_return"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: error_return_deliver
+  })
+
+s_2a = %{s | idempotency_key: "returnfail:1", ref: "returnfail:1"}
+{n_2a, state_2a} = Payments.settle([s_2a], state_2a)
+
+Check.check(f, "2a: deliver_fn returning {:error,_} (not raising) is NOT counted as delivered",
+  n_2a == 1 and Map.has_key?(state_2a.undelivered, "returnfail:1"))
+
+{:ok, retried_2a} = Agent.start_link(fn -> [] end)
+
+healed_deliver_2a = fn target, from, _content ->
+  Agent.update(retried_2a, &[{target, from} | &1])
+  :ok
+end
+
+state_2a = %{state_2a | deliver_fn: healed_deliver_2a}
+state_2a = Payments.poll(state_2a)
+
+Check.check(f, "2a: once deliver_fn heals, the queued entry is retried and delivered on next poll",
+  Agent.get(retried_2a, & &1) == [{"down_by_return", :payments}] and state_2a.undelivered == %{})
+
+# ── 2a(ii): multi-target, one fails by RETURN (not raise) — only that
+# target is queued, the other delivers normally in the same round.
+{:ok, delivered_2a2} = Agent.start_link(fn -> [] end)
+
+mixed_return_deliver = fn target, from, _content ->
+  case target do
+    "bad_return" -> {:error, :nope}
+    _ ->
+      Agent.update(delivered_2a2, &[{target, from} | &1])
+      :ok
+  end
+end
+
+state_2a2 =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["bad_return", "good_target"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: mixed_return_deliver
+  })
+
+s_2a2 = %{s | idempotency_key: "returnfail:2", ref: "returnfail:2"}
+{n_2a2, state_2a2} = Payments.settle([s_2a2], state_2a2)
+
+Check.check(f, "2a: only the error-RETURNING target is queued; the succeeding target delivered",
+  n_2a2 == 1 and
+    Agent.get(delivered_2a2, & &1) == [{"good_target", :payments}] and
+    Map.get(state_2a2.undelivered, "returnfail:2", %{targets: nil}).targets == ["bad_return"])
+
 # ── B3: record-write-only isolation (disclosed gap) — payment_seen? healthy,
 # record_payment fails ⇒ held; heals ⇒ the SAME settlement settles.
 defmodule WriteOnlyDownStore do
