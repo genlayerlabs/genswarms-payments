@@ -78,8 +78,15 @@ interval; this package owns the settlement/watch logic, not the clock.
   `degraded_boot` (distinct from `{"ok": false, "error": "store_unavailable"}`,
   which means boot was fine but *this* allocation's write just failed).
 - `{"action": "payment_status", "beneficiary": "..."}` — trusted only;
-  returns the address plus recorded payments (empty list if unbound or the
-  store has none).
+  returns the address plus recorded payments, plus a `durable` flag: `true`
+  when a configured store actually answered, `false` when there's no store
+  configured or it doesn't implement `list_payments/1` (memory mode — a
+  genuinely empty list, not a masked failure). Refuses rather than fail
+  open in two cases: `{"ok": false, "error": "degraded_boot"}` while
+  `degraded_boot` (see below — init never learned the true payment history),
+  and `{"ok": false, "error": "store_unavailable"}` when a **configured**
+  `list_payments/1` errors, raises, or exits (an empty list here would be
+  indistinguishable from "no payments" — see Reconciliation below).
 - `{"action": "ingest_event", ...}` — trusted only; reserved for future push
   methods, currently always refuses.
 
@@ -192,7 +199,13 @@ it, and because the settlement is already recorded (dedup by
 `idempotency_key`), it will never be re-presented by the watcher either.
 Downstream consumers should treat delivery as best-effort and reconcile via
 `payment_status` for the source of truth; the credit they apply on receipt
-should itself be idempotent.
+should itself be idempotent. `payment_status` itself only answers when it
+can answer truthfully: it refuses (`{"ok": false, ...}`) rather than
+returning a fabricated empty list during `degraded_boot` or when a
+configured `list_payments/1` errors — see the object protocol section above
+— so a reconciling consumer can trust an `"ok": true` response's `payments`
+(and its `durable` flag) at face value instead of risking a false "nothing
+to reconcile" read.
 
 ## In-tree USDC watcher
 

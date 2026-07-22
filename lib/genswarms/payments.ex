@@ -258,6 +258,21 @@ defmodule Genswarms.Payments do
     end
   end
 
+  # Same NOT-EXPORTED (memory mode — truthfully has no rows) vs
+  # EXPORTED-BUT-ERRORED (refuse rather than fabricate an empty list)
+  # distinction as payment_seen_lookup/2, for payment_status's list_payments.
+  defp list_payments_lookup(mod, ben) do
+    if exported?(mod, :list_payments, 1) do
+      case store_result(mod, :list_payments, [ben], {:error, :store_failed}) do
+        {:ok, rows} -> {:ok, rows}
+        {:error, why} -> {:error, why}
+        _other -> {:error, :store_failed}
+      end
+    else
+      :no_store
+    end
+  end
+
   defp record_and_deliver(%{idempotency_key: key} = s, state) do
     row = %{
       idempotency_key: key,
@@ -474,18 +489,39 @@ defmodule Genswarms.Payments do
     end
   end
 
+  # payment_status is README's reconciliation path — it must refuse rather
+  # than fail open. During degraded_boot init couldn't establish the true
+  # watched set, so an "ok:true, payments:[]" answer here would be
+  # indistinguishable from "genuinely zero payments" when it's really "we
+  # don't know". Checked ahead of the generic clause below.
+  defp handle_action("payment_status", %{"beneficiary" => _ben}, %{degraded_boot: true} = state) do
+    {:reply, Jason.encode!(%{ok: false, error: "degraded_boot"}), state}
+  end
+
   defp handle_action("payment_status", %{"beneficiary" => ben}, state) when is_binary(ben) do
-    payments =
-      case store_result(state.store_mod, :list_payments, [ben], {:ok, []}) do
-        {:ok, rows} -> Enum.map(rows, &Map.take(&1, [:amount_usd, :method, :ref, :at]) |> stringify())
-        _ -> []
-      end
+    case list_payments_lookup(state.store_mod, ben) do
+      {:error, _why} ->
+        {:reply, Jason.encode!(%{ok: false, error: "store_unavailable"}), state}
 
-    binding = Map.get(state.bindings, ben)
+      lookup ->
+        {rows, durable?} =
+          case lookup do
+            {:ok, rows} -> {rows, true}
+            :no_store -> {[], false}
+          end
 
-    {:reply,
-     Jason.encode!(%{ok: true, beneficiary: ben, address: binding && binding.address, payments: payments}),
-     state}
+        payments = Enum.map(rows, &Map.take(&1, [:amount_usd, :method, :ref, :at]) |> stringify())
+        binding = Map.get(state.bindings, ben)
+
+        {:reply,
+         Jason.encode!(%{
+           ok: true,
+           beneficiary: ben,
+           address: binding && binding.address,
+           payments: payments,
+           durable: durable?
+         }), state}
+    end
   end
 
   defp handle_action("ingest_event", _msg, state) do
