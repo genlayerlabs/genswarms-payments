@@ -24,4 +24,14 @@ Check.check(f, "keccak256(\"Transfer(address,address,uint256)\") is the ERC-20 t
   hex.(Keccak.hash_256("Transfer(address,address,uint256)")) ==
     "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
+# Pad-edge KAT: 135 bytes mod 136 (@rate) leaves gap == 1 ⇒ the single
+# 0x81-byte padding branch (pad/1's `1 -> data <> <<0x81>>` clause), which
+# none of the vectors above exercise ("" and "abc" gap != 1; 200 bytes is
+# 200 mod 136 = 64, also != 1). Independently computed via ethers.js 6.17.0
+# (`ethers.keccak256(Buffer.alloc(135, 0x61))`, NOT this Elixir
+# implementation) against 135 bytes of 0x61 ("a").
+Check.check(f, "keccak256 of 135 bytes of 'a' — gap==1 single-0x81-pad-byte KAT (ethers.js-verified)",
+  hex.(Keccak.hash_256(:binary.copy(<<0x61>>, 135))) ==
+    "34367dc248bbd832f4e3e69dfaac2f92638bd0bbd18f2912ba4ef454919cf446")
+
 Check.finish(f)

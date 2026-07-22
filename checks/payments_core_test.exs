@@ -79,4 +79,51 @@ Check.check(f, "health is unauthenticated and ok", Jason.decode!(h)["ok"] == tru
 Check.check(f, "malformed JSON ⇒ noreply",
   match?({:noreply, _}, Payments.handle_message("telegram_ingress", "{nope", state)))
 
+# C2: rpc_url validation — a curl --config tempfile is built from this value
+# as `url = "#{rpc_url}"`; a quote lets an attacker close that value early
+# and inject config directives, a backslash/control char is just as
+# unsanitary. Reject at init, don't wait for curl to choke on it.
+bad_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: ~s(https://evil.example/"), usdc_contract: "0x0"}])
+
+Check.check(f, "rpc_url containing a quote raises ArgumentError at init",
+  match?(
+    {:error, %ArgumentError{}},
+    (try do
+       Payments.init(bad_rpc_config)
+       {:ok, :did_not_raise}
+     rescue
+       e -> {:error, e}
+     end)
+  ))
+
+backslash_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://evil.example/\\injected", usdc_contract: "0x0"}])
+
+Check.check(f, "rpc_url containing a backslash raises ArgumentError at init",
+  match?(
+    {:error, %ArgumentError{}},
+    (try do
+       Payments.init(backslash_rpc_config)
+       {:ok, :did_not_raise}
+     rescue
+       e -> {:error, e}
+     end)
+  ))
+
+control_char_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://evil.example/\ninjected", usdc_contract: "0x0"}])
+
+Check.check(f, "rpc_url containing a control character raises ArgumentError at init",
+  match?(
+    {:error, %ArgumentError{}},
+    (try do
+       Payments.init(control_char_rpc_config)
+       {:ok, :did_not_raise}
+     rescue
+       e -> {:error, e}
+     end)
+  ))
+
+clean_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://mainnet.base.org/v2/KEY", usdc_contract: "0x0"}])
+Check.check(f, "a clean rpc_url boots without raising",
+  match?(%{}, Payments.init(clean_rpc_config)))
+
 Check.finish(f)

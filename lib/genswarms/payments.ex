@@ -30,6 +30,7 @@ defmodule Genswarms.Payments do
     validate_store_coherence!(store_mod)
 
     chains = Map.get(config, :chains, [])
+    Enum.each(chains, &validate_rpc_url!/1)
 
     {bindings, degraded_boot?} = init_bindings(store_mod)
 
@@ -138,6 +139,24 @@ defmodule Genswarms.Payments do
               "payments: store #{inspect(mod)} implements only part of the callback group [#{names}] — implement all of them or none (partial coverage silently causes address reuse or double-credit)"
     end
   end
+
+  # Genswarms.Payments.Rpc writes rpc_url verbatim into a curl --config
+  # tempfile as `url = "#{rpc_url}"` — a quote lets it close that value
+  # early and inject arbitrary curl config directives; a backslash or other
+  # control character is equally unsanitary in that file format. Reject at
+  # init rather than let it reach curl.
+  defp validate_rpc_url!(%{rpc_url: url}) do
+    url = to_string(url)
+
+    if String.contains?(url, ["\"", "\\"]) or String.match?(url, ~r/[\x00-\x1f\x7f]/) do
+      raise ArgumentError,
+            "payments: rpc_url contains a quote, backslash, or control character — refusing (curl --config injection guard)"
+    end
+
+    :ok
+  end
+
+  defp validate_rpc_url!(_chain), do: :ok
 
   def handle_message(from, content, state) do
     case Jason.decode(content) do
