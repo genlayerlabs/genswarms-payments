@@ -59,8 +59,28 @@ defmodule Genswarms.Payments.Rpc do
     end
   end
 
-  defp scrub(str, url) when is_binary(str), do: String.replace(str, url, "[rpc-url]")
+  # Path-aware: replacing only the exact whole rpc_url is not enough —
+  # provider error bodies (curl --fail-with-body) and not-JSON responses
+  # routinely echo just the URL PATH (`/v2/<APIKEY>`), and for keyed
+  # endpoints (Alchemy/Infura style) the API key lives in that path (or in
+  # userinfo/query). Redact every one of those fragments, longest first so
+  # the whole-URL replacement doesn't leave a partial behind.
+  defp scrub(str, url) when is_binary(str) do
+    Enum.reduce(secret_fragments(url), str, fn frag, acc ->
+      String.replace(acc, frag, "[redacted]")
+    end)
+  end
+
   defp scrub(other, _url), do: other
+
+  defp secret_fragments(url) do
+    uri = URI.parse(url)
+
+    [url, uri.path, uri.userinfo, uri.query]
+    |> Enum.filter(&(is_binary(&1) and byte_size(&1) > 1))
+    |> Enum.uniq()
+    |> Enum.sort_by(&byte_size/1, :desc)
+  end
 
   # Only the {:curl, code, msg} shape run_curl/2 itself emits carries a
   # string that could contain the URL — an injected custom runner may return

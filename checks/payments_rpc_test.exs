@@ -45,4 +45,45 @@ end
 Check.check(f, "curl-exit-nonzero error tuple has the rpc_url scrubbed",
   is_binary(curl_exit_msg) and not String.contains?(curl_exit_msg, "SECRETKEY"))
 
+# ── 3b: path-aware scrub. Provider error bodies routinely echo only the URL
+# PATH (`/v2/<APIKEY>`) — where Alchemy/Infura-style keys live — not the full
+# origin. A whole-URL-only replace leaks the key into {:error, _} tuples that
+# Usdc.poll logs verbatim. Cover BOTH the {:curl, ...} error path and the
+# not-JSON success path with a body containing only the path.
+path_only_curl_runner = fn _args, _config_path ->
+  {:error, {:curl, 22, "curl: (22) The requested URL /v2/SECRETKEY returned error: 401"}}
+end
+
+{:error, {:curl, 22, path_only_msg}} =
+  Rpc.call(chain, "eth_blockNumber", [], runner: path_only_curl_runner)
+
+Check.check(f, "3b: error body echoing only the URL PATH is scrubbed (no key fragment)",
+  is_binary(path_only_msg) and not String.contains?(path_only_msg, "SECRETKEY") and
+    not String.contains?(path_only_msg, "/v2/SECRETKEY"))
+
+path_only_not_json_runner = fn _, _ ->
+  {:ok, "404 page not found: /v2/SECRETKEY does not exist"}
+end
+
+{:error, {:not_json, path_only_slice}} =
+  Rpc.call(chain, "eth_blockNumber", [], runner: path_only_not_json_runner)
+
+Check.check(f, "3b: not-json body echoing only the URL PATH is scrubbed (no key fragment)",
+  not String.contains?(path_only_slice, "SECRETKEY") and
+    not String.contains?(path_only_slice, "/v2/SECRETKEY"))
+
+# userinfo- and query-keyed URLs leak the same way — pin those fragments too
+keyed_chain = %{name: "base", rpc_url: "https://user:QUERYPASS@node.example.org/rpc?apikey=QUERYKEY"}
+
+keyed_runner = fn _, _ ->
+  {:ok, "unauthorized for user:QUERYPASS with apikey=QUERYKEY"}
+end
+
+{:error, {:not_json, keyed_slice}} =
+  Rpc.call(keyed_chain, "eth_blockNumber", [], runner: keyed_runner)
+
+Check.check(f, "3b: userinfo and query fragments of the rpc_url are scrubbed too",
+  not String.contains?(keyed_slice, "QUERYPASS") and
+    not String.contains?(keyed_slice, "QUERYKEY"))
+
 Check.finish(f)
