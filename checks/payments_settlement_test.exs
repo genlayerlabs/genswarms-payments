@@ -1,0 +1,350 @@
+Code.require_file(Path.join(__DIR__, "support.exs"))
+f = Check.start()
+alias Genswarms.Payments
+
+defmodule LedgerStore do
+  def reset do
+    :persistent_term.put({__MODULE__, :seen}, MapSet.new())
+    :persistent_term.put({__MODULE__, :rows}, [])
+    :persistent_term.put({__MODULE__, :down}, false)
+  end
+
+  def down!(flag), do: :persistent_term.put({__MODULE__, :down}, flag)
+  defp down?, do: :persistent_term.get({__MODULE__, :down}, false)
+  def rows, do: :persistent_term.get({__MODULE__, :rows}, [])
+
+  def payment_seen?(key) do
+    if down?(), do: {:error, :db_down},
+      else: {:ok, MapSet.member?(:persistent_term.get({__MODULE__, :seen}), key)}
+  end
+
+  def record_payment(row) do
+    if down?() do
+      {:error, :db_down}
+    else
+      :persistent_term.put({__MODULE__, :seen},
+        MapSet.put(:persistent_term.get({__MODULE__, :seen}), row.idempotency_key))
+      :persistent_term.put({__MODULE__, :rows}, [row | rows()])
+      :ok
+    end
+  end
+
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_chain), do: {:ok, nil}
+  def put_last_scanned_block(_chain, _n), do: :ok
+end
+
+LedgerStore.reset()
+{:ok, delivered} = Agent.start_link(fn -> [] end)
+
+state =
+  Payments.init(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["llm_proxy", "audit_log"],
+    store_mod: LedgerStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn target, from, content ->
+      Agent.update(delivered, &[{target, from, Jason.decode!(content)} | &1])
+      :ok
+    end
+  })
+
+s = %{
+  beneficiary: "budget:abc",
+  amount_usd: Decimal.new("5.00"),
+  method: "usdc_base",
+  ref: "0xTX:3",
+  idempotency_key: "base:0xTX:3",
+  namespace: "llm_quota"
+}
+
+{n, state} = Payments.settle([s], state)
+msgs = Agent.get(delivered, &Enum.reverse(&1))
+
+Check.check(f, "one settlement settled", n == 1)
+Check.check(f, "delivered to BOTH allowlisted targets, stamped with object name",
+  Enum.map(msgs, fn {t, from, _} -> {t, from} end) ==
+    [{"llm_proxy", :payments}, {"audit_log", :payments}])
+
+{_, _, payload} = hd(msgs)
+Check.check(f, "payload shape",
+  payload["action"] == "payment_confirmed" and payload["beneficiary"] == "budget:abc" and
+    payload["amount_usd"] == "5.00" and payload["method"] == "usdc_base" and
+    payload["namespace"] == "llm_quota" and payload["at"] == "2026-07-22T12:00:00Z")
+
+# idempotency: same key again ⇒ nothing
+Agent.update(delivered, fn _ -> [] end)
+{n2, state} = Payments.settle([s], state)
+Check.check(f, "duplicate idempotency_key ⇒ zero settled, zero delivered",
+  n2 == 0 and Agent.get(delivered, & &1) == [])
+Check.check(f, "ledger recorded exactly once", length(LedgerStore.rows()) == 1)
+
+# FAIL CLOSED: store down ⇒ nothing settles, nothing delivered
+LedgerStore.down!(true)
+s2 = %{s | idempotency_key: "base:0xTX:4", ref: "0xTX:4"}
+{n3, state} = Payments.settle([s2], state)
+Check.check(f, "store down ⇒ fail closed (0 settled, 0 delivered)",
+  n3 == 0 and Agent.get(delivered, & &1) == [])
+
+# recovery: store back up ⇒ the SAME settlement goes through
+LedgerStore.down!(false)
+{n4, _state} = Payments.settle([s2], state)
+Check.check(f, "after store recovery the held settlement settles", n4 == 1)
+
+# no store (dev): memory dedup still works
+ok_dev =
+  Payments.init(%{
+    name: :p2,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    targets: ["t"],
+    trusted_sources: [],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: fn _, _, _ -> :ok end
+  })
+
+{d1, ok_dev} = Payments.settle([s], ok_dev)
+{d2, _} = Payments.settle([s], ok_dev)
+Check.check(f, "dev mode (no store): settles once, memory-dedups the repeat",
+  d1 == 1 and d2 == 0)
+
+# ── B1(i): multi-target delivery isolation — a raise on one target must not
+# block delivery to the other (a disclosed gap the review called out).
+{:ok, raise_flag} = Agent.start_link(fn -> true end)
+{:ok, delivered2} = Agent.start_link(fn -> [] end)
+
+isolating_deliver = fn target, from, _content ->
+  if target == "flaky" and Agent.get(raise_flag, & &1) do
+    raise "boom"
+  else
+    Agent.update(delivered2, &[{target, from} | &1])
+    :ok
+  end
+end
+
+state_iso =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["flaky", "reliable"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: isolating_deliver
+  })
+
+s_iso = %{s | idempotency_key: "iso:1", ref: "iso:1"}
+{n_iso, state_iso} = Payments.settle([s_iso], state_iso)
+
+Check.check(f, "one target raising doesn't block delivery to the OTHER target",
+  n_iso == 1 and Agent.get(delivered2, & &1) == [{"reliable", :payments}])
+Check.check(f, "the raising target is queued in undelivered for retry",
+  Map.has_key?(state_iso.undelivered, "iso:1") and
+    state_iso.undelivered["iso:1"].targets == ["flaky"])
+
+# ── B1(ii): a GenServer-call-timeout-shaped EXIT must not crash the tick
+# either, and the delivery is retried (and cleared) on the next poll.
+exiting_deliver = fn target, _from, _content ->
+  if target == "flaky2", do: exit(:timeout), else: :ok
+end
+
+state_exit =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["flaky2"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: exiting_deliver
+  })
+
+s_exit = %{s | idempotency_key: "exitk:1", ref: "exitk:1"}
+{n_exit, state_exit} = Payments.settle([s_exit], state_exit)
+
+Check.check(f, "a delivery EXIT is caught (no crash); settlement still counts; entry queued",
+  n_exit == 1 and Map.has_key?(state_exit.undelivered, "exitk:1"))
+
+{:ok, retried} = Agent.start_link(fn -> [] end)
+
+working_deliver = fn target, from, _content ->
+  Agent.update(retried, &[{target, from} | &1])
+  :ok
+end
+
+state_exit = %{state_exit | deliver_fn: working_deliver}
+state_exit = Payments.poll(state_exit)
+
+Check.check(f, "poll retries undelivered entries and clears them once delivered",
+  Agent.get(retried, & &1) == [{"flaky2", :payments}] and state_exit.undelivered == %{})
+
+# ── 2a: an {:error, _} RETURN from deliver_fn (no raise, no exit) is a
+# delivered-loss bug on current code — deliver_one hardcodes :ok after
+# invoking deliver_fn, so an error-shaped return is silently treated as a
+# success: the credit is recorded, dedup blocks re-presentation, and the
+# target never actually got it. Only a literal :ok may count as delivered.
+error_return_deliver = fn target, _from, _content ->
+  if target == "down_by_return", do: {:error, :target_down}, else: :ok
+end
+
+state_2a =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["down_by_return"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: error_return_deliver
+  })
+
+s_2a = %{s | idempotency_key: "returnfail:1", ref: "returnfail:1"}
+{n_2a, state_2a} = Payments.settle([s_2a], state_2a)
+
+Check.check(f, "2a: deliver_fn returning {:error,_} (not raising) is NOT counted as delivered",
+  n_2a == 1 and Map.has_key?(state_2a.undelivered, "returnfail:1"))
+
+{:ok, retried_2a} = Agent.start_link(fn -> [] end)
+
+healed_deliver_2a = fn target, from, _content ->
+  Agent.update(retried_2a, &[{target, from} | &1])
+  :ok
+end
+
+state_2a = %{state_2a | deliver_fn: healed_deliver_2a}
+state_2a = Payments.poll(state_2a)
+
+Check.check(f, "2a: once deliver_fn heals, the queued entry is retried and delivered on next poll",
+  Agent.get(retried_2a, & &1) == [{"down_by_return", :payments}] and state_2a.undelivered == %{})
+
+# ── 2a(ii): multi-target, one fails by RETURN (not raise) — only that
+# target is queued, the other delivers normally in the same round.
+{:ok, delivered_2a2} = Agent.start_link(fn -> [] end)
+
+mixed_return_deliver = fn target, from, _content ->
+  case target do
+    "bad_return" -> {:error, :nope}
+    _ ->
+      Agent.update(delivered_2a2, &[{target, from} | &1])
+      :ok
+  end
+end
+
+state_2a2 =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["bad_return", "good_target"],
+    store_mod: nil,
+    auto_tick: false,
+    deliver_fn: mixed_return_deliver
+  })
+
+s_2a2 = %{s | idempotency_key: "returnfail:2", ref: "returnfail:2"}
+{n_2a2, state_2a2} = Payments.settle([s_2a2], state_2a2)
+
+Check.check(f, "2a: only the error-RETURNING target is queued; the succeeding target delivered",
+  n_2a2 == 1 and
+    Agent.get(delivered_2a2, & &1) == [{"good_target", :payments}] and
+    Map.get(state_2a2.undelivered, "returnfail:2", %{targets: nil}).targets == ["bad_return"])
+
+# ── B3: record-write-only isolation (disclosed gap) — payment_seen? healthy,
+# record_payment fails ⇒ held; heals ⇒ the SAME settlement settles.
+defmodule WriteOnlyDownStore do
+  def reset, do: :persistent_term.put({__MODULE__, :d}, %{seen: MapSet.new(), rows: [], down: true})
+  defp d, do: :persistent_term.get({__MODULE__, :d})
+  defp put(k, v), do: :persistent_term.put({__MODULE__, :d}, Map.put(d(), k, v))
+  def down!(flag), do: put(:down, flag)
+
+  def payment_seen?(key), do: {:ok, MapSet.member?(d().seen, key)}
+
+  def record_payment(row) do
+    if d().down do
+      {:error, :db_down}
+    else
+      put(:seen, MapSet.put(d().seen, row.idempotency_key))
+      put(:rows, [row | d().rows])
+      :ok
+    end
+  end
+
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_c), do: {:ok, nil}
+  def put_last_scanned_block(_c, _n), do: :ok
+  def rows, do: d().rows
+end
+
+WriteOnlyDownStore.reset()
+{:ok, delivered3} = Agent.start_link(fn -> [] end)
+
+state_wo =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["t"],
+    store_mod: WriteOnlyDownStore,
+    auto_tick: false,
+    deliver_fn: fn t, from, _c ->
+      Agent.update(delivered3, &[{t, from} | &1])
+      :ok
+    end
+  })
+
+s_wo = %{s | idempotency_key: "wo:1", ref: "wo:1"}
+{n_wo, state_wo} = Payments.settle([s_wo], state_wo)
+
+Check.check(f, "payment_seen? ok but record_payment fails ⇒ held (0 settled, 0 delivered)",
+  n_wo == 0 and Agent.get(delivered3, & &1) == [])
+
+WriteOnlyDownStore.down!(false)
+{n_wo2, _state_wo} = Payments.settle([s_wo], state_wo)
+
+Check.check(f, "after record_payment heals, the SAME settlement settles",
+  n_wo2 == 1 and length(WriteOnlyDownStore.rows()) == 1)
+
+# ── 2d: the shipped DEFAULT deliver_fn must honor the same contract the
+# injected fns above are held to. It used to discard ObjectServer's return
+# and hardcode :ok, so an error-shaped RETURN (e.g. {:error, :unknown_target})
+# was silently counted as delivered — settlement recorded, dedup blocks
+# re-presentation, delivery lost forever. The peer call's result now flows
+# through map_peer_delivery_result/1; pin the mapping directly (ObjectServer
+# itself is host-provided and not hermetically callable here).
+Check.check(f, "2d: peer returning :ok maps to delivered",
+  Payments.map_peer_delivery_result(:ok) == :ok)
+Check.check(f, "2d: peer returning {:ok, _} maps to delivered",
+  Payments.map_peer_delivery_result({:ok, :queued}) == :ok)
+Check.check(f, "2d: peer returning {:error, _} passes through as the failure",
+  Payments.map_peer_delivery_result({:error, :unknown_target}) == {:error, :unknown_target})
+Check.check(f, "2d: any other peer return is a failure, not silently delivered",
+  Payments.map_peer_delivery_result(:noop) == {:error, {:bad_return, :noop}} and
+    Payments.map_peer_delivery_result(nil) == {:error, {:bad_return, nil}})
+
+# The default fn itself (no deliver_fn injected): ObjectServer is absent in
+# this hermetic run, so the apply raises UndefinedFunctionError — deliver_one
+# must catch it and queue the target, never crash or count it delivered.
+state_2d =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["peer_obj"],
+    store_mod: nil,
+    auto_tick: false
+  })
+
+s_2d = %{s | idempotency_key: "default_fn:1", ref: "default_fn:1"}
+
+result_2d =
+  try do
+    {:ok, Payments.settle([s_2d], state_2d)}
+  rescue
+    e -> {:raised, e}
+  catch
+    kind, reason -> {kind, reason}
+  end
+
+Check.check(f, "2d: default deliver_fn with an absent ObjectServer doesn't crash; target queued for retry",
+  match?({:ok, {1, %{undelivered: %{"default_fn:1" => %{targets: ["peer_obj"]}}}}}, result_2d))
+
+Check.finish(f)

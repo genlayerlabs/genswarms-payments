@@ -6,6 +6,14 @@ defmodule Genswarms.Payments.Store do
   errors: without durable dedup there is no safe way to guarantee a payment is
   credited exactly once. No store at all (dev) = memory fallback is fine.
 
+  The fail-closed rule keys off whether the callback is *exported*, not
+  whether `store_mod` is nil: a coherence-legal store that implements the
+  bindings group but not the settlement group (`payment_seen?/1`,
+  `record_payment/1`, ...) is NOT-EXPORTED for those callbacks, and is
+  treated exactly like a nil store — memory dedup, not a permanent hold. Only
+  an EXPORTED callback that raises, exits, or returns `{:error, _}` fails
+  closed.
+
   Money is `Decimal`. Addresses are EIP-55 checksummed strings.
   """
 
