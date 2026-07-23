@@ -375,4 +375,89 @@ state_dedup = Payments.poll(state_dedup)
 Check.check(f, "2b: a log already durably seen (dedup) still counts as settled — cursor advances",
   CursorInvariantStore.cursor("dedupchain") == 200 and CursorInvariantStore.rows() == [])
 
+# ── 2c: pin the cursor-read fallback default. A store that EXPORTS
+# get_last_scanned_block/1 but RAISES on every call (other settlement
+# callbacks work fine) must fail closed: scan_from/2 sees {:error, _} from
+# the cursor read (NOT {:ok, nil}), so the chain's round is skipped
+# entirely — no eth_getLogs at all this tick, not even a rescan from
+# start_block. The wrong default ({:ok, nil}) would instead treat the
+# raising store as "never scanned" and rescan from start_block, calling
+# eth_getLogs with fromBlock = start_block — the rescan-storm bug.
+defmodule RaisingCursorStore do
+  def reset,
+    do: :persistent_term.put({__MODULE__, :d}, %{seen: MapSet.new(), rows: [], bindings: []})
+
+  defp d, do: :persistent_term.get({__MODULE__, :d})
+  defp put(k, v), do: :persistent_term.put({__MODULE__, :d}, Map.put(d(), k, v))
+
+  def put_address_binding(b), do: put(:bindings, [b | d().bindings])
+  def list_address_bindings, do: {:ok, d().bindings}
+  def payment_seen?(k), do: {:ok, MapSet.member?(d().seen, k)}
+
+  def record_payment(row) do
+    put(:seen, MapSet.put(d().seen, row.idempotency_key))
+    put(:rows, [row | d().rows])
+    :ok
+  end
+
+  def rows, do: d().rows
+
+  # EXPORTED but RAISING on every call — the fallback default matters here.
+  def get_last_scanned_block(_chain), do: raise("cursor store unavailable")
+  def put_last_scanned_block(_chain, _n), do: :ok
+end
+
+RaisingCursorStore.reset()
+
+state_raising0 =
+  Payments.init(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"],
+    namespace: "llm_quota",
+    store_mod: RaisingCursorStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn _, _, _ -> :ok end,
+    chains: [
+      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+        confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000,
+        address_chunk: 2}
+    ],
+    rpc_fn: nil
+  })
+
+# bind a beneficiary so the chain has something to (not) scan for
+{:reply, jraise, state_raising0} =
+  Payments.handle_message("ingress",
+    Jason.encode!(%{action: "deposit_address", beneficiary: "budget:raising"}), state_raising0)
+addr_raising = Jason.decode!(jraise)["address"]
+
+# canned logs are available (would settle if fetched) but must never be reached
+log_raising = mk_log.(addr_raising, 150, "0xRAISING", 0)
+
+{:ok, rpc_log_raising} = Agent.start_link(fn -> [] end)
+
+rpc_raising = fn _chain, method, _params ->
+  Agent.update(rpc_log_raising, &[method | &1])
+  case method do
+    "eth_blockNumber" -> {:ok, "0xc8"}
+    "eth_getLogs" -> {:ok, [log_raising]}
+  end
+end
+
+state_raising = %{state_raising0 | rpc_fn: rpc_raising}
+_state_raising = Payments.poll(state_raising)
+
+raising_get_logs_calls =
+  Agent.get(rpc_log_raising, &Enum.count(&1, fn m -> m == "eth_getLogs" end))
+
+Check.check(f,
+  "2c: get_last_scanned_block raising skips the round — zero eth_getLogs, no rescan-from-start_block",
+  raising_get_logs_calls == 0)
+
+Check.check(f, "2c: no settlement recorded and cursor stays untouched while the cursor store raises",
+  RaisingCursorStore.rows() == [])
+
 Check.finish(f)
