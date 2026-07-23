@@ -61,3 +61,44 @@
   ledger write, no delivery; cursor still advances) — `transfer(victim, 0)`
   costs an attacker only gas and would otherwise grow the ledger, seen-set,
   and delivery fan-out for free.
+- The USDC watcher fails CLOSED on a log missing `transactionHash` (chain
+  held, cursor unmoved — consistent with every other malformed field)
+  instead of settling under the nil-interpolated dedup key
+  `"<chain>::<logIndex>"`, which a durable store then remembered forever,
+  silently swallowing every future colliding hash-less log while the
+  cursor advanced.
+- `HD.parse_xpub` verifies the embedded pubkey is actually ON secp256k1
+  (y² ≡ x³ + 7 mod p, and x < p) and rejects off-curve keys as
+  `{:error, :not_on_curve}` — a validly-checksummed off-curve xpub
+  previously derived valid-looking EIP-55 addresses no private key
+  controls (one bad config value = a permanently unspendable address
+  tree).
+- All USDC watcher hex comparisons are case-insensitive (topic0, to-address
+  topic, contract address, watched-address matching) — an uppercase-hex
+  provider's Transfer logs were silently missed while the cursor advanced.
+- `removed: true` reorg-marker logs are skipped entirely (no settlement,
+  no delivery; the cursor advances normally — the log is officially
+  retracted).
+- The RPC config-tempfile hardening (exclusive create + chmod 600 before
+  the secret write) is extracted to `Rpc.open_config_exclusively!/1` and
+  pinned by checks — it was previously an unpinned mutation survivor.
+
+### Known limitations (v1 riders)
+
+- Namespace is config-level, not per-requesting-source: the design's
+  "namespace defaults to the requesting source" is not implemented, because
+  binding identity (state map, store contract, `payment_status`) is keyed by
+  the bare beneficiary string — per-source namespaces require re-keying
+  bindings by (namespace, beneficiary) across the store contract and host
+  schemas. Equivalent while a hub serves one trusted consumer; run one hub
+  namespace per consumer until then.
+- Settlements recorded while `targets: []` are never re-delivered after
+  targets are wired later (durable dedup blocks re-presentation) — wire
+  targets before announcing deposit addresses, or reconcile manually via
+  `payment_status`.
+- Outgoing `fromBlock`/`toBlock` quantities are uppercase hex (`"0xC8"`);
+  the canonical JSON-RPC quantity encoding is lowercase and a strict
+  provider/validator could reject them.
+- URL scrubbing does not redact API keys embedded in the HOSTNAME
+  (`https://<key>.provider.com/`); full URL, path, userinfo, and query
+  fragments are covered.
