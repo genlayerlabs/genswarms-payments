@@ -584,4 +584,35 @@ Check.check(f, "R3-M2: the sibling normal log in the same batch still settles an
   Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xSIBLING:0")) and
     ScanStore.cursor("base") == 190)
 
+# ── R3-R1: malformed topics fail CLOSED like a missing transactionHash. The
+# getLogs filter pinned topic0 and the to-address position, so a 3-topic log
+# with a nil to-topic (or any non-3-binary-topics shape) is provider garbage
+# that may be a real payment with mangled topics — it must hold the chain
+# (cursor unmoved), never silently skip past it.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+nil_topic_log = Map.update!(mk_log.(addr, 150, "0xNILTOPIC", 0), "topics", fn [t0, from, _to] -> [t0, from, nil] end)
+
+nil_topic_result =
+  try do
+    Payments.poll(%{state0 | rpc_fn: canned.([nil_topic_log], 200)})
+    :ok
+  rescue
+    e -> {:raised, e}
+  end
+
+Check.check(f, "R3-R1: a Transfer log with nil to-topic never settles (no ledger row)",
+  ScanStore.rows() == [])
+Check.check(f, "R3-R1: the failure is contained (poll survives, chain merely held)",
+  nil_topic_result == :ok)
+Check.check(f, "R3-R1: cursor NOT advanced past the nil-topic log",
+  ScanStore.cursor("base") == nil)
+
+# a later well-formed log at the same coordinates still settles — held, not lost
+_ = Payments.poll(%{state0 | rpc_fn: canned.([mk_log.(addr, 150, "0xTOPICOK", 0)], 200)})
+Check.check(f, "R3-R1: a later well-formed log settles and the cursor advances",
+  Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["base:0xTOPICOK:0"] and
+    ScanStore.cursor("base") == 190)
+
 Check.finish(f)

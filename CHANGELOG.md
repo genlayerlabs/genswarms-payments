@@ -10,6 +10,11 @@
 
 ### Hardening (pre-release audit)
 
+- A log whose `topics` don't decode as a 3-binary-topic Transfer (nil
+  to-topic, wrong arity, non-list) now fails CLOSED — the chain is held
+  with the cursor unmoved, like a missing `transactionHash` — instead of
+  being silently skipped while the cursor advanced past a possibly real
+  payment with mangled topics.
 - Store seams (`init_bindings`, `store_result`, `store_write`) now
   `catch kind, reason` instead of `rescue`, so an EXIT-shaped store failure
   (GenServer call timeout, dead Ecto pool) degrades/holds instead of

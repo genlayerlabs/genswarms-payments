@@ -165,8 +165,14 @@ defmodule Genswarms.Payments.Usdc do
           []
         end
 
-      _other ->
-        []
+      # The getLogs filter pinned topic0 to @transfer_topic and position 2 to
+      # the watched-address set, so any other shape (nil to-topic, wrong
+      # arity, non-list) is provider garbage that may be a real payment with
+      # mangled topics. Fail CLOSED like tx_hash!/1 — raise, rescued by
+      # safe_scan_chain/3, chain held with the cursor unmoved — instead of
+      # skipping and advancing the cursor past a payment we could not read.
+      other ->
+        raise ArgumentError, "log with malformed topics: #{inspect(other)}"
     end
   end
 
