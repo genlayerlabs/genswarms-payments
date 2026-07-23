@@ -10,6 +10,8 @@ defmodule Genswarms.Payments.HD do
   @b58_alphabet ~c(123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz)
   # mainnet public version bytes 0x0488B21E ("xpub")
   @xpub_version <<0x04, 0x88, 0xB2, 0x1E>>
+  # secp256k1 field prime
+  @secp256k1_p 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 
   @spec parse_xpub(String.t()) ::
           {:ok, %{chain_code: binary(), pubkey: binary(), depth: byte()}} | {:error, atom()}
@@ -18,10 +20,15 @@ defmodule Genswarms.Payments.HD do
       case payload do
         <<@xpub_version, depth::8, _fingerprint::binary-4, _child::binary-4,
           chain_code::binary-32, pubkey::binary-33>> ->
-          if :binary.first(pubkey) in [2, 3] do
-            {:ok, %{chain_code: chain_code, pubkey: pubkey, depth: depth}}
-          else
-            {:error, :not_an_xpub}
+          cond do
+            :binary.first(pubkey) not in [2, 3] ->
+              {:error, :not_an_xpub}
+
+            not on_curve?(pubkey) ->
+              {:error, :not_on_curve}
+
+            true ->
+              {:ok, %{chain_code: chain_code, pubkey: pubkey, depth: depth}}
           end
 
         <<_version::binary-4, _rest::binary-74>> ->
@@ -31,6 +38,23 @@ defmodule Genswarms.Payments.HD do
           {:error, :bad_length}
       end
     end
+  end
+
+  # A validly-checksummed xpub can still embed an x-coordinate with NO point
+  # on secp256k1 — curvy's decompression "square-roots" non-residues without
+  # checking, so derivation from such a key silently yields valid-looking
+  # EIP-55 addresses no private key on earth controls: permanent fund loss at
+  # the root of the whole tree, from one bad operator-config value. Verify
+  # curve membership at parse time: decompress x and require y² ≡ x³ + 7
+  # (mod p), taking the candidate root as rhs^((p+1)/4) (valid since
+  # p ≡ 3 mod 4); if rhs is a non-residue that candidate fails the square
+  # check and the xpub is rejected. Also requires x < p (no field overflow).
+  defp on_curve?(<<_prefix::8, x_bin::binary-32>>) do
+    p = @secp256k1_p
+    x = :binary.decode_unsigned(x_bin)
+    rhs = rem(rem(x * x, p) * x + 7, p)
+    y = :binary.decode_unsigned(:crypto.mod_pow(rhs, div(p + 1, 4), p))
+    x < p and rem(y * y, p) == rhs
   end
 
   defp base58check_decode(str) do

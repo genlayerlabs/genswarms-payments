@@ -70,4 +70,22 @@ Check.check(
   HD.parse_xpub(crafted_xpub) == {:error, :not_an_xpub}
 )
 
+# --- Regression (R3-I2): a validly-checksummed xpub whose embedded pubkey is
+# NOT a point on secp256k1 (here x = 5, correct base58check, 0x02 prefix)
+# must be rejected at parse time. Before the on-curve check, curvy's
+# decompression happily "square-rooted" the non-residue and derivation
+# produced valid-looking EIP-55 addresses no private key on earth controls —
+# one bad operator-config value = a silently unspendable address tree.
+offcurve_xpub =
+  "xpub6Bn3YAipEwKc3jmTf2673DahZ79ZU2Fr8tC8hhGXPrTDosnbeUtAm6itq8vqB383puZ7FAzqTsj57gZvUTxwPBKUJRFb3YZrJthEqVW23qK"
+
+Check.check(f, "off-curve pubkey (x = 5) rejected as :not_on_curve",
+  HD.parse_xpub(offcurve_xpub) == {:error, :not_on_curve})
+
+# the genuine test xpub still parses and derives the ethers.js-pinned ADDR0
+Check.check(f, "on-curve xpub still parses and derives the pinned index-0 address",
+  match?({:ok, _}, HD.parse_xpub(xpub)) and
+    (fn -> {:ok, p} = HD.parse_xpub(xpub); HD.address(p, 0) end).() ==
+      {:ok, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94"})
+
 Check.finish(f)
