@@ -166,14 +166,15 @@ defmodule Genswarms.Payments.Usdc do
             else
               amount = Decimal.div(Decimal.new(raw), Decimal.new(Integer.pow(10, decimals)))
               log_index = hex_int(log["logIndex"])
+              tx_hash = tx_hash!(log)
 
               [
                 %{
                   beneficiary: beneficiary,
                   amount_usd: amount,
                   method: "usdc_#{chain.name}",
-                  ref: "#{log["transactionHash"]}:#{log_index}",
-                  idempotency_key: "#{chain.name}:#{log["transactionHash"]}:#{log_index}",
+                  ref: "#{tx_hash}:#{log_index}",
+                  idempotency_key: "#{chain.name}:#{tx_hash}:#{log_index}",
                   namespace: namespace
                 }
               ]
@@ -185,6 +186,21 @@ defmodule Genswarms.Payments.Usdc do
 
       _other ->
         []
+    end
+  end
+
+  # A log with no usable transactionHash must fail CLOSED like every other
+  # malformed field: missing logIndex/data/blockNumber crash hex_int/1, are
+  # rescued by safe_scan_chain/3, and hold the whole chain (cursor unmoved,
+  # retried next tick). Interpolating nil instead minted the garbage durable
+  # dedup key "<chain>::<logIndex>" — once a durable store had seen it, every
+  # future hash-less log at that logIndex was silently swallowed while the
+  # cursor advanced: credit lost, no log line, no held settlement, and a ref
+  # (":0") reconciliation can't tie to a tx.
+  defp tx_hash!(log) do
+    case log["transactionHash"] do
+      tx when is_binary(tx) and tx != "" -> tx
+      other -> raise ArgumentError, "log missing transactionHash: #{inspect(other)}"
     end
   end
 

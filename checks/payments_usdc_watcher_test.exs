@@ -491,4 +491,41 @@ Check.check(f, "2e: the legit non-zero log in the same batch still settles",
 Check.check(f, "2e: the cursor still advances normally past the skipped dust log",
   ScanStore.cursor("base") == 190)
 
+# ── R3-I1: a log MISSING transactionHash must fail CLOSED like every other
+# malformed field — chain held, cursor unmoved, NO settlement and NO ledger
+# write. It used to settle under the nil-interpolated garbage key
+# "base::0"; with a durable store that key was then seen FOREVER, silently
+# swallowing any future hash-less log at logIndex 0 while the cursor
+# advanced past it.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+hashless_log = Map.delete(mk_log.(addr, 150, "0xIGNORED", 0), "transactionHash")
+
+state_hashless = %{state0 | rpc_fn: canned.([hashless_log], 200)}
+
+hashless_result =
+  try do
+    Payments.poll(state_hashless)
+    :ok
+  rescue
+    e -> {:raised, e}
+  end
+
+Check.check(f, "R3-I1: a log without transactionHash never settles (no ledger row, no garbage key)",
+  ScanStore.rows() == [])
+Check.check(f, "R3-I1: the failure is contained (poll survives, chain merely held)",
+  hashless_result == :ok)
+Check.check(f, "R3-I1: cursor NOT advanced past the hash-less log",
+  ScanStore.cursor("base") == nil)
+
+# a later well-formed log at the same (block, logIndex) coordinates still
+# settles under its correct chain:tx:logIndex key — nothing was poisoned
+state_healed = %{state0 | rpc_fn: canned.([mk_log.(addr, 150, "0xHEALED", 0)], 200)}
+_state_healed = Payments.poll(state_healed)
+
+Check.check(f, "R3-I1: a later well-formed log settles under its correct key",
+  Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["base:0xHEALED:0"] and
+    ScanStore.cursor("base") == 190)
+
 Check.finish(f)
