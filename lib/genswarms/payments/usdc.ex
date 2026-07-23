@@ -154,19 +154,30 @@ defmodule Genswarms.Payments.Usdc do
           {:ok, %{beneficiary: beneficiary, namespace: namespace}} ->
             decimals = Map.get(chain, :decimals, 6)
             raw = hex_int(log["data"])
-            amount = Decimal.div(Decimal.new(raw), Decimal.new(Integer.pow(10, decimals)))
-            log_index = hex_int(log["logIndex"])
 
-            [
-              %{
-                beneficiary: beneficiary,
-                amount_usd: amount,
-                method: "usdc_#{chain.name}",
-                ref: "#{log["transactionHash"]}:#{log_index}",
-                idempotency_key: "#{chain.name}:#{log["transactionHash"]}:#{log_index}",
-                namespace: namespace
-              }
-            ]
+            # Zero-value Transfer events are real logs anyone can emit for
+            # only gas (`transfer(victim, 0)`), and "any amount becomes
+            # credit" means USDC actually ARRIVING — 0 is not an arrival.
+            # Settling them would let an attacker grow the ledger, seen-set,
+            # and delivery fan-out for free; skip with no ledger write (the
+            # cursor still advances normally — nothing is held).
+            if raw == 0 do
+              []
+            else
+              amount = Decimal.div(Decimal.new(raw), Decimal.new(Integer.pow(10, decimals)))
+              log_index = hex_int(log["logIndex"])
+
+              [
+                %{
+                  beneficiary: beneficiary,
+                  amount_usd: amount,
+                  method: "usdc_#{chain.name}",
+                  ref: "#{log["transactionHash"]}:#{log_index}",
+                  idempotency_key: "#{chain.name}:#{log["transactionHash"]}:#{log_index}",
+                  namespace: namespace
+                }
+              ]
+            end
 
           :error ->
             []

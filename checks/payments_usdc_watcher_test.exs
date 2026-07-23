@@ -460,4 +460,35 @@ Check.check(f,
 Check.check(f, "2c: no settlement recorded and cursor stays untouched while the cursor store raises",
   RaisingCursorStore.rows() == [])
 
+# ── 2e: zero-value Transfer dust filter. `transfer(victim, 0)` emits a real
+# log anyone can produce for only gas; settling it grows the ledger, the
+# seen-set, and the delivery fan-out for free. A zero-amount log must produce
+# NO settlement and NO delivery — but it is not held either: the cursor still
+# advances normally, and a legit non-zero log in the same batch settles.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+{:ok, delivered_dust} = Agent.start_link(fn -> [] end)
+
+zero_value_hex = "0x" <> String.duplicate("0", 64)
+zero_log = %{mk_log.(addr, 150, "0xDUST", 0) | "data" => zero_value_hex}
+paid_log = mk_log.(addr, 151, "0xPAID", 0)
+
+state_dust = %{
+  state0
+  | rpc_fn: canned.([zero_log, paid_log], 200),
+    deliver_fn: fn t, from, _c -> (Agent.update(delivered_dust, &[{t, from} | &1]); :ok) end
+}
+
+_state_dust = Payments.poll(state_dust)
+
+Check.check(f, "2e: a zero-value Transfer log never settles (no ledger row)",
+  not Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xDUST:0")))
+Check.check(f, "2e: a zero-value Transfer log never delivers payment_confirmed",
+  Agent.get(delivered_dust, & &1) == [{"llm_proxy", :payments}])
+Check.check(f, "2e: the legit non-zero log in the same batch still settles",
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xPAID:0")))
+Check.check(f, "2e: the cursor still advances normally past the skipped dust log",
+  ScanStore.cursor("base") == 190)
+
 Check.finish(f)
