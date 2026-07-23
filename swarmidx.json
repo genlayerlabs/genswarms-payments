@@ -1,0 +1,15 @@
+{
+  "registry": {
+    "scope": "genlayerlabs"
+  },
+  "packages": [
+    {
+      "name": "genswarms-payments",
+      "dir": ".",
+      "kind": "handler",
+      "description": "Payments hub object: pluggable payment methods (in-tree USDC watcher, watch-only HD deposit addresses), idempotent settlement ledger, stamped payment_confirmed delivery to allowlisted targets",
+      "skill": ".claude/skills/genswarms-payments-use/SKILL.md",
+      "module": "Genswarms.Payments"
+    }
+  ]
+}
