@@ -147,44 +147,54 @@ defmodule Genswarms.Payments.Usdc do
 
   defp to_settlement(log, chain, watched) do
     case log["topics"] do
-      [@transfer_topic, _from_topic, to_topic] ->
-        to_addr = topic_address(to_topic)
-
-        case Map.fetch(watched, to_addr) do
-          {:ok, %{beneficiary: beneficiary, namespace: namespace}} ->
-            decimals = Map.get(chain, :decimals, 6)
-            raw = hex_int(log["data"])
-
-            # Zero-value Transfer events are real logs anyone can emit for
-            # only gas (`transfer(victim, 0)`), and "any amount becomes
-            # credit" means USDC actually ARRIVING — 0 is not an arrival.
-            # Settling them would let an attacker grow the ledger, seen-set,
-            # and delivery fan-out for free; skip with no ledger write (the
-            # cursor still advances normally — nothing is held).
-            if raw == 0 do
-              []
-            else
-              amount = Decimal.div(Decimal.new(raw), Decimal.new(Integer.pow(10, decimals)))
-              log_index = hex_int(log["logIndex"])
-              tx_hash = tx_hash!(log)
-
-              [
-                %{
-                  beneficiary: beneficiary,
-                  amount_usd: amount,
-                  method: "usdc_#{chain.name}",
-                  ref: "#{tx_hash}:#{log_index}",
-                  idempotency_key: "#{chain.name}:#{tx_hash}:#{log_index}",
-                  namespace: namespace
-                }
-              ]
-            end
-
-          :error ->
-            []
+      # Topic0 matching is case-INSENSITIVE, like same_contract?/2 and
+      # topic_address/1 — the module already decided hex case can vary, and
+      # an uppercase-hex provider must not silently miss payments while the
+      # cursor advances (credit lost, never re-presented).
+      [topic0, _from_topic, to_topic] when is_binary(topic0) and is_binary(to_topic) ->
+        if String.downcase(topic0) == @transfer_topic do
+          transfer_settlement(log, chain, watched, to_topic)
+        else
+          []
         end
 
       _other ->
+        []
+    end
+  end
+
+  defp transfer_settlement(log, chain, watched, to_topic) do
+    case Map.fetch(watched, topic_address(to_topic)) do
+      {:ok, %{beneficiary: beneficiary, namespace: namespace}} ->
+        decimals = Map.get(chain, :decimals, 6)
+        raw = hex_int(log["data"])
+
+        # Zero-value Transfer events are real logs anyone can emit for
+        # only gas (`transfer(victim, 0)`), and "any amount becomes
+        # credit" means USDC actually ARRIVING — 0 is not an arrival.
+        # Settling them would let an attacker grow the ledger, seen-set,
+        # and delivery fan-out for free; skip with no ledger write (the
+        # cursor still advances normally — nothing is held).
+        if raw == 0 do
+          []
+        else
+          amount = Decimal.div(Decimal.new(raw), Decimal.new(Integer.pow(10, decimals)))
+          log_index = hex_int(log["logIndex"])
+          tx_hash = tx_hash!(log)
+
+          [
+            %{
+              beneficiary: beneficiary,
+              amount_usd: amount,
+              method: "usdc_#{chain.name}",
+              ref: "#{tx_hash}:#{log_index}",
+              idempotency_key: "#{chain.name}:#{tx_hash}:#{log_index}",
+              namespace: namespace
+            }
+          ]
+        end
+
+      :error ->
         []
     end
   end
@@ -211,7 +221,12 @@ defmodule Genswarms.Payments.Usdc do
     end)
   end
 
-  defp topic_address("0x" <> hex), do: "0x" <> String.downcase(String.slice(hex, -40, 40))
+  # Case-insensitive (downcase BEFORE matching the prefix, so even an "0X"
+  # prefix from a nonstandard node normalizes instead of crashing the scan).
+  defp topic_address(topic) when is_binary(topic) do
+    "0x" <> hex = String.downcase(topic)
+    "0x" <> String.slice(hex, -40, 40)
+  end
 
   defp pad_topic_address("0x" <> hex),
     do: "0x" <> String.duplicate("0", 24) <> String.downcase(hex)

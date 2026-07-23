@@ -528,4 +528,33 @@ Check.check(f, "R3-I1: a later well-formed log settles under its correct key",
   Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["base:0xHEALED:0"] and
     ScanStore.cursor("base") == 190)
 
+# ── R3-M1: hex comparisons are case-INSENSITIVE. A nonstandard node emitting
+# uppercase hex (topic0, to-address topic, contract address, data) used to be
+# silently missed on the topic0 exact-match while the cursor advanced — a
+# lost payment, never re-presented.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+upcase_hex = fn "0x" <> h -> "0x" <> String.upcase(h) end
+
+upper_log = %{
+  "address" => "0XCONTRACT",
+  "topics" => [
+    upcase_hex.(transfer_sig),
+    upcase_hex.(pad_addr.("0x" <> String.duplicate("a", 40))),
+    upcase_hex.(pad_addr.(addr))
+  ],
+  "data" => upcase_hex.(value_hex),
+  "blockNumber" => "0x96",
+  "transactionHash" => "0xUPPER",
+  "logIndex" => "0x0"
+}
+
+state_upper = %{state0 | rpc_fn: canned.([upper_log], 200)}
+_state_upper = Payments.poll(state_upper)
+
+Check.check(f, "R3-M1: an uppercase-hex log (topic0/topics/address/data) settles normally",
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xUPPER:0")) and
+    ScanStore.cursor("base") == 190)
+
 Check.finish(f)
