@@ -250,3 +250,24 @@ callbacks are optional so a method can be pull-only or push-only.
 mix deps.get
 ./checks/run.sh        # every checks/payments_*.exs — no Postgres, no network
 ```
+
+## End-to-end tests (`e2e/`)
+
+`e2e/` boots this hub together with the REAL `genswarms-llm-proxy` in one
+BEAM and drives the full USDC → credit → spend story across the live seam:
+deposit address (ADDR0, stable), free-budget exhaustion over real HTTP, the
+block notice carrying a hub-provided top-up hint, a canned on-chain USDC
+Transfer settling and crediting the proxy (strings-only wire), credit-funded
+spending with exact debit math, idempotent redelivery (proxy answers
+`duplicate`), and the retryable-NACK outage path (hub redelivers after the
+proxy's credit store heals — credited exactly once). Still hermetic: canned
+JSON-RPC, loopback HTTP only, no Postgres.
+
+```sh
+sh e2e/run.sh          # needs a genswarms-llm-proxy checkout:
+                       #   defaults to the sibling ../genswarms-llm-proxy,
+                       #   or set LLM_PROXY_PATH=/path/to/genswarms-llm-proxy
+```
+
+The runner fails (exit 1) when the proxy checkout is missing — the e2e never
+silently skips.

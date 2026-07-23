@@ -7,6 +7,14 @@
   payment_confirmed delivery to allowlisted targets), Method behaviour for
   pluggable modalities, in-tree USDC watcher (multi-chain, reorg-safe,
   chunked getLogs, curl JSON-RPC with keyed-URL protection).
+- Cross-package end-to-end harness (`e2e/`): boots this hub and the REAL
+  `genswarms-llm-proxy` in one BEAM and drives the full USDC → credit →
+  spend story across the live `deliver_fn` seam (deposit address, budget
+  block with hub-provided top-up hint, settlement + credit over the
+  strings-only wire, exact debit math, duplicate-redelivery and
+  retryable-NACK outage retry). `sh e2e/run.sh`; proxy checkout located via
+  `LLM_PROXY_PATH` (defaults to sibling `../genswarms-llm-proxy`), fails
+  loudly when absent. Still hermetic — canned JSON-RPC, loopback only.
 
 ### Hardening (pre-release audit)
 
