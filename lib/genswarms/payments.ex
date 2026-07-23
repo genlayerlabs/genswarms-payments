@@ -244,12 +244,16 @@ defmodule Genswarms.Payments do
   # implement payment_seen?/1 — legal per validate_store_coherence!/1 when
   # the WHOLE settlement group is absent) means "no durable dedup available",
   # which is exactly the nil-store memory-fallback situation — settle via
-  # memory dedup. EXPORTED-BUT-ERRORED (raised, exited, or returned
-  # {:error, _}) is the only case that fails closed.
+  # memory dedup. EXPORTED-BUT-ERRORED (raised, exited, returned {:error, _},
+  # or returned any non-boolean — a store answering {:ok, nil} the way
+  # Repo.one does on no row cannot answer "seen?" truthfully) is the only
+  # case that fails closed. The is_boolean guard matters: a bare {:ok, bool}
+  # match binds ANYTHING, so {:ok, nil} would escape settle_one's case as a
+  # CaseClauseError and crash-loop the object every tick.
   defp payment_seen_lookup(mod, key) do
     if exported?(mod, :payment_seen?, 1) do
       case store_result(mod, :payment_seen?, [key], {:error, :store_failed}) do
-        {:ok, bool} -> {:ok, bool}
+        {:ok, bool} when is_boolean(bool) -> {:ok, bool}
         {:error, why} -> {:error, why}
         _other -> {:error, :store_failed}
       end

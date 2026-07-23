@@ -301,4 +301,70 @@ Check.check(f, "1c: an exiting cursor-read store doesn't crash poll", result_c2 
 Check.check(f, "1c: an exiting cursor-read store skips the chain — no eth_getLogs call issued",
   not Enum.member?(Agent.get(calls_c2, & &1), "eth_getLogs"))
 
+# ── 1d: a payment_seen? returning {:ok, nil} (the realistic Repo.one-on-no-row
+# adapter bug) must NOT escape as a CaseClauseError out of handle_message and
+# crash-loop the object every tick. A bare {:ok, bool} match binds anything;
+# with the is_boolean guard the non-boolean falls to the fail-closed clause:
+# the tick completes, the payment is HELD (not settled, not lost), and the
+# cursor does not advance past it — the next round re-presents it.
+defmodule NilSeenStore do
+  def payment_seen?(_k), do: {:ok, nil}
+  def record_payment(row), do: (:persistent_term.put({__MODULE__, :rows}, [row | rows()]); :ok)
+  def rows, do: :persistent_term.get({__MODULE__, :rows}, [])
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_c), do: {:ok, :persistent_term.get({__MODULE__, :cursor}, nil)}
+  def put_last_scanned_block(_c, n), do: (:persistent_term.put({__MODULE__, :cursor}, n); :ok)
+  def cursor, do: :persistent_term.get({__MODULE__, :cursor}, nil)
+end
+
+:persistent_term.put({NilSeenStore, :rows}, [])
+:persistent_term.erase({NilSeenStore, :cursor})
+
+{:ok, delivered_d1} = Agent.start_link(fn -> [] end)
+
+state_d1 =
+  Payments.init(%{
+    name: :payments,
+    xpub: xpub,
+    trusted_sources: ["ingress"],
+    targets: ["t"],
+    namespace: "ns",
+    store_mod: NilSeenStore,
+    auto_tick: false,
+    deliver_fn: fn t, from, _c -> (Agent.update(delivered_d1, &[{t, from} | &1]); :ok) end,
+    chains: [
+      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+    ]
+  })
+
+{:reply, dj_d1, state_d1} =
+  Payments.handle_message("ingress", Jason.encode!(%{action: "deposit_address", beneficiary: "budget:nil"}), state_d1)
+addr_d1 = Jason.decode!(dj_d1)["address"]
+
+rpc_d1 = fn _chain, method, _params ->
+  case method do
+    "eth_blockNumber" -> {:ok, "0xc8"}
+    "eth_getLogs" -> {:ok, [mk_log.(addr_d1, 1, "0xNIL", 0)]}
+  end
+end
+
+state_d1 = %{state_d1 | rpc_fn: rpc_d1}
+
+result_d1 =
+  try do
+    {Payments.handle_message("ingress", Jason.encode!(%{action: "tick"}), state_d1), :ok}
+  rescue
+    e -> {:raised, e}
+  catch
+    kind, reason -> {kind, reason}
+  end
+
+Check.check(f, "1d: payment_seen? returning {:ok, nil} does not raise out of the tick",
+  match?({{:noreply, _}, :ok}, result_d1))
+Check.check(f, "1d: the payment is held — not settled (no ledger row), not delivered",
+  NilSeenStore.rows() == [] and Agent.get(delivered_d1, & &1) == [])
+Check.check(f, "1d: the cursor does not advance past the held payment",
+  NilSeenStore.cursor() == nil)
+
 Check.finish(f)
