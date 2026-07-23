@@ -105,8 +105,15 @@ defmodule Genswarms.Payments.Usdc do
         # RPC could hand back a Transfer-shaped log from an unrelated
         # contract; only settle logs actually emitted by the configured USDC
         # contract.
+        # `removed: true` marks a log the provider retracted after a reorg —
+        # it is officially NOT part of the chain, so it must never settle or
+        # deliver. Skipping (not holding) is correct: the log is gone, there
+        # is nothing to re-present, and the canonical replacement (if any)
+        # arrives as its own normal log. In practice a ≥confirmations-deep
+        # getLogs range should never contain one; defense in depth.
         settlements =
           logs
+          |> Enum.reject(&(&1["removed"] == true))
           |> Enum.filter(&(hex_int(&1["blockNumber"]) <= to))
           |> Enum.filter(&same_contract?(&1, chain))
           |> Enum.flat_map(&to_settlement(&1, chain, watched))

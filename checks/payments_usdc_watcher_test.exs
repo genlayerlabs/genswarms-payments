@@ -557,4 +557,31 @@ Check.check(f, "R3-M1: an uppercase-hex log (topic0/topics/address/data) settles
   Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xUPPER:0")) and
     ScanStore.cursor("base") == 190)
 
+# ── R3-M2: `removed: true` reorg markers never settle and never deliver —
+# the log is officially retracted, so it is SKIPPED (cursor may advance;
+# nothing is held) while a sibling normal log in the same batch settles.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+{:ok, delivered_removed} = Agent.start_link(fn -> [] end)
+
+removed_log = Map.put(mk_log.(addr, 150, "0xREMOVED", 0), "removed", true)
+sibling_log = mk_log.(addr, 151, "0xSIBLING", 0)
+
+state_removed = %{
+  state0
+  | rpc_fn: canned.([removed_log, sibling_log], 200),
+    deliver_fn: fn t, _from, c -> (Agent.update(delivered_removed, &[{t, c} | &1]); :ok) end
+}
+
+_state_removed = Payments.poll(state_removed)
+
+Check.check(f, "R3-M2: a removed:true reorg marker never settles (no ledger row)",
+  not Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xREMOVED:0")))
+Check.check(f, "R3-M2: a removed:true reorg marker never delivers payment_confirmed",
+  not Enum.any?(Agent.get(delivered_removed, & &1), fn {_t, c} -> String.contains?(c, "0xREMOVED") end))
+Check.check(f, "R3-M2: the sibling normal log in the same batch still settles and the cursor advances",
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xSIBLING:0")) and
+    ScanStore.cursor("base") == 190)
+
 Check.finish(f)
