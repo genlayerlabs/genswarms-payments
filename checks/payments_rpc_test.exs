@@ -86,4 +86,41 @@ Check.check(f, "3b: userinfo and query fragments of the rpc_url are scrubbed too
   not String.contains?(keyed_slice, "QUERYPASS") and
     not String.contains?(keyed_slice, "QUERYKEY"))
 
+# ── R3-M3: pin the tempfile hardening (a round-1 security fix that a
+# mutation replacing it with a plain File.open!([:write]) previously
+# survived). Two properties: (1) by the time curl would read the config
+# file it is chmod 600 — no other local user gets a readable window on the
+# keyed URL; (2) creation is :exclusive — a pre-existing file at the path
+# (tempdir squatting) fails loudly instead of being truncated/followed.
+import Bitwise, only: [band: 2]
+
+{:ok, seen_mode} = Agent.start_link(fn -> nil end)
+
+mode_runner = fn _args, config_path ->
+  Agent.update(seen_mode, fn _ -> File.stat!(config_path).mode end)
+  {:ok, ~s({"jsonrpc":"2.0","id":1,"result":"0x1"})}
+end
+
+{:ok, _} = Rpc.call(chain, "eth_blockNumber", [], runner: mode_runner)
+mode = Agent.get(seen_mode, & &1)
+
+Check.check(f, "R3-M3: config tempfile is chmod 600 by the time the runner sees it",
+  is_integer(mode) and band(mode, 0o777) == 0o600)
+
+squat_path = Path.join(System.tmp_dir!(), "gsp-rpc-check-squat.conf")
+File.write!(squat_path, "squatted")
+
+squat_result =
+  try do
+    Rpc.open_config_exclusively!(squat_path)
+    :opened_over_existing_file
+  rescue
+    _e -> :refused
+  end
+
+File.rm(squat_path)
+
+Check.check(f, "R3-M3: tempfile creation is :exclusive — a pre-existing file at the path is refused",
+  squat_result == :refused)
+
 Check.finish(f)

@@ -28,8 +28,7 @@ defmodule Genswarms.Payments.Rpc do
       )
 
     try do
-      fd = File.open!(config_path, [:write, :exclusive])
-      File.chmod!(config_path, 0o600)
+      fd = open_config_exclusively!(config_path)
       IO.binwrite(fd, ~s(url = "#{chain.rpc_url}"\n))
       File.close(fd)
 
@@ -50,6 +49,19 @@ defmodule Genswarms.Payments.Rpc do
     after
       File.rm(config_path)
     end
+  end
+
+  @doc false
+  # The tempfile carries the keyed rpc_url, so its creation is hardened (a
+  # round-1 security fix) and PINNED by checks: `:exclusive` fails loudly if
+  # the path already exists (a squatted symlink/file in the shared tempdir
+  # would otherwise be followed/truncated), and chmod 600 happens BEFORE the
+  # secret write so no other local user ever gets a readable window. Public
+  # (doc: false) so checks can assert both properties directly.
+  def open_config_exclusively!(config_path) do
+    fd = File.open!(config_path, [:write, :exclusive])
+    File.chmod!(config_path, 0o600)
+    fd
   end
 
   defp run_curl(args, _config_path) do
