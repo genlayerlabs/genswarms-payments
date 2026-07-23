@@ -627,9 +627,27 @@ defmodule Genswarms.Payments do
     # compile-time dep of this package — dispatch via apply/3 so this module
     # compiles standalone (a direct remote call would warn/fail under
     # --warnings-as-errors since the module isn't available at compile time).
+    # The peer call's RESULT is propagated through map_peer_delivery_result/1
+    # — hardcoding :ok here would count any error-shaped RETURN from
+    # deliver_message as delivered, silently defeating the retry queue for
+    # the shipped default (raises/EXITs were already caught by deliver_one).
     fn target, from, content ->
-      apply(Genswarms.Objects.ObjectServer, :deliver_message, [swarm_name, target, from, content])
-      :ok
+      Genswarms.Objects.ObjectServer
+      |> apply(:deliver_message, [swarm_name, target, from, content])
+      |> map_peer_delivery_result()
     end
   end
+
+  @doc false
+  # Maps a host-defined ObjectServer.deliver_message/4 return onto the
+  # deliver_fn contract (:ok | {:error, term()}). deliver_message's return
+  # shape is host-provided and not pinned by this package, so only exactly
+  # :ok and {:ok, _} count as delivered; an {:error, _} passes through and
+  # anything else becomes {:error, {:bad_return, other}} — deliver_one then
+  # logs it and queues the target for retry. Public (doc: false) so the
+  # mapping itself is pinnable by checks without a live ObjectServer.
+  def map_peer_delivery_result(:ok), do: :ok
+  def map_peer_delivery_result({:ok, _}), do: :ok
+  def map_peer_delivery_result({:error, _} = err), do: err
+  def map_peer_delivery_result(other), do: {:error, {:bad_return, other}}
 end

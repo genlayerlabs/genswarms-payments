@@ -304,4 +304,47 @@ WriteOnlyDownStore.down!(false)
 Check.check(f, "after record_payment heals, the SAME settlement settles",
   n_wo2 == 1 and length(WriteOnlyDownStore.rows()) == 1)
 
+# ── 2d: the shipped DEFAULT deliver_fn must honor the same contract the
+# injected fns above are held to. It used to discard ObjectServer's return
+# and hardcode :ok, so an error-shaped RETURN (e.g. {:error, :unknown_target})
+# was silently counted as delivered — settlement recorded, dedup blocks
+# re-presentation, delivery lost forever. The peer call's result now flows
+# through map_peer_delivery_result/1; pin the mapping directly (ObjectServer
+# itself is host-provided and not hermetically callable here).
+Check.check(f, "2d: peer returning :ok maps to delivered",
+  Payments.map_peer_delivery_result(:ok) == :ok)
+Check.check(f, "2d: peer returning {:ok, _} maps to delivered",
+  Payments.map_peer_delivery_result({:ok, :queued}) == :ok)
+Check.check(f, "2d: peer returning {:error, _} passes through as the failure",
+  Payments.map_peer_delivery_result({:error, :unknown_target}) == {:error, :unknown_target})
+Check.check(f, "2d: any other peer return is a failure, not silently delivered",
+  Payments.map_peer_delivery_result(:noop) == {:error, {:bad_return, :noop}} and
+    Payments.map_peer_delivery_result(nil) == {:error, {:bad_return, nil}})
+
+# The default fn itself (no deliver_fn injected): ObjectServer is absent in
+# this hermetic run, so the apply raises UndefinedFunctionError — deliver_one
+# must catch it and queue the target, never crash or count it delivered.
+state_2d =
+  Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: [],
+    targets: ["peer_obj"],
+    store_mod: nil,
+    auto_tick: false
+  })
+
+s_2d = %{s | idempotency_key: "default_fn:1", ref: "default_fn:1"}
+
+result_2d =
+  try do
+    {:ok, Payments.settle([s_2d], state_2d)}
+  rescue
+    e -> {:raised, e}
+  catch
+    kind, reason -> {kind, reason}
+  end
+
+Check.check(f, "2d: default deliver_fn with an absent ObjectServer doesn't crash; target queued for retry",
+  match?({:ok, {1, %{undelivered: %{"default_fn:1" => %{targets: ["peer_obj"]}}}}}, result_2d))
+
 Check.finish(f)
