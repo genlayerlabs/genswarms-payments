@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.0 — Unreleased
+
+- USDC settlement rows now preserve the raw chain facts needed to re-verify
+  and recompute credited money: `raw_amount`, `decimals`, `token_contract`,
+  `chain`, `chain_id`, `block_number`, `log_index`, `tx_hash`, and
+  `from_address`, alongside the existing derived `amount_usd` and settlement
+  fields.
+- Every chain config now requires an integer `chain_id`. New settlements use
+  `"#{chain_id}:#{tx_hash}:#{log_index}"` as the idempotency key, preventing a
+  mutable chain-name rename from re-crediting history. Previously recorded
+  old-format keys remain valid because dedup is string equality.
+- `Genswarms.Payments.Store.record_payment/1` may return either legacy `:ok`
+  or `{:ok, positive_seq}`. Store-assigned sequences are retained as
+  `outbox_seq` on the settlement mirror; the memory fallback mints its own
+  monotone sequence. Error, raise, exit, and invalid-return paths remain
+  fail-closed, and held rows receive no sequence.
+- A hub with non-empty `targets` now refuses to boot unless its effective
+  store exports durable `payment_seen?/1` and `record_payment/1`. Ephemeral
+  dev/test use requires the explicit `allow_ephemeral: true` opt-out because
+  memory mode can re-mint addresses and re-credit history after restart.
+- Added a contract-shape check that derives every action string from the
+  handler source and pins `init/1` plus every message path to the real
+  `Genswarms.Objects.ObjectHandler` return shapes and JSON reply contract.
+
 ## 0.1.1 — 2026-07-24
 
 - FIX (engine contract): `init/1` now returns `{:ok, state}` as

@@ -36,11 +36,13 @@ push method ships yet; `ingest_event` currently always replies
   xpub: System.fetch_env!("PAYMENTS_XPUB"),   # required — watch-only, see Custody below
   trusted_sources: ["telegram_ingress", "cron"],  # required for anything to work (default [])
   targets: ["downstream_object"],     # required for anyone to get credited (default [])
+  allow_ephemeral: false,             # explicit dev-only opt-out when targets are non-empty (default false)
   namespace: "default",               # stamped on bindings/deliveries; caller-defined meaning (default "default")
   store_mod: MyApp.PaymentsStore,     # optional — see Store contract (default nil = memory)
   chains: [
     %{
       name: "base",
+      chain_id: 8453,                 # required integer; immutable on-chain identity
       rpc_url: System.fetch_env!("BASE_RPC_URL"),
       usdc_contract: "0x...",
       confirmations: 12,              # default 12
@@ -58,6 +60,13 @@ push method ships yet; `ingest_event` currently always replies
   poll_interval_ms: 60_000            # currently INERT — see below (default 60_000)
 }
 ```
+
+When `targets` is non-empty, `init/1` requires the effective store to export
+both `payment_seen?/1` and `record_payment/1`. Without durable settlement
+dedup, a restart can re-mint addresses and re-credit payment history. Local
+or test configurations may accept that risk only by setting
+`allow_ephemeral: true` explicitly. Empty-target observers may still use
+memory mode without the opt-out because they cannot credit anyone.
 
 `auto_tick` and `poll_interval_ms` are accepted and stored but nothing in
 this package reads them to schedule anything — a poll round only happens
@@ -128,7 +137,7 @@ Every callback is optional; missing ones fall back to an in-memory mirror
 | `get_address_binding/1` | fetch a binding by beneficiary |
 | `list_address_bindings/0` | boot: rebuild the watched set + next index |
 | `payment_seen?/1` | settlement dedup by idempotency key — must be durable in prod |
-| `record_payment/1` | record one settled payment |
+| `record_payment/1` | record one settled payment; return `:ok`, `{:ok, positive_seq}`, or `{:error, term}` |
 | `get_last_scanned_block/1` | last fully-settled block for a chain |
 | `put_last_scanned_block/2` | advance a chain's scan cursor |
 | `list_payments/1` | settled payments for a beneficiary, newest first |
@@ -137,7 +146,8 @@ Unlike budget *reads* in sibling packages, settlement **writes** fail closed:
 if a configured store errors on the dedup read or the record write, the
 round holds that settlement rather than risk crediting it twice or losing
 it. No store at all is a legitimate dev mode — memory dedup still works
-within a single run.
+within a single run, but a hub with non-empty `targets` refuses that mode
+unless `allow_ephemeral: true` is explicit.
 
 This fail-closed rule is keyed on whether the callback is **exported**, not
 on whether `store_mod` is `nil`. A store that implements the bindings group
@@ -150,8 +160,9 @@ returns `{:error, _}` holds the settlement closed.
 **Coherence requirement**: `init/1` validates two callback groups —
 `{put_address_binding/1, list_address_bindings/0}` and `{payment_seen?/1,
 record_payment/1, get_last_scanned_block/1, put_last_scanned_block/2}` —
-and **raises `ArgumentError`** if a store implements only part of either
-group. A store that persists bindings but can never list them forgets the
+and returns `{:error, %ArgumentError{}}` if a store implements only part of
+either group (`init!/1` raises the same error). A store that persists
+bindings but can never list them forgets the
 watched set (and reuses HD indices) on every restart; a store that can
 write settlements but never check `payment_seen?` (or vice versa) always
 looks unseen and double-credits. Implement all of a group's callbacks or
@@ -173,6 +184,22 @@ held back by a store failure, the cursor stays put, so the next `tick`
 re-scans and re-presents it. This is the invariant that makes the whole
 pipeline safe against a flaky store: nothing is ever double-credited, and
 nothing is ever silently skipped.
+
+USDC settlement rows retain the raw chain evidence used to compute credit:
+`raw_amount`, `decimals`, `token_contract`, `chain`, `chain_id`,
+`block_number`, `log_index`, `tx_hash`, and `from_address`, alongside the
+existing derived `amount_usd` and settlement fields. New idempotency keys are
+`"#{chain_id}:#{tx_hash}:#{log_index}"`, so renaming a mutable chain label
+cannot re-key and re-credit history. Existing old-format keys remain valid
+because dedup compares the stored strings as-is.
+
+`record_payment/1` may return `{:ok, seq}` with a positive store-assigned
+sequence or the legacy `:ok`. A returned sequence is retained as
+`outbox_seq` on the in-memory settlement mirror; legacy durable adapters
+remain valid with `outbox_seq: nil`. When settlement storage is absent, the
+memory fallback assigns its own monotone sequence for the life of the hub.
+Store failures and invalid return values still hold the settlement closed,
+and held settlements receive no sequence.
 
 ## Delivery guarantee
 
@@ -229,12 +256,12 @@ a chmod-600, exclusively-created `--config` tempfile (random suffix, never
 reused), never argv where `ps` would expose it, and is scrubbed from both
 successful and error output (unified in `call/4`, not reparsed out of the
 config file) before it's logged. `init/1` requires `rpc_url` on every
-configured chain (raises `ArgumentError` if the key is missing, rather than
-booting and hitting a `KeyError` the first time a poll round runs) and also
-rejects (raises `ArgumentError`) any chain's `rpc_url` containing a quote,
-backslash, or control character, since the URL is written into that
-tempfile as `url = "#{rpc_url}"` and an unsanitized value could close the
-string early and inject config directives.
+configured chain (returning an `ArgumentError` tuple if the key is missing,
+rather than booting and hitting a `KeyError` the first time a poll round
+runs) and also rejects any chain `rpc_url` containing a quote, backslash, or
+control character. `init!/1` raises those validation errors. The URL is
+written into that tempfile as `url = "#{rpc_url}"`, where an unsanitized
+value could close the string early and inject config directives.
 
 ## Method behaviour
 
