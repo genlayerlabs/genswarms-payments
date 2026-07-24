@@ -12,14 +12,21 @@ expected = [
   record_payment: 1,
   get_last_scanned_block: 1,
   put_last_scanned_block: 2,
-  list_payments: 1
+  list_payments: 1,
+  list_settlements_since: 2
 ]
 
-Check.check(f, "Store behaviour declares all 8 callbacks",
-  Enum.all?(expected, &(&1 in callbacks)))
+Check.check(
+  f,
+  "Store behaviour declares all 9 callbacks",
+  Enum.all?(expected, &(&1 in callbacks))
+)
 
-Check.check(f, "all Store callbacks are optional",
+Check.check(
+  f,
+  "all Store callbacks are optional",
   Enum.sort(Genswarms.Payments.Store.behaviour_info(:optional_callbacks)) ==
-    Enum.sort(expected))
+    Enum.sort(expected)
+)
 
 Check.finish(f)
