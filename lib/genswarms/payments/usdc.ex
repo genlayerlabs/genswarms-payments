@@ -37,6 +37,12 @@ defmodule Genswarms.Payments.Usdc do
               "payments/usdc: scan of #{chain.name} failed: #{inspect(why)} — retrying next tick"
             )
 
+            core.emit_metric.("payments_hold", %{
+              stage: "chain_scan",
+              chain: to_string(chain.name),
+              reason: inspect(why)
+            })
+
             {chain, [], nil}
         end
       end)
