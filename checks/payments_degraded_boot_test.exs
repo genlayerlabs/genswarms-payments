@@ -62,7 +62,7 @@ settling_rpc = fn _chain, method, _params ->
 end
 
 state =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
@@ -127,7 +127,7 @@ end
 HealthyStore.reset()
 
 healthy_state =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
@@ -154,7 +154,7 @@ Check.check(f, "store exporting only put_address_binding (no list_address_bindin
   match?(
     {:error, %ArgumentError{}},
     (try do
-       Payments.init(%{
+       Payments.init!(%{
          xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
          store_mod: OnlyPutAddressStore
        })
@@ -172,7 +172,7 @@ Check.check(f, "store exporting only payment_seen? (no record_payment) raises at
   match?(
     {:error, %ArgumentError{}},
     (try do
-       Payments.init(%{
+       Payments.init!(%{
          xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
          store_mod: OnlySeenStore
        })
@@ -183,7 +183,7 @@ Check.check(f, "store exporting only payment_seen? (no record_payment) raises at
   ))
 
 Check.check(f, "store with both groups fully covered boots without raising",
-  match?(%{}, Payments.init(%{
+  match?(%{}, Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     store_mod: HealthyStore
   })))
@@ -205,7 +205,7 @@ canned = fn logs, latest ->
 end
 
 mirror_state =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],

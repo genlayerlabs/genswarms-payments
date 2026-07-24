@@ -39,7 +39,7 @@ LedgerStore.reset()
 {:ok, delivered} = Agent.start_link(fn -> [] end)
 
 state =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
@@ -97,7 +97,7 @@ Check.check(f, "after store recovery the held settlement settles", n4 == 1)
 
 # no store (dev): memory dedup still works
 ok_dev =
-  Payments.init(%{
+  Payments.init!(%{
     name: :p2,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     targets: ["t"],
@@ -127,7 +127,7 @@ isolating_deliver = fn target, from, _content ->
 end
 
 state_iso =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["flaky", "reliable"],
@@ -152,7 +152,7 @@ exiting_deliver = fn target, _from, _content ->
 end
 
 state_exit =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["flaky2"],
@@ -190,7 +190,7 @@ error_return_deliver = fn target, _from, _content ->
 end
 
 state_2a =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["down_by_return"],
@@ -232,7 +232,7 @@ mixed_return_deliver = fn target, from, _content ->
 end
 
 state_2a2 =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["bad_return", "good_target"],
@@ -280,7 +280,7 @@ WriteOnlyDownStore.reset()
 {:ok, delivered3} = Agent.start_link(fn -> [] end)
 
 state_wo =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["t"],
@@ -325,7 +325,7 @@ Check.check(f, "2d: any other peer return is a failure, not silently delivered",
 # this hermetic run, so the apply raises UndefinedFunctionError — deliver_one
 # must catch it and queue the target, never crash or count it delivered.
 state_2d =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["peer_obj"],

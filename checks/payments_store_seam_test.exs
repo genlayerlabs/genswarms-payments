@@ -38,7 +38,7 @@ defmodule ExitingListStore do
   def list_address_bindings, do: exit(:timeout)
 end
 
-state_a1 = Payments.init(%{xpub: xpub, store_mod: ExitingListStore})
+state_a1 = Payments.init!(%{xpub: xpub, store_mod: ExitingListStore})
 
 Check.check(f, "1a: list_address_bindings exiting at boot degrades (not crashes) init/1",
   state_a1.degraded_boot == true)
@@ -57,7 +57,7 @@ end
 :persistent_term.put({ExitingSeenStore, :rows}, [])
 
 state_a2 =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: xpub,
     trusted_sources: [],
     targets: ["t"],
@@ -96,7 +96,7 @@ end
 :persistent_term.erase({ExitingRecordStore, :cursor})
 
 state_a3 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: xpub,
     trusted_sources: ["ingress"],
@@ -155,7 +155,7 @@ end
 :persistent_term.put({BindingsOnlyStore, :b}, [])
 
 state_b1 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: xpub,
     trusted_sources: ["ingress"],
@@ -210,7 +210,7 @@ end
 {:ok, calls_c1} = Agent.start_link(fn -> [] end)
 
 state_c1 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: xpub,
     trusted_sources: ["ingress"],
@@ -262,7 +262,7 @@ end
 {:ok, calls_c2} = Agent.start_link(fn -> [] end)
 
 state_c2 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: xpub,
     trusted_sources: ["ingress"],
@@ -324,7 +324,7 @@ end
 {:ok, delivered_d1} = Agent.start_link(fn -> [] end)
 
 state_d1 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: xpub,
     trusted_sources: ["ingress"],

@@ -372,7 +372,7 @@ deliver_fn = fn target, from, content ->
 end
 
 hub_state =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     swarm_name: "e2e",
     xpub: xpub,

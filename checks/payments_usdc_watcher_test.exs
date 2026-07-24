@@ -36,7 +36,7 @@ value_hex = "0x" <> String.pad_leading("4c4b40", 64, "0")
 {:ok, rpc_log} = Agent.start_link(fn -> [] end)
 
 state0 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt", trusted_sources: ["ingress"],
     targets: ["llm_proxy"], namespace: "llm_quota", store_mod: ScanStore,
     auto_tick: false, now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
@@ -133,7 +133,7 @@ Check.check(f, "RPC failure leaves cursor untouched (retry next tick)",
 ScanStore.reset()
 ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
 
-state_chunk = Payments.init(%{
+state_chunk = Payments.init!(%{
   name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt", trusted_sources: ["ingress"],
   targets: ["llm_proxy"], namespace: "llm_quota", store_mod: ScanStore,
   auto_tick: false, now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
@@ -206,7 +206,7 @@ Check.check(f, "cursor untouched after a bad-shape RPC response",
 ScanStore.reset()
 
 state_two_chain =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
@@ -288,7 +288,7 @@ end
 CursorInvariantStore.reset()
 
 state_ci =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
@@ -337,7 +337,7 @@ Check.check(f, "2b: after the store heals, the SAME payment settles and the curs
 CursorInvariantStore.reset()
 
 state_dedup =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
@@ -410,7 +410,7 @@ end
 RaisingCursorStore.reset()
 
 state_raising0 =
-  Payments.init(%{
+  Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],

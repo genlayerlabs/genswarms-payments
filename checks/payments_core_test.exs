@@ -34,7 +34,7 @@ config = %{
   auto_tick: false
 }
 
-state = Payments.init(config)
+state = Payments.init!(config)
 
 req = Jason.encode!(%{action: "deposit_address", beneficiary: "budget:abc"})
 
@@ -62,13 +62,13 @@ Check.check(f, "binding persisted durably (index 0 for first beneficiary)",
   match?({:ok, %{index: 0}}, FakeStore.get_address_binding("budget:abc")))
 
 # reboot: bindings + next_index rebuilt from store
-state_reboot = Payments.init(config)
+state_reboot = Payments.init!(config)
 {:reply, json4, _} = Payments.handle_message("telegram_ingress", req, state_reboot)
 Check.check(f, "address survives restart via store",
   Jason.decode!(json4)["address"] == reply["address"])
 
 # fail-closed allocation: store down ⇒ error reply, no address minted
-down = Payments.init(%{config | store_mod: DownStore})
+down = Payments.init!(%{config | store_mod: DownStore})
 {:reply, json5, _} = Payments.handle_message("telegram_ingress", req, down)
 Check.check(f, "store down ⇒ allocation refused (fail closed)",
   Jason.decode!(json5)["ok"] == false)
@@ -90,7 +90,7 @@ counting_rpc_2c = fn _chain, _method, _params ->
 end
 
 state_2c =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["telegram_ingress"],
     targets: ["llm_proxy"],
@@ -120,7 +120,7 @@ Check.check(f, "rpc_url containing a quote raises ArgumentError at init",
   match?(
     {:error, %ArgumentError{}},
     (try do
-       Payments.init(bad_rpc_config)
+       Payments.init!(bad_rpc_config)
        {:ok, :did_not_raise}
      rescue
        e -> {:error, e}
@@ -133,7 +133,7 @@ Check.check(f, "rpc_url containing a backslash raises ArgumentError at init",
   match?(
     {:error, %ArgumentError{}},
     (try do
-       Payments.init(backslash_rpc_config)
+       Payments.init!(backslash_rpc_config)
        {:ok, :did_not_raise}
      rescue
        e -> {:error, e}
@@ -146,7 +146,7 @@ Check.check(f, "rpc_url containing a control character raises ArgumentError at i
   match?(
     {:error, %ArgumentError{}},
     (try do
-       Payments.init(control_char_rpc_config)
+       Payments.init!(control_char_rpc_config)
        {:ok, :did_not_raise}
      rescue
        e -> {:error, e}
@@ -155,7 +155,7 @@ Check.check(f, "rpc_url containing a control character raises ArgumentError at i
 
 clean_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://mainnet.base.org/v2/KEY", usdc_contract: "0x0"}])
 Check.check(f, "a clean rpc_url boots without raising",
-  match?(%{}, Payments.init(clean_rpc_config)))
+  match?(%{}, Payments.init!(clean_rpc_config)))
 
 # 3b: a chain missing rpc_url entirely must raise at init (ArgumentError),
 # not silently boot and blow up later at runtime with a KeyError the first
@@ -166,11 +166,25 @@ Check.check(f, "a chain missing rpc_url entirely raises ArgumentError at init",
   match?(
     {:error, %ArgumentError{}},
     (try do
-       Payments.init(missing_rpc_config)
+       Payments.init!(missing_rpc_config)
        {:ok, :did_not_raise}
      rescue
        e -> {:error, e}
      end)
   ))
+
+# ── Engine contract pin: ObjectServer matches init/1 against {:ok, state} —
+# v0.1.0 returned the bare state map and crash-looped at real swarm boot
+# (caught 2026-07-24 on the first live engine boot, missed by every direct-call
+# check and the cross-package e2e).
+{:ok, engine_state} =
+  Genswarms.Payments.init(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"]
+  })
+
+Check.check(f, "engine contract: init/1 returns {:ok, state} (ObjectServer shape)",
+  is_map(engine_state) and Map.has_key?(engine_state, :bindings))
 
 Check.finish(f)

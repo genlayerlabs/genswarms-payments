@@ -25,7 +25,14 @@ defmodule Genswarms.Payments do
   require Logger
   alias Genswarms.Payments.HD
 
-  def init(config) do
+  # Engine contract (Genswarms.Objects.ObjectHandler): init/1 MUST return
+  # {:ok, state} — ObjectServer matches on the tuple and a bare map crash-loops
+  # the object at swarm boot. init!/1 returns the bare state for tests and
+  # embedders that manage state themselves.
+  def init(config), do: {:ok, init!(config)}
+
+  @doc false
+  def init!(config) do
     xpub =
       case HD.parse_xpub(Map.fetch!(config, :xpub) |> to_string()) do
         {:ok, parsed} -> parsed

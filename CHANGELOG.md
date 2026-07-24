@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 — 2026-07-24
+
+- FIX (engine contract): `init/1` now returns `{:ok, state}` as
+  `Genswarms.Objects.ObjectHandler` requires — v0.1.0 returned the bare state
+  map, which crash-looped the object at real swarm boot (ObjectServer matches
+  on the tuple). Caught on the first live engine boot; every direct-call check
+  and the cross-package e2e had bypassed ObjectServer. New `init!/1` returns
+  the bare state for tests/embedders; checks pin the engine shape.
+
 ## 0.1.0 — 2026-07-23
 
 - Initial release: settlement hub core (stable HD deposit addresses from a

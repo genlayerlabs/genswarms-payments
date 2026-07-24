@@ -27,7 +27,7 @@ defmodule DegradedStatusStore do
 end
 
 state_degraded =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: xpub,
     trusted_sources: ["ingress"],
     targets: ["t"],
@@ -68,7 +68,7 @@ healthy_status_config = %{
 :persistent_term.put({ErroringListPaymentsStore, :behavior}, {:error, :db_down})
 
 state_err =
-  Payments.init(%{healthy_status_config | store_mod: ErroringListPaymentsStore})
+  Payments.init!(%{healthy_status_config | store_mod: ErroringListPaymentsStore})
 
 {:reply, ej, _} =
   Payments.handle_message("ingress",
@@ -90,7 +90,7 @@ defmodule RaisingListPaymentsStore do
   def list_payments(_ben), do: raise("boom")
 end
 
-state_raise = Payments.init(%{healthy_status_config | store_mod: RaisingListPaymentsStore})
+state_raise = Payments.init!(%{healthy_status_config | store_mod: RaisingListPaymentsStore})
 
 {:reply, rj, _} =
   Payments.handle_message("ingress",
@@ -110,7 +110,7 @@ defmodule ExitingListPaymentsStore do
   def list_payments(_ben), do: exit(:timeout)
 end
 
-state_exit = Payments.init(%{healthy_status_config | store_mod: ExitingListPaymentsStore})
+state_exit = Payments.init!(%{healthy_status_config | store_mod: ExitingListPaymentsStore})
 
 {:reply, xj, _} =
   Payments.handle_message("ingress",
@@ -124,7 +124,7 @@ Check.check(f, "list_payments exiting ⇒ ok:false, error:store_unavailable (no 
 # truthful durable:false field (this beneficiary genuinely has no rows —
 # memory mode never had any to lose)
 state_mem =
-  Payments.init(%{
+  Payments.init!(%{
     xpub: xpub,
     trusted_sources: ["ingress"],
     targets: ["t"],
@@ -155,7 +155,7 @@ defmodule HealthyListPaymentsStore do
     do: {:ok, [%{amount_usd: Decimal.new("5"), method: "usdc_base", ref: "0xT:0", at: ~U[2026-07-22 12:00:00Z]}]}
 end
 
-state_ok = Payments.init(%{healthy_status_config | store_mod: HealthyListPaymentsStore})
+state_ok = Payments.init!(%{healthy_status_config | store_mod: HealthyListPaymentsStore})
 
 {:reply, oj, _} =
   Payments.handle_message("ingress",
