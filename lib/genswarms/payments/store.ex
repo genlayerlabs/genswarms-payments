@@ -1,12 +1,13 @@
 defmodule Genswarms.Payments.Store do
   @moduledoc """
-  The OPTIONAL durable seam (host-owned schema). Every callback is optional —
-  missing callbacks fall back to the in-memory mirror. BUT unlike budget reads
-  in sibling packages, settlement WRITES fail CLOSED when a configured store
-  errors: without durable dedup there is no safe way to guarantee a payment is
-  credited exactly once. No store at all uses the memory fallback; with
-  non-empty targets, that requires the explicit `allow_ephemeral: true`
-  boot opt-out.
+  The OPTIONAL durable seam (host-owned schema). Every callback is optional.
+  Settlement/binding/cursor callbacks have documented memory fallbacks; the
+  outbox read refuses when absent unless the hub explicitly booted in
+  ephemeral mode. Unlike budget reads in sibling packages, settlement WRITES
+  fail CLOSED when a configured store errors: without durable dedup there is
+  no safe way to guarantee a payment is credited exactly once. No store at
+  all uses the memory fallback; with non-empty targets, that requires the
+  explicit `allow_ephemeral: true` boot opt-out.
 
   The fail-closed rule keys off whether the callback is *exported*, not
   whether `store_mod` is nil: a coherence-legal store that implements the
@@ -44,13 +45,26 @@ defmodule Genswarms.Payments.Store do
   @callback record_payment(map()) :: :ok | {:ok, pos_integer()} | {:error, term()}
 
   @doc "Last fully-settled block for a chain name; {:ok, nil} when never scanned."
-  @callback get_last_scanned_block(String.t()) :: {:ok, non_neg_integer() | nil} | {:error, term()}
+  @callback get_last_scanned_block(String.t()) ::
+              {:ok, non_neg_integer() | nil} | {:error, term()}
 
   @doc "Advance the scan cursor for a chain (only after all its settlements recorded)."
   @callback put_last_scanned_block(String.t(), non_neg_integer()) :: :ok | {:error, term()}
 
   @doc "Settled payments for a beneficiary, newest first."
   @callback list_payments(String.t()) :: {:ok, [map()]} | {:error, term()}
+
+  @doc """
+  Return the outbox page whose rows satisfy:
+
+      outbox_seq IS NOT NULL AND outbox_seq > after_seq
+
+  Rows are ordered by `outbox_seq` ascending and limited to `limit`.
+  `max_seq` is `COALESCE(MAX(outbox_seq), 0)` over the whole settlements
+  table, not merely the returned page.
+  """
+  @callback list_settlements_since(after_seq :: non_neg_integer(), limit :: pos_integer()) ::
+              {:ok, %{settlements: [map()], max_seq: non_neg_integer()}} | {:error, term()}
 
   @optional_callbacks put_address_binding: 1,
                       get_address_binding: 1,
@@ -59,5 +73,6 @@ defmodule Genswarms.Payments.Store do
                       record_payment: 1,
                       get_last_scanned_block: 1,
                       put_last_scanned_block: 2,
-                      list_payments: 1
+                      list_payments: 1,
+                      list_settlements_since: 2
 end
