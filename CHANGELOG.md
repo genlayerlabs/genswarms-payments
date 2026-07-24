@@ -2,6 +2,31 @@
 
 ## 0.2.0 — Unreleased
 
+- Added the optional `Store.list_settlements_since/2` transactional-outbox
+  read contract, the synchronous `Genswarms.Payments.settlements_since/3`
+  host seam, and the trusted-target message action. Reads are namespace
+  filtered, carry whole-table `max_seq`, clamp action limits to 1..500, and
+  refuse distinctly rather than masking degraded/store/missing-callback
+  failures as empty success. Explicit ephemeral hubs can serve the same
+  action from their sequenced settlement mirror.
+- Removed the in-memory `undelivered` queue and tick-time redelivery
+  machinery. `payment_confirmed` is now a one-shot best-effort latency path:
+  target failures are isolated, logged, and metered, while the durable
+  sequenced outbox is the authoritative recovery path.
+- Added the trusted `reconcile` action and optional per-chain
+  `reconcile_rpc_url`, validated and called through the same scrubbed,
+  tempfile-hardened RPC path as the primary endpoint. Recent full-fact rows
+  are checked against independent receipts/logs; drift, unverifiable chains,
+  and legacy pre-0.2.0 rows are reported without automatically reversing
+  credits.
+- Added the isolated `metrics_fn` seam (default `Logger`) for settlements,
+  fail-closed holds, failed pushes, refused reads, reconciliation drift, and
+  unverifiable reconciliation. Raising/exiting telemetry cannot affect a
+  settlement or other money path.
+- Updated the cross-package e2e lost-ack and proxy-store-outage scenarios:
+  both now recover by reading `settlements_since` and applying the returned
+  row through the proxy's real validating ingress, rather than relying on
+  the deleted hub retry queue.
 - USDC settlement rows now preserve the raw chain facts needed to re-verify
   and recompute credited money: `raw_amount`, `decimals`, `token_contract`,
   `chain`, `chain_id`, `block_number`, `log_index`, `tx_hash`, and
@@ -146,10 +171,9 @@
   bindings by (namespace, beneficiary) across the store contract and host
   schemas. Equivalent while a hub serves one trusted consumer; run one hub
   namespace per consumer until then.
-- Settlements recorded while `targets: []` are never re-delivered after
-  targets are wired later (durable dedup blocks re-presentation) — wire
-  targets before announcing deposit addresses, or reconcile manually via
-  `payment_status`.
+- Settlements recorded without an `outbox_seq` (legacy adapters returning
+  plain `:ok`) are not visible to `settlements_since`; deploy a store that
+  assigns positive sequences before relying on pull recovery.
 - Outgoing `fromBlock`/`toBlock` quantities are uppercase hex (`"0xC8"`);
   the canonical JSON-RPC quantity encoding is lowercase and a strict
   provider/validator could reject them.

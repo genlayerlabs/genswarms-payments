@@ -14,11 +14,13 @@ number of ways money can arrive.
 Every capability is fail-closed, gated by two allowlists:
 
 - **`trusted_sources`** — who may talk to the object at all. An untrusted
-  `deposit_address`, `payment_status`, `tick`, or `ingest_event` message gets
-  silent `{:noreply, _}` (only `health` is unauthenticated). Empty
-  `trusted_sources` means nobody can act.
+  `deposit_address`, `payment_status`, `settlements_since`, `reconcile`,
+  `tick`, or `ingest_event` message gets silent `{:noreply, _}` (only
+  `health` is unauthenticated). Empty `trusted_sources` means nobody can act.
 - **`targets`** — who may receive `payment_confirmed`. Empty `targets` means
   nobody is ever credited, even though settlement still records durably.
+  The `settlements_since` action additionally requires its authenticated
+  caller to be a target; a trusted non-target receives `not_a_consumer`.
 
 Push modalities add a second gate before settlement ever sees a payload: the
 `Method.ingest_event/2` callback must verify the payload's authenticity
@@ -44,6 +46,7 @@ push method ships yet; `ingest_event` currently always replies
       name: "base",
       chain_id: 8453,                 # required integer; immutable on-chain identity
       rpc_url: System.fetch_env!("BASE_RPC_URL"),
+      reconcile_rpc_url: System.get_env("BASE_RECONCILE_RPC_URL"), # optional independent endpoint
       usdc_contract: "0x...",
       confirmations: 12,              # default 12
       decimals: 6,                    # default 6
@@ -54,6 +57,7 @@ push method ships yet; `ingest_event` currently always replies
   ],
   methods: [Genswarms.Payments.Usdc], # pluggable modalities (default [Genswarms.Payments.Usdc])
   deliver_fn: fn target, from, content -> :ok | {:error, term()} end,  # default dispatches via the host ObjectServer
+  metrics_fn: fn event, meta -> :ok end, # optional; default logs through Logger
   now_fn: &DateTime.utc_now/0,        # injection seam for checks (default)
   rpc_fn: &Genswarms.Payments.Rpc.call/3,  # injection seam for checks (default)
   auto_tick: true,                    # currently INERT — see below (default true)
@@ -96,8 +100,36 @@ interval; this package owns the settlement/watch logic, not the clock.
   and `{"ok": false, "error": "store_unavailable"}` when a **configured**
   `list_payments/1` errors, raises, or exits (an empty list here would be
   indistinguishable from "no payments" — see Reconciliation below).
+- `{"action": "settlements_since", "after_seq": N, "limit": M}` — trusted
+  target only. `after_seq` defaults to 0; `limit` defaults to 100 and clamps
+  to 1..500. Returns namespace-filtered, ascending outbox rows with
+  `action: "settlements_since"`, `next_seq`, whole-table `max_seq`, and
+  `complete`; the action key keeps a routed response visible to a consumer's
+  dispatcher. It refuses distinctly on degraded boot, store failure, or a
+  non-ephemeral store without the outbox callback. Explicit ephemeral mode
+  reads the in-memory settlement mirror.
+- `{"action": "reconcile", "limit": M}` — trusted only; defaults to 50 and
+  clamps to 1..200. Re-fetches recent full-fact rows through each chain's
+  independent `reconcile_rpc_url`, reporting checked rows, drift keys,
+  unverifiable rows, and legacy rows. Detection alarms only; it never
+  reverses a credit.
 - `{"action": "ingest_event", ...}` — trusted only; reserved for future push
   methods, currently always refuses.
+
+The primary single-BEAM consumer seam is synchronous and does not depend on
+object routing:
+
+```elixir
+Genswarms.Payments.settlements_since(
+  %{store_mod: MyApp.PaymentsStore, namespace: "default"},
+  after_seq,
+  limit
+)
+```
+
+It returns the store error unchanged, returns `:no_outbox_store` when the
+optional callback is absent, and never converts a failed read into an empty
+success.
 
 ## Degraded boot
 
@@ -127,9 +159,10 @@ misbehaving.
 
 ## Store contract (`Genswarms.Payments.Store`)
 
-Every callback is optional; missing ones fall back to an in-memory mirror
-(fine in dev, lost on restart — including the scan cursor, via
-`cursor_mirror`, so dev mode doesn't rescan the same block window forever).
+Every callback is optional. Settlement/binding/cursor seams use in-memory
+mirrors where documented (fine in dev, lost on restart). The durable outbox
+read is intentionally different: a missing `list_settlements_since/2`
+refuses unless the hub explicitly booted in ephemeral mode.
 
 | Callback | Purpose |
 |---|---|
@@ -141,6 +174,7 @@ Every callback is optional; missing ones fall back to an in-memory mirror
 | `get_last_scanned_block/1` | last fully-settled block for a chain |
 | `put_last_scanned_block/2` | advance a chain's scan cursor |
 | `list_payments/1` | settled payments for a beneficiary, newest first |
+| `list_settlements_since/2` | ascending sequenced outbox page plus whole-table `max_seq` |
 
 Unlike budget *reads* in sibling packages, settlement **writes** fail closed:
 if a configured store errors on the dedup read or the record write, the
@@ -166,8 +200,9 @@ bindings but can never list them forgets the
 watched set (and reuses HD indices) on every restart; a store that can
 write settlements but never check `payment_seen?` (or vice versa) always
 looks unseen and double-credits. Implement all of a group's callbacks or
-none of them. `list_payments/1` and `get_address_binding/1` are independent
-reporting callbacks, not part of either group.
+none of them. `list_payments/1`, `list_settlements_since/2`, and
+`get_address_binding/1` are independent read callbacks, not part of either
+group.
 
 ## Settlement fail-closed rule and the cursor invariant
 
@@ -205,34 +240,34 @@ and held settlements receive no sequence.
 
 `deliver_fn`'s return contract is `:ok | {:error, term()}`. Only a literal
 `:ok` counts as delivered — an `{:error, _}` return is treated exactly like
-a raise or an EXIT: logged and queued for retry. This matters because the
-settlement is already durably recorded by the time delivery is attempted;
-silently treating a non-`:ok` return as success would lose the delivery
-forever with no way to detect it (dedup blocks re-presentation).
+a raise or an EXIT: logged and emitted as `payments_push_failed`. Each target
+is isolated under `catch kind, reason`, so one failed push never blocks the
+others or crashes settlement.
 
-Once a settlement is **recorded** (durably written via `record_payment`),
-delivering `payment_confirmed` to targets is **at-least-once** for transient
-per-target failures: a target's delivery runs under `catch kind, reason`
-(covering a raise, an EXIT such as a GenServer call timeout, and a throw),
-plus an explicit check that the return value is `:ok`, so one target failing
-never blocks the others in the same round and never crashes the tick. A
-target that fails is queued (keyed by
-`idempotency_key`) and retried at the start of every subsequent `tick`,
-dropped once it succeeds — the queue itself is never durable (in-memory
-only). This is **not** at-least-once across a process crash inside the
-record→deliver window: if the object dies between `record_payment`
-succeeding and the delivery queue being updated, that delivery is lost with
-it, and because the settlement is already recorded (dedup by
-`idempotency_key`), it will never be re-presented by the watcher either.
-Downstream consumers should treat delivery as best-effort and reconcile via
-`payment_status` for the source of truth; the credit they apply on receipt
-should itself be idempotent. `payment_status` itself only answers when it
-can answer truthfully: it refuses (`{"ok": false, ...}`) rather than
-returning a fabricated empty list during `degraded_boot` or when a
-configured `list_payments/1` errors — see the object protocol section above
-— so a reconciling consumer can trust an `"ok": true` response's `payments`
-(and its `durable` flag) at face value instead of risking a false "nothing
-to reconcile" read.
+Push is deliberately **one-shot best-effort**. There is no in-memory
+undelivered queue and `tick` never redelivers. The sequenced outbox is the
+recovery and correctness path: a consumer reads `settlements_since`, applies
+each full row through its normal validating/idempotent credit path, and
+advances its cursor. A dropped push changes only latency; the row remains
+durable and readable.
+
+## Reconciliation and metrics
+
+The chain reconciliation action reads the most recent namespace rows, treats
+pre-0.2.0 rows without the complete chain-fact set as `legacy`, and uses the
+configured chain's optional `reconcile_rpc_url` as a second endpoint. It
+fetches `eth_getTransactionReceipt`, locates the stored log index, and
+compares raw amount, token contract, bound destination address, block number,
+log index, and transaction hash. Missing independent endpoints and RPC
+failures are counted as unverifiable; mismatches are logged and returned as
+drift. No result automatically changes credited money.
+
+`metrics_fn` receives `payments_settled`, `payments_hold`,
+`payments_push_failed`, `payments_read_refused`,
+`payments_reconcile_drift`, and `payments_reconcile_unverifiable`. Every
+invocation is isolated with `try/catch`; telemetry failure cannot affect
+settlement or another money path. The default implementation logs through
+`Logger`.
 
 ## In-tree USDC watcher
 
@@ -259,7 +294,9 @@ config file) before it's logged. `init/1` requires `rpc_url` on every
 configured chain (returning an `ArgumentError` tuple if the key is missing,
 rather than booting and hitting a `KeyError` the first time a poll round
 runs) and also rejects any chain `rpc_url` containing a quote, backslash, or
-control character. `init!/1` raises those validation errors. The URL is
+control character. Optional `reconcile_rpc_url` receives the same validation
+and is passed through the same scrubbed tempfile RPC implementation.
+`init!/1` raises those validation errors. The URL is
 written into that tempfile as `url = "#{rpc_url}"`, where an unsanitized
 value could close the string early and inject config directives.
 
@@ -285,10 +322,11 @@ BEAM and drives the full USDC → credit → spend story across the live seam:
 deposit address (ADDR0, stable), free-budget exhaustion over real HTTP, the
 block notice carrying a hub-provided top-up hint, a canned on-chain USDC
 Transfer settling and crediting the proxy (strings-only wire), credit-funded
-spending with exact debit math, idempotent redelivery (proxy answers
-`duplicate`), and the retryable-NACK outage path (hub redelivers after the
-proxy's credit store heals — credited exactly once). Still hermetic: canned
-JSON-RPC, loopback HTTP only, no Postgres.
+spending with exact debit math, a lost-push row recovered through
+`settlements_since` (proxy answers `duplicate` when it already applied the
+push), and a retryable-NACK outage recovered by outbox application after the
+proxy's credit store heals. Still hermetic: canned JSON-RPC, loopback HTTP
+only, no Postgres.
 
 ```sh
 sh e2e/run.sh          # needs a genswarms-llm-proxy checkout:
