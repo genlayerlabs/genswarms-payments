@@ -219,10 +219,14 @@ defmodule Genswarms.Payments do
   defp validate_unique_chain_field!(chains, field) do
     duplicate =
       Enum.reduce_while(chains, MapSet.new(), fn chain, seen ->
-        value = Map.get(chain, field)
+        # Compared in string form: `name: :base` and `name: "base"` interpolate
+        # to the same method/cursor text key, so they must count as the same
+        # name here. The ORIGINAL value is what the error reports.
+        original = Map.get(chain, field)
+        value = to_string(original)
 
         if MapSet.member?(seen, value) do
-          {:halt, {:duplicate, value}}
+          {:halt, {:duplicate, original}}
         else
           {:cont, MapSet.put(seen, value)}
         end

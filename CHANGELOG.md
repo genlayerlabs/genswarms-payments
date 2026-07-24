@@ -156,6 +156,7 @@
 - URL scrubbing does not redact API keys embedded in the HOSTNAME
   (`https://<key>.provider.com/`); full URL, path, userinfo, and query
   fragments are covered.
-- In `allow_ephemeral: true` development mode, `settlement_mirror` is
-  append-only and grows without bound for the life of the hub. Phase 2 will
-  decide the reader and retention owner; this release does not bound it.
+- `settlement_mirror` is append-only and grows without bound for the life of
+  the hub in EVERY mode (durable-store hubs append too; only the outbox
+  fallback read is ephemeral-mode-specific). Phase 2 will decide the reader
+  and retention owner; this release does not bound it.
