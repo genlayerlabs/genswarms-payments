@@ -106,7 +106,7 @@ state_a3 =
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -160,12 +160,13 @@ state_b1 =
     xpub: xpub,
     trusted_sources: ["ingress"],
     targets: ["t"],
+    allow_ephemeral: true,
     namespace: "ns",
     store_mod: BindingsOnlyStore,
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -189,7 +190,9 @@ state_b1 = %{state_b1 | rpc_fn: rpc_b1}
 state_b1 = Payments.poll(state_b1)
 
 Check.check(f, "1b: settlement settles via memory dedup despite non-nil, half-implemented store",
-  MapSet.member?(state_b1.seen_keys, "base:0xB1:0"))
+  MapSet.member?(state_b1.seen_keys, "8453:0xB1:0"))
+Check.check(f, "1b: store without the settlement group uses the memory sequence counter",
+  hd(state_b1.settlement_mirror).outbox_seq == 1 and state_b1.next_outbox_seq == 2)
 Check.check(f, "1b: cursor advances (not frozen) once settled",
   Map.get(state_b1.cursor_mirror, "base") == 200 - 0)
 
@@ -220,7 +223,7 @@ state_c1 =
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -272,7 +275,7 @@ state_c2 =
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -334,7 +337,7 @@ state_d1 =
     auto_tick: false,
     deliver_fn: fn t, from, _c -> (Agent.update(delivered_d1, &[{t, from} | &1]); :ok) end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 

@@ -4,7 +4,8 @@ defmodule Genswarms.Payments.Method do
   the core context); push methods implement `ingest_event/2` and MUST verify
   the payload's authenticity (webhook signature, facilitator sig) before
   returning settlements — the core trusts what a method returns. Settlements:
-  %{beneficiary, amount_usd: Decimal, method, ref, idempotency_key, namespace}.
+  `%{beneficiary, amount_usd: Decimal, method, ref, idempotency_key,
+  namespace}` plus every source fact used to derive the amount.
   """
 
   @type settlement :: map()

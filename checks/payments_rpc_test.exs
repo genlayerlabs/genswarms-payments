@@ -9,7 +9,7 @@ runner = fn args, config_path ->
   {:ok, ~s({"jsonrpc":"2.0","id":1,"result":"0xc8"})}
 end
 
-chain = %{name: "base", rpc_url: "https://mainnet.base.org/v2/SECRETKEY"}
+chain = %{name: "base", chain_id: 8453, rpc_url: "https://mainnet.base.org/v2/SECRETKEY"}
 {:ok, result} = Rpc.call(chain, "eth_blockNumber", [], runner: runner)
 
 Check.check(f, "parses result", result == "0xc8")
@@ -73,7 +73,7 @@ Check.check(f, "3b: not-json body echoing only the URL PATH is scrubbed (no key 
     not String.contains?(path_only_slice, "/v2/SECRETKEY"))
 
 # userinfo- and query-keyed URLs leak the same way — pin those fragments too
-keyed_chain = %{name: "base", rpc_url: "https://user:QUERYPASS@node.example.org/rpc?apikey=QUERYKEY"}
+keyed_chain = %{name: "base", chain_id: 8453, rpc_url: "https://user:QUERYPASS@node.example.org/rpc?apikey=QUERYKEY"}
 
 keyed_runner = fn _, _ ->
   {:ok, "unauthorized for user:QUERYPASS with apikey=QUERYKEY"}

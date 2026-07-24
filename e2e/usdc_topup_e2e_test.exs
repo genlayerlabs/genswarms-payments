@@ -385,7 +385,7 @@ hub_state =
     deliver_fn: deliver_fn,
     rpc_fn: &E2E.Chain.rpc/3,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
         confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000}
     ]
   })
@@ -473,7 +473,7 @@ E2E.Chain.latest!(200)
 E2E.Hub.tick()
 
 Check.check(f, "hub settled the payment durably (ledger row, method usdc_base, ref 0xT1:0)",
-  Enum.map(E2E.HubStore.rows(), & &1.idempotency_key) == ["base:0xT1:0"])
+  Enum.map(E2E.HubStore.rows(), & &1.idempotency_key) == ["8453:0xT1:0"])
 
 [first_delivery | _] = E2E.DeliveryLog.deliveries()
 
@@ -538,7 +538,7 @@ E2E.Hub.tick()
 
 Check.check(f, "6a: ack lost — proxy already credited (+1.00) but hub queued the delivery for retry",
   Decimal.equal?(balance.(), Decimal.new("2.875")) and
-    Map.has_key?(E2E.Hub.undelivered(), "base:0xT2:0"))
+    Map.has_key?(E2E.Hub.undelivered(), "8453:0xT2:0"))
 
 E2E.Flags.drop_ack!(false)
 replies_before = length(E2E.DeliveryLog.replies())
@@ -605,8 +605,8 @@ Check.check(f, "store down: proxy answers ok:false retryable (fail closed, key r
     outage_reply["error"] == "store_unavailable")
 
 Check.check(f, "hub recorded the settlement but holds the delivery undelivered",
-  Enum.any?(E2E.HubStore.rows(), &(&1.idempotency_key == "base:0xT4:0")) and
-    Map.has_key?(E2E.Hub.undelivered(), "base:0xT4:0") and
+  Enum.any?(E2E.HubStore.rows(), &(&1.idempotency_key == "8453:0xT4:0")) and
+    Map.has_key?(E2E.Hub.undelivered(), "8453:0xT4:0") and
     Decimal.equal?(balance.(), Decimal.new("-0.25")))
 
 E2E.ProxyStore.credit_down!(false)

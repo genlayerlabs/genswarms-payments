@@ -4,7 +4,9 @@ defmodule Genswarms.Payments.Store do
   missing callbacks fall back to the in-memory mirror. BUT unlike budget reads
   in sibling packages, settlement WRITES fail CLOSED when a configured store
   errors: without durable dedup there is no safe way to guarantee a payment is
-  credited exactly once. No store at all (dev) = memory fallback is fine.
+  credited exactly once. No store at all uses the memory fallback; with
+  non-empty targets, that requires the explicit `allow_ephemeral: true`
+  boot opt-out.
 
   The fail-closed rule keys off whether the callback is *exported*, not
   whether `store_mod` is nil: a coherence-legal store that implements the
@@ -29,8 +31,17 @@ defmodule Genswarms.Payments.Store do
   @doc "Has idempotency_key already settled? Settlement dedup — MUST be durable in prod."
   @callback payment_seen?(String.t()) :: {:ok, boolean()} | {:error, term()}
 
-  @doc "Record one settled payment: %{idempotency_key, beneficiary, amount_usd, method, ref, namespace, at}."
-  @callback record_payment(map()) :: :ok | {:error, term()}
+  @doc """
+  Record one creditable settlement with the existing settlement fields,
+  `outbox_seq`, and the full method-supplied audit facts (`raw_amount`,
+  `decimals`, `token_contract`, `chain`, `chain_id`, `block_number`,
+  `log_index`, `tx_hash`, and `from_address` for USDC).
+
+  A store may return `{:ok, seq}` with its positive monotone insertion
+  sequence. Plain `:ok` remains valid for adapters that do not assign a
+  sequence yet.
+  """
+  @callback record_payment(map()) :: :ok | {:ok, pos_integer()} | {:error, term()}
 
   @doc "Last fully-settled block for a chain name; {:ok, nil} when never scanned."
   @callback get_last_scanned_block(String.t()) :: {:ok, non_neg_integer() | nil} | {:error, term()}

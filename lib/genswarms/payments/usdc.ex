@@ -158,9 +158,10 @@ defmodule Genswarms.Payments.Usdc do
       # topic_address/1 — the module already decided hex case can vary, and
       # an uppercase-hex provider must not silently miss payments while the
       # cursor advances (credit lost, never re-presented).
-      [topic0, _from_topic, to_topic] when is_binary(topic0) and is_binary(to_topic) ->
+      [topic0, from_topic, to_topic]
+      when is_binary(topic0) and is_binary(from_topic) and is_binary(to_topic) ->
         if String.downcase(topic0) == @transfer_topic do
-          transfer_settlement(log, chain, watched, to_topic)
+          transfer_settlement(log, chain, watched, from_topic, to_topic)
         else
           []
         end
@@ -176,7 +177,7 @@ defmodule Genswarms.Payments.Usdc do
     end
   end
 
-  defp transfer_settlement(log, chain, watched, to_topic) do
+  defp transfer_settlement(log, chain, watched, from_topic, to_topic) do
     case Map.fetch(watched, topic_address(to_topic)) do
       {:ok, %{beneficiary: beneficiary, namespace: namespace}} ->
         decimals = Map.get(chain, :decimals, 6)
@@ -192,6 +193,7 @@ defmodule Genswarms.Payments.Usdc do
           []
         else
           amount = Decimal.div(Decimal.new(raw), Decimal.new(Integer.pow(10, decimals)))
+          block_number = hex_int(log["blockNumber"])
           log_index = hex_int(log["logIndex"])
           tx_hash = tx_hash!(log)
 
@@ -201,8 +203,17 @@ defmodule Genswarms.Payments.Usdc do
               amount_usd: amount,
               method: "usdc_#{chain.name}",
               ref: "#{tx_hash}:#{log_index}",
-              idempotency_key: "#{chain.name}:#{tx_hash}:#{log_index}",
-              namespace: namespace
+              idempotency_key: "#{chain.chain_id}:#{tx_hash}:#{log_index}",
+              namespace: namespace,
+              raw_amount: raw,
+              decimals: decimals,
+              token_contract: chain.usdc_contract,
+              chain: chain.name,
+              chain_id: chain.chain_id,
+              block_number: block_number,
+              log_index: log_index,
+              tx_hash: tx_hash,
+              from_address: topic_address(from_topic)
             }
           ]
         end

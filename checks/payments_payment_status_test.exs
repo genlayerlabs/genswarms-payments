@@ -128,6 +128,7 @@ state_mem =
     xpub: xpub,
     trusted_sources: ["ingress"],
     targets: ["t"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false
   })

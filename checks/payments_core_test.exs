@@ -29,6 +29,7 @@ config = %{
   xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
   trusted_sources: ["telegram_ingress"],
   targets: ["llm_proxy"],
+  allow_ephemeral: true,
   namespace: "llm_quota",
   store_mod: FakeStore,
   auto_tick: false
@@ -94,10 +95,11 @@ state_2c =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["telegram_ingress"],
     targets: ["llm_proxy"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false,
     rpc_fn: counting_rpc_2c,
-    chains: [%{name: "base", rpc_url: "injected", usdc_contract: "0x0"}]
+    chains: [%{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0x0"}]
   })
 
 tick_req = Jason.encode!(%{action: "tick"})
@@ -114,7 +116,7 @@ Check.check(f, "2c: untrusted tick never actually polls — rpc_fn is never invo
 # as `url = "#{rpc_url}"`; a quote lets an attacker close that value early
 # and inject config directives, a backslash/control char is just as
 # unsanitary. Reject at init, don't wait for curl to choke on it.
-bad_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: ~s(https://evil.example/"), usdc_contract: "0x0"}])
+bad_rpc_config = Map.put(config, :chains, [%{name: "base", chain_id: 8453, rpc_url: ~s(https://evil.example/"), usdc_contract: "0x0"}])
 
 Check.check(f, "rpc_url containing a quote raises ArgumentError at init",
   match?(
@@ -127,7 +129,7 @@ Check.check(f, "rpc_url containing a quote raises ArgumentError at init",
      end)
   ))
 
-backslash_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://evil.example/\\injected", usdc_contract: "0x0"}])
+backslash_rpc_config = Map.put(config, :chains, [%{name: "base", chain_id: 8453, rpc_url: "https://evil.example/\\injected", usdc_contract: "0x0"}])
 
 Check.check(f, "rpc_url containing a backslash raises ArgumentError at init",
   match?(
@@ -140,7 +142,7 @@ Check.check(f, "rpc_url containing a backslash raises ArgumentError at init",
      end)
   ))
 
-control_char_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://evil.example/\ninjected", usdc_contract: "0x0"}])
+control_char_rpc_config = Map.put(config, :chains, [%{name: "base", chain_id: 8453, rpc_url: "https://evil.example/\ninjected", usdc_contract: "0x0"}])
 
 Check.check(f, "rpc_url containing a control character raises ArgumentError at init",
   match?(
@@ -153,14 +155,14 @@ Check.check(f, "rpc_url containing a control character raises ArgumentError at i
      end)
   ))
 
-clean_rpc_config = Map.put(config, :chains, [%{name: "base", rpc_url: "https://mainnet.base.org/v2/KEY", usdc_contract: "0x0"}])
+clean_rpc_config = Map.put(config, :chains, [%{name: "base", chain_id: 8453, rpc_url: "https://mainnet.base.org/v2/KEY", usdc_contract: "0x0"}])
 Check.check(f, "a clean rpc_url boots without raising",
   match?(%{}, Payments.init!(clean_rpc_config)))
 
 # 3b: a chain missing rpc_url entirely must raise at init (ArgumentError),
 # not silently boot and blow up later at runtime with a KeyError the first
 # time Rpc.call tries chain.rpc_url.
-missing_rpc_config = Map.put(config, :chains, [%{name: "base", usdc_contract: "0x0"}])
+missing_rpc_config = Map.put(config, :chains, [%{name: "base", chain_id: 8453, usdc_contract: "0x0"}])
 
 Check.check(f, "a chain missing rpc_url entirely raises ArgumentError at init",
   match?(
@@ -173,6 +175,63 @@ Check.check(f, "a chain missing rpc_url entirely raises ArgumentError at init",
      end)
   ))
 
+# chain_id is an immutable on-chain identity used in settlement dedup keys,
+# so every configured chain must supply it as an integer.
+missing_chain_id_config =
+  Map.put(config, :chains, [%{name: "base", rpc_url: "injected", usdc_contract: "0x0"}])
+
+missing_chain_id_result =
+  try do
+    Payments.init!(missing_chain_id_config)
+    {:ok, :did_not_raise}
+  rescue
+    e -> {:error, e}
+  end
+
+Check.check(f, "a chain missing required chain_id raises clearly at init",
+  match?({:error, %ArgumentError{}}, missing_chain_id_result) and
+    Exception.message(elem(missing_chain_id_result, 1)) =~ "missing required chain_id")
+
+non_integer_chain_id_config =
+  Map.put(config, :chains, [
+    %{name: "base", chain_id: "8453", rpc_url: "injected", usdc_contract: "0x0"}
+  ])
+
+non_integer_chain_id_result =
+  try do
+    Payments.init!(non_integer_chain_id_config)
+    {:ok, :did_not_raise}
+  rescue
+    e -> {:error, e}
+  end
+
+Check.check(f, "a non-integer chain_id raises clearly at init",
+  match?({:error, %ArgumentError{}}, non_integer_chain_id_result) and
+    Exception.message(elem(non_integer_chain_id_result, 1)) =~ "non-integer required chain_id")
+
+# C3: a hub that credits targets must not silently use restart-volatile
+# address allocation and settlement dedup.
+ephemeral_config = %{
+  xpub: config.xpub,
+  trusted_sources: ["ingress"],
+  targets: ["llm_proxy"],
+  store_mod: nil
+}
+
+ephemeral_result = Payments.init(ephemeral_config)
+
+Check.check(f, "non-empty targets without durable settlement dedup are refused",
+  match?({:error, %ArgumentError{}}, ephemeral_result) and
+    elem(ephemeral_result, 1).message =~ "memory mode re-mints addresses and re-credits history")
+
+bindings_only_result = Payments.init(%{ephemeral_config | store_mod: FakeStore})
+
+Check.check(f, "a store without the durable settlement pair is also refused",
+  match?({:error, %ArgumentError{}}, bindings_only_result))
+
+Check.check(f, "allow_ephemeral:true is the explicit opt-out",
+  match?({:ok, %{}}, Payments.init(Map.put(ephemeral_config, :allow_ephemeral, true))))
+
 # ── Engine contract pin: ObjectServer matches init/1 against {:ok, state} —
 # v0.1.0 returned the bare state map and crash-looped at real swarm boot
 # (caught 2026-07-24 on the first live engine boot, missed by every direct-call
@@ -181,7 +240,8 @@ Check.check(f, "a chain missing rpc_url entirely raises ArgumentError at init",
   Genswarms.Payments.init(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
-    targets: ["llm_proxy"]
+    targets: ["llm_proxy"],
+    allow_ephemeral: true
   })
 
 Check.check(f, "engine contract: init/1 returns {:ok, state} (ObjectServer shape)",

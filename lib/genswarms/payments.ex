@@ -20,6 +20,10 @@ defmodule Genswarms.Payments do
   transient DB blip at pod boot shouldn't crash-loop the object, but it also
   must never scan an empty watched set or hand out a reused address). See
   `init_bindings/1`.
+
+  A hub with non-empty `targets` also refuses to boot unless its store
+  exports durable settlement dedup, or `allow_ephemeral: true` explicitly
+  accepts restart-volatile address allocation and dedup for development.
   """
 
   require Logger
@@ -29,7 +33,15 @@ defmodule Genswarms.Payments do
   # {:ok, state} — ObjectServer matches on the tuple and a bare map crash-loops
   # the object at swarm boot. init!/1 returns the bare state for tests and
   # embedders that manage state themselves.
-  def init(config), do: {:ok, init!(config)}
+  def init(config) do
+    try do
+      {:ok, init!(config)}
+    rescue
+      error -> {:error, error}
+    catch
+      kind, reason -> {:error, {kind, reason}}
+    end
+  end
 
   @doc false
   def init!(config) do
@@ -43,7 +55,10 @@ defmodule Genswarms.Payments do
     validate_store_coherence!(store_mod)
 
     chains = Map.get(config, :chains, [])
-    Enum.each(chains, &validate_rpc_url!/1)
+    Enum.each(chains, &validate_chain!/1)
+
+    targets = Map.get(config, :targets, []) |> Enum.map(&to_string/1)
+    validate_durable_settlement_store!(store_mod, targets, Map.get(config, :allow_ephemeral))
 
     {bindings, degraded_boot?} = init_bindings(store_mod)
 
@@ -55,7 +70,7 @@ defmodule Genswarms.Payments do
       swarm_name: Map.get(config, :swarm_name, "swarm"),
       xpub: xpub,
       trusted_sources: MapSet.new(Map.get(config, :trusted_sources, []) |> Enum.map(&to_string/1)),
-      targets: Map.get(config, :targets, []) |> Enum.map(&to_string/1),
+      targets: targets,
       namespace: Map.get(config, :namespace, "default") |> to_string(),
       store_mod: store_mod,
       deliver_fn: Map.get(config, :deliver_fn, default_deliver_fn(Map.get(config, :swarm_name, "swarm"))),
@@ -69,6 +84,8 @@ defmodule Genswarms.Payments do
       bindings: bindings,
       next_index: next_index,
       seen_keys: MapSet.new(),
+      settlement_mirror: [],
+      next_outbox_seq: 1,
       undelivered: %{},
       cursor_mirror: %{},
       degraded_boot: degraded_boot?
@@ -153,6 +170,21 @@ defmodule Genswarms.Payments do
     end
   end
 
+  defp validate_durable_settlement_store!(_store_mod, [], _allow_ephemeral), do: :ok
+
+  defp validate_durable_settlement_store!(store_mod, _targets, allow_ephemeral) do
+    durable? =
+      exported?(store_mod, :payment_seen?, 1) and
+        exported?(store_mod, :record_payment, 1)
+
+    if not durable? and allow_ephemeral != true do
+      raise ArgumentError,
+            "payments: non-empty targets require durable settlement dedup; memory mode re-mints addresses and re-credits history on restart — configure a store exporting payment_seen?/1 and record_payment/1, or set allow_ephemeral: true explicitly"
+    end
+
+    :ok
+  end
+
   # Genswarms.Payments.Rpc writes rpc_url verbatim into a curl --config
   # tempfile as `url = "#{rpc_url}"` — a quote lets it close that value
   # early and inject arbitrary curl config directives; a backslash or other
@@ -161,6 +193,23 @@ defmodule Genswarms.Payments do
   # a chain missing the key entirely used to silently pass validation and
   # only blow up later at runtime with a KeyError the first time Rpc.call
   # tried chain.rpc_url; that's now an ArgumentError at init instead.
+  defp validate_chain!(chain) do
+    case Map.fetch(chain, :chain_id) do
+      {:ok, chain_id} when is_integer(chain_id) ->
+        :ok
+
+      {:ok, chain_id} ->
+        raise ArgumentError,
+              "payments: chain #{inspect(Map.get(chain, :name, chain))} has non-integer required chain_id: #{inspect(chain_id)}"
+
+      :error ->
+        raise ArgumentError,
+              "payments: chain #{inspect(Map.get(chain, :name, chain))} is missing required chain_id"
+    end
+
+    validate_rpc_url!(chain)
+  end
+
   defp validate_rpc_url!(chain) do
     case Map.fetch(chain, :rpc_url) do
       {:ok, url} ->
@@ -285,18 +334,15 @@ defmodule Genswarms.Payments do
   end
 
   defp record_and_deliver(%{idempotency_key: key} = s, state) do
-    row = %{
-      idempotency_key: key,
-      beneficiary: s.beneficiary,
-      amount_usd: s.amount_usd,
-      method: s.method,
-      ref: s.ref,
-      namespace: s.namespace,
-      at: state.now_fn.()
-    }
+    row =
+      s
+      |> Map.put(:at, state.now_fn.())
+      |> Map.put(:outbox_seq, nil)
 
-    case store_write(state.store_mod, :record_payment, [row]) do
-      :ok ->
+    case record_payment_write(state.store_mod, row) do
+      result when result == :memory or result == :ok or elem(result, 0) == :ok ->
+        {row, state} = keep_settlement(row, result, state)
+
         content =
           Jason.encode!(%{
             action: "payment_confirmed",
@@ -313,7 +359,11 @@ defmodule Genswarms.Payments do
             deliver_one(state.deliver_fn, target, state.name, content) == :error
           end)
 
-        state = %{state | seen_keys: MapSet.put(state.seen_keys, key)}
+        state = %{
+          state
+          | seen_keys: MapSet.put(state.seen_keys, key),
+            settlement_mirror: [row | state.settlement_mirror]
+        }
 
         state =
           if failed_targets == [] do
@@ -335,6 +385,17 @@ defmodule Genswarms.Payments do
         Logger.error("payments: record_payment failed (#{inspect(why)}) — FAIL CLOSED, holding #{key}")
         {:skipped, state}
     end
+  end
+
+  defp keep_settlement(row, {:ok, seq}, state) when is_integer(seq) and seq > 0 do
+    {Map.put(row, :outbox_seq, seq), state}
+  end
+
+  defp keep_settlement(row, :ok, state), do: {row, state}
+
+  defp keep_settlement(row, :memory, state) do
+    {Map.put(row, :outbox_seq, state.next_outbox_seq),
+     %{state | next_outbox_seq: state.next_outbox_seq + 1}}
   end
 
   # Recorded (settled = durable) is never undone by a delivery failure — this
@@ -610,6 +671,25 @@ defmodule Genswarms.Payments do
       end
     else
       :ok
+    end
+  end
+
+  defp record_payment_write(nil, _row), do: :memory
+
+  defp record_payment_write(mod, row) do
+    if exported?(mod, :record_payment, 1) do
+      try do
+        case apply(mod, :record_payment, [row]) do
+          :ok -> :ok
+          {:ok, seq} when is_integer(seq) and seq > 0 -> {:ok, seq}
+          {:error, why} -> {:error, why}
+          other -> {:error, {:bad_return, other}}
+        end
+      catch
+        kind, reason -> {:error, {kind, reason}}
+      end
+    else
+      :memory
     end
   end
 

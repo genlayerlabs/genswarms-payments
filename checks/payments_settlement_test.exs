@@ -35,6 +35,22 @@ defmodule LedgerStore do
   def put_last_scanned_block(_chain, _n), do: :ok
 end
 
+defmodule SequencedLedgerStore do
+  def reset, do: :persistent_term.put({__MODULE__, :rows}, [])
+  def rows, do: :persistent_term.get({__MODULE__, :rows}, [])
+  def payment_seen?(_key), do: {:ok, false}
+
+  def record_payment(row) do
+    :persistent_term.put({__MODULE__, :rows}, [row | rows()])
+    {:ok, 41}
+  end
+
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_chain), do: {:ok, nil}
+  def put_last_scanned_block(_chain, _n), do: :ok
+end
+
 LedgerStore.reset()
 {:ok, delivered} = Agent.start_link(fn -> [] end)
 
@@ -53,6 +69,8 @@ state =
     end
   })
 
+# Old-format keys remain valid inputs and dedup by exact string equality;
+# only newly built USDC settlements switch to chain_id-prefixed keys.
 s = %{
   beneficiary: "budget:abc",
   amount_usd: Decimal.new("5.00"),
@@ -82,6 +100,9 @@ Agent.update(delivered, fn _ -> [] end)
 Check.check(f, "duplicate idempotency_key ⇒ zero settled, zero delivered",
   n2 == 0 and Agent.get(delivered, & &1) == [])
 Check.check(f, "ledger recorded exactly once", length(LedgerStore.rows()) == 1)
+Check.check(f, "legacy :ok store remains valid and mirror row has no invented store sequence",
+  hd(LedgerStore.rows()).outbox_seq == nil and
+    hd(state.settlement_mirror).outbox_seq == nil)
 
 # FAIL CLOSED: store down ⇒ nothing settles, nothing delivered
 LedgerStore.down!(true)
@@ -89,6 +110,8 @@ s2 = %{s | idempotency_key: "base:0xTX:4", ref: "0xTX:4"}
 {n3, state} = Payments.settle([s2], state)
 Check.check(f, "store down ⇒ fail closed (0 settled, 0 delivered)",
   n3 == 0 and Agent.get(delivered, & &1) == [])
+Check.check(f, "held settlement gets no mirror row or outbox sequence",
+  length(state.settlement_mirror) == 1)
 
 # recovery: store back up ⇒ the SAME settlement goes through
 LedgerStore.down!(false)
@@ -101,6 +124,7 @@ ok_dev =
     name: :p2,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     targets: ["t"],
+    allow_ephemeral: true,
     trusted_sources: [],
     store_mod: nil,
     auto_tick: false,
@@ -108,9 +132,35 @@ ok_dev =
   })
 
 {d1, ok_dev} = Payments.settle([s], ok_dev)
-{d2, _} = Payments.settle([s], ok_dev)
+{d2, ok_dev} = Payments.settle([s], ok_dev)
+s_mem2 = %{s | idempotency_key: "memory:2", ref: "memory:2"}
+{d3, ok_dev} = Payments.settle([s_mem2], ok_dev)
 Check.check(f, "dev mode (no store): settles once, memory-dedups the repeat",
   d1 == 1 and d2 == 0)
+Check.check(f, "memory fallback mints monotone outbox sequences",
+  d3 == 1 and Enum.map(ok_dev.settlement_mirror, & &1.outbox_seq) == [2, 1] and
+    ok_dev.next_outbox_seq == 3)
+
+# A2: a new store may assign the sequence itself. The hub accepts the tuple
+# without weakening any error path and keeps the assigned value on its mirror.
+SequencedLedgerStore.reset()
+
+seq_state =
+  Payments.init!(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    targets: ["t"],
+    store_mod: SequencedLedgerStore,
+    auto_tick: false,
+    deliver_fn: fn _, _, _ -> :ok end
+  })
+
+{seq_count, seq_state} =
+  Payments.settle([%{s | idempotency_key: "sequenced:1", ref: "sequenced:1"}], seq_state)
+
+Check.check(f, "record_payment {:ok, positive_seq} is a successful settlement",
+  seq_count == 1 and hd(seq_state.settlement_mirror).outbox_seq == 41)
+Check.check(f, "store receives the full row before attaching its returned sequence",
+  hd(SequencedLedgerStore.rows()).outbox_seq == nil)
 
 # ── B1(i): multi-target delivery isolation — a raise on one target must not
 # block delivery to the other (a disclosed gap the review called out).
@@ -131,6 +181,7 @@ state_iso =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["flaky", "reliable"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false,
     deliver_fn: isolating_deliver
@@ -156,6 +207,7 @@ state_exit =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["flaky2"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false,
     deliver_fn: exiting_deliver
@@ -194,6 +246,7 @@ state_2a =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["down_by_return"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false,
     deliver_fn: error_return_deliver
@@ -236,6 +289,7 @@ state_2a2 =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["bad_return", "good_target"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false,
     deliver_fn: mixed_return_deliver
@@ -329,6 +383,7 @@ state_2d =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: [],
     targets: ["peer_obj"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false
   })

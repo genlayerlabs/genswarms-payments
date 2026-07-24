@@ -73,7 +73,7 @@ state =
     deliver_fn: fn _, _, _ -> :ok end,
     rpc_fn: settling_rpc,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -210,12 +210,13 @@ mirror_state =
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
+    allow_ephemeral: true,
     namespace: "llm_quota",
     store_mod: nil,
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
     ],
     rpc_fn: nil
   })
