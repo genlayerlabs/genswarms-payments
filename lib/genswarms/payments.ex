@@ -56,6 +56,8 @@ defmodule Genswarms.Payments do
 
     chains = Map.get(config, :chains, [])
     Enum.each(chains, &validate_chain!/1)
+    validate_unique_chain_field!(chains, :name)
+    validate_unique_chain_field!(chains, :chain_id)
 
     targets = Map.get(config, :targets, []) |> Enum.map(&to_string/1)
     validate_durable_settlement_store!(store_mod, targets, Map.get(config, :allow_ephemeral))
@@ -195,8 +197,12 @@ defmodule Genswarms.Payments do
   # tried chain.rpc_url; that's now an ArgumentError at init instead.
   defp validate_chain!(chain) do
     case Map.fetch(chain, :chain_id) do
-      {:ok, chain_id} when is_integer(chain_id) ->
+      {:ok, chain_id} when is_integer(chain_id) and chain_id > 0 ->
         :ok
+
+      {:ok, chain_id} when is_integer(chain_id) ->
+        raise ArgumentError,
+              "payments: chain #{inspect(Map.get(chain, :name, chain))} has non-positive required chain_id: #{inspect(chain_id)}"
 
       {:ok, chain_id} ->
         raise ArgumentError,
@@ -208,6 +214,30 @@ defmodule Genswarms.Payments do
     end
 
     validate_rpc_url!(chain)
+  end
+
+  defp validate_unique_chain_field!(chains, field) do
+    duplicate =
+      Enum.reduce_while(chains, MapSet.new(), fn chain, seen ->
+        value = Map.get(chain, field)
+
+        if MapSet.member?(seen, value) do
+          {:halt, {:duplicate, value}}
+        else
+          {:cont, MapSet.put(seen, value)}
+        end
+      end)
+
+    case duplicate do
+      {:duplicate, value} ->
+        label = if field == :name, do: "chain name", else: "chain_id"
+
+        raise ArgumentError,
+              "payments: duplicate #{label} #{inspect(value)}; every configured chain must have a unique #{field}"
+
+      %MapSet{} ->
+        :ok
+    end
   end
 
   defp validate_rpc_url!(chain) do
@@ -340,51 +370,58 @@ defmodule Genswarms.Payments do
       |> Map.put(:outbox_seq, nil)
 
     case record_payment_write(state.store_mod, row) do
-      result when result == :memory or result == :ok or elem(result, 0) == :ok ->
-        {row, state} = keep_settlement(row, result, state)
+      result when result in [:memory, :ok] ->
+        finish_recorded_settlement(row, s, key, result, state)
 
-        content =
-          Jason.encode!(%{
-            action: "payment_confirmed",
-            beneficiary: s.beneficiary,
-            amount_usd: Decimal.to_string(s.amount_usd),
-            method: s.method,
-            ref: s.ref,
-            namespace: s.namespace,
-            at: DateTime.to_iso8601(row.at)
-          })
-
-        failed_targets =
-          Enum.filter(state.targets, fn target ->
-            deliver_one(state.deliver_fn, target, state.name, content) == :error
-          end)
-
-        state = %{
-          state
-          | seen_keys: MapSet.put(state.seen_keys, key),
-            settlement_mirror: [row | state.settlement_mirror]
-        }
-
-        state =
-          if failed_targets == [] do
-            state
-          else
-            Logger.error(
-              "payments: #{key} undelivered to #{inspect(failed_targets)} — queued for retry next tick"
-            )
-
-            %{
-              state
-              | undelivered: Map.put(state.undelivered, key, %{targets: failed_targets, content: content})
-            }
-          end
-
-        {:settled, state}
+      {:ok, seq} = result when is_integer(seq) and seq > 0 ->
+        finish_recorded_settlement(row, s, key, result, state)
 
       {:error, why} ->
         Logger.error("payments: record_payment failed (#{inspect(why)}) — FAIL CLOSED, holding #{key}")
         {:skipped, state}
     end
+  end
+
+  defp finish_recorded_settlement(row, s, key, result, state) do
+    {row, state} = keep_settlement(row, result, state)
+
+    content =
+      Jason.encode!(%{
+        action: "payment_confirmed",
+        beneficiary: s.beneficiary,
+        amount_usd: Decimal.to_string(s.amount_usd),
+        method: s.method,
+        ref: s.ref,
+        namespace: s.namespace,
+        at: DateTime.to_iso8601(row.at)
+      })
+
+    failed_targets =
+      Enum.filter(state.targets, fn target ->
+        deliver_one(state.deliver_fn, target, state.name, content) == :error
+      end)
+
+    state = %{
+      state
+      | seen_keys: MapSet.put(state.seen_keys, key),
+        settlement_mirror: [row | state.settlement_mirror]
+    }
+
+    state =
+      if failed_targets == [] do
+        state
+      else
+        Logger.error(
+          "payments: #{key} undelivered to #{inspect(failed_targets)} — queued for retry next tick"
+        )
+
+        %{
+          state
+          | undelivered: Map.put(state.undelivered, key, %{targets: failed_targets, content: content})
+        }
+      end
+
+    {:settled, state}
   end
 
   defp keep_settlement(row, {:ok, seq}, state) when is_integer(seq) and seq > 0 do

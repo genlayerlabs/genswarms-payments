@@ -47,8 +47,10 @@ end
 # a newly added action fail here until it has an explicit shape-driving case.
 source = File.read!(Path.expand("../lib/genswarms/payments.ex", __DIR__))
 
+literal_action_pattern = ~r/"action"\s*=>\s*"([^"]+)"/
+
 literal_actions =
-  Regex.scan(~r/%\{"action"\s*=>\s*"([^"]+)"\}/, source, capture: :all_but_first)
+  Regex.scan(literal_action_pattern, source, capture: :all_but_first)
   |> List.flatten()
 
 grouped_actions =
@@ -56,6 +58,18 @@ grouped_actions =
   |> Enum.flat_map(fn [actions] -> String.split(actions) end)
 
 implemented_actions = MapSet.new(literal_actions ++ grouped_actions)
+
+multiline_multi_key_pattern = """
+%{
+  "request_id" => _request_id,
+  "action" => "future_refund",
+  "reason" => _reason
+}
+"""
+
+Check.check(f, "literal action enumeration handles multi-key multiline map patterns",
+  Regex.scan(literal_action_pattern, multiline_multi_key_pattern, capture: :all_but_first) ==
+    [["future_refund"]])
 
 action_messages = %{
   "health" => %{"action" => "health"},

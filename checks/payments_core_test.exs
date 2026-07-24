@@ -209,6 +209,69 @@ Check.check(f, "a non-integer chain_id raises clearly at init",
   match?({:error, %ArgumentError{}}, non_integer_chain_id_result) and
     Exception.message(elem(non_integer_chain_id_result, 1)) =~ "non-integer required chain_id")
 
+# chain_id identifies real on-chain state and must never admit sentinel-like
+# zero/negative values into permanent idempotency keys.
+for invalid_chain_id <- [0, -1] do
+  invalid_chain_id_config =
+    Map.put(config, :chains, [
+      %{name: "base", chain_id: invalid_chain_id, rpc_url: "injected", usdc_contract: "0x0"}
+    ])
+
+  invalid_chain_id_result =
+    try do
+      Payments.init!(invalid_chain_id_config)
+      {:ok, :did_not_raise}
+    rescue
+      e -> {:error, e}
+    end
+
+  Check.check(f, "chain_id #{invalid_chain_id} is rejected as non-positive",
+    match?({:error, %ArgumentError{}}, invalid_chain_id_result) and
+      Exception.message(elem(invalid_chain_id_result, 1)) =~
+        "non-positive required chain_id: #{invalid_chain_id}")
+end
+
+# Scan cursors are keyed by chain.name, while chain_id is the immutable
+# on-chain identity in settlement keys. Both fields must be unique across the
+# complete chain list.
+duplicate_name_config =
+  Map.put(config, :chains, [
+    %{name: "base", chain_id: 8453, rpc_url: "injected-a", usdc_contract: "0x0"},
+    %{name: "base", chain_id: 84532, rpc_url: "injected-b", usdc_contract: "0x1"}
+  ])
+
+duplicate_name_result =
+  try do
+    Payments.init!(duplicate_name_config)
+    {:ok, :did_not_raise}
+  rescue
+    e -> {:error, e}
+  end
+
+Check.check(f, "duplicate chain names are rejected clearly at init",
+  match?({:error, %ArgumentError{}}, duplicate_name_result) and
+    Exception.message(elem(duplicate_name_result, 1)) =~
+      ~s(duplicate chain name "base"))
+
+duplicate_chain_id_config =
+  Map.put(config, :chains, [
+    %{name: "base", chain_id: 8453, rpc_url: "injected-a", usdc_contract: "0x0"},
+    %{name: "base_archive", chain_id: 8453, rpc_url: "injected-b", usdc_contract: "0x1"}
+  ])
+
+duplicate_chain_id_result =
+  try do
+    Payments.init!(duplicate_chain_id_config)
+    {:ok, :did_not_raise}
+  rescue
+    e -> {:error, e}
+  end
+
+Check.check(f, "duplicate chain_ids are rejected clearly at init",
+  match?({:error, %ArgumentError{}}, duplicate_chain_id_result) and
+    Exception.message(elem(duplicate_chain_id_result, 1)) =~
+      "duplicate chain_id 8453")
+
 # C3: a hub that credits targets must not silently use restart-volatile
 # address allocation and settlement dedup.
 ephemeral_config = %{

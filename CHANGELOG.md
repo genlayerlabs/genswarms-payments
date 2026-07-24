@@ -7,10 +7,14 @@
   `chain`, `chain_id`, `block_number`, `log_index`, `tx_hash`, and
   `from_address`, alongside the existing derived `amount_usd` and settlement
   fields.
-- Every chain config now requires an integer `chain_id`. New settlements use
-  `"#{chain_id}:#{tx_hash}:#{log_index}"` as the idempotency key, preventing a
-  mutable chain-name rename from re-crediting history. Previously recorded
-  old-format keys remain valid because dedup is string equality.
+- Every chain config now requires a unique positive integer `chain_id`, and
+  chain names must also be unique because scan cursors are keyed by name. New
+  settlements use `"#{chain_id}:#{tx_hash}:#{log_index}"` as the idempotency
+  key, preventing a mutable chain-name rename from re-keying new rows. Dedup
+  remains exact string equality, so already-recorded old keys keep deduping
+  matching old-key inputs, while new watcher rows always use the new format;
+  safe transition relies on the scan cursor never rolling back, not on
+  cross-format key equivalence.
 - `Genswarms.Payments.Store.record_payment/1` may return either legacy `:ok`
   or `{:ok, positive_seq}`. Store-assigned sequences are retained as
   `outbox_seq` on the settlement mirror; the memory fallback mints its own
@@ -23,6 +27,10 @@
 - Added a contract-shape check that derives every action string from the
   handler source and pins `init/1` plus every message path to the real
   `Genswarms.Objects.ObjectHandler` return shapes and JSON reply contract.
+- Invalid configuration no longer escapes `init/1` as a raise: it returns
+  `{:error, term}`, which the engine logs while leaving the object unstarted,
+  instead of crash-looping it. `init!/1` retains the raising contract for
+  tests and embedders.
 
 ## 0.1.1 — 2026-07-24
 
@@ -148,3 +156,6 @@
 - URL scrubbing does not redact API keys embedded in the HOSTNAME
   (`https://<key>.provider.com/`); full URL, path, userinfo, and query
   fragments are covered.
+- In `allow_ephemeral: true` development mode, `settlement_mirror` is
+  append-only and grows without bound for the life of the hub. Phase 2 will
+  decide the reader and retention owner; this release does not bound it.

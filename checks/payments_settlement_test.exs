@@ -51,6 +51,16 @@ defmodule SequencedLedgerStore do
   def put_last_scanned_block(_chain, _n), do: :ok
 end
 
+defmodule InvalidReturnLedgerStore do
+  def set_return(value), do: :persistent_term.put({__MODULE__, :return}, value)
+  def payment_seen?(_key), do: {:ok, false}
+  def record_payment(_row), do: :persistent_term.get({__MODULE__, :return})
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_), do: :ok
+  def get_last_scanned_block(_chain), do: {:ok, nil}
+  def put_last_scanned_block(_chain, _n), do: :ok
+end
+
 LedgerStore.reset()
 {:ok, delivered} = Agent.start_link(fn -> [] end)
 
@@ -161,6 +171,43 @@ Check.check(f, "record_payment {:ok, positive_seq} is a successful settlement",
   seq_count == 1 and hd(seq_state.settlement_mirror).outbox_seq == 41)
 Check.check(f, "store receives the full row before attaching its returned sequence",
   hd(SequencedLedgerStore.rows()).outbox_seq == nil)
+
+# The record-and-deliver dispatch must remain total over every result that
+# record_payment_write/2 can produce. Invalid store returns are normalized to
+# {:error, {:bad_return, _}} and must hold cleanly rather than reaching the
+# success path or keep_settlement/3.
+{:ok, invalid_return_deliveries} = Agent.start_link(fn -> [] end)
+
+invalid_return_state =
+  Payments.init!(%{
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    targets: ["t"],
+    store_mod: InvalidReturnLedgerStore,
+    auto_tick: false,
+    deliver_fn: fn _, _, _ ->
+      Agent.update(invalid_return_deliveries, &[:delivered | &1])
+      :ok
+    end
+  })
+
+invalid_return_results =
+  Enum.with_index([{:ok, 0}, {:ok, -1}, {:ok, "41"}, :unexpected, %{ok: true}], 1)
+  |> Enum.map(fn {invalid_return, index} ->
+    InvalidReturnLedgerStore.set_return(invalid_return)
+    candidate = %{s | idempotency_key: "invalid-return:#{index}", ref: "invalid-return:#{index}"}
+
+    try do
+      Payments.settle([candidate], invalid_return_state)
+    rescue
+      error -> {:raised, error}
+    catch
+      kind, reason -> {:caught, kind, reason}
+    end
+  end)
+
+Check.check(f, "invalid record_payment returns are total: all hold with no delivery or mirror row",
+  Enum.all?(invalid_return_results, &match?({0, %{settlement_mirror: []}}, &1)) and
+    Agent.get(invalid_return_deliveries, & &1) == [])
 
 # ── B1(i): multi-target delivery isolation — a raise on one target must not
 # block delivery to the other (a disclosed gap the review called out).
