@@ -173,6 +173,59 @@ Check.check(
     length(logged.()) == 2
 )
 
+# ── R4-P4-I6: bounded in TIME, not only in count ───────────────────────────
+# Every address is one sequential synchronous RPC inside this object's
+# GenServer callback, so the count cap alone is a mailbox stall measured in
+# minutes on an operator keystroke — taken, by construction, exactly when the
+# RPC endpoint is degraded. The report must come back PARTIAL rather than hold
+# the money hub.
+:ets.insert(calls, {:log, []})
+
+slow_state = %{
+  state
+  | sweep_budget_ms: 60,
+    rpc_fn: fn chain, method, params ->
+      Process.sleep(40)
+      rpc_fn.(chain, method, params)
+    end
+}
+
+{timed_out, _} = ask.(slow_state, "ops", %{action: "sweep_report"})
+
+Check.check(
+  f,
+  "a slow endpoint spends the wall-clock budget and returns PARTIAL results, never a wedged hub",
+  timed_out["ok"] == true and timed_out["budget_spent"] == true and
+    timed_out["complete"] == false and timed_out["addresses_checked"] < 6 and
+    timed_out["remaining"] == 6 - timed_out["addresses_checked"]
+)
+
+Check.check(
+  f,
+  "the truncated run stopped issuing chain calls the moment the budget was spent",
+  length(logged.()) == timed_out["addresses_checked"]
+)
+
+:ets.insert(calls, {:log, []})
+{capped, _} = ask.(state, "ops", %{action: "sweep_report", limit: 10_000})
+
+Check.check(
+  f,
+  "an oversized limit is clamped by the hub's own hard cap, never honoured",
+  capped["addresses_checked"] == 6 and capped["complete"] == true and
+    capped["remaining"] == 0 and capped["budget_spent"] == false
+)
+
+:ets.insert(calls, {:log, []})
+{partial, state} = ask.(state, "ops", %{action: "sweep_report", limit: 4})
+
+Check.check(
+  f,
+  "a partial report says how much it did NOT measure, instead of implying a full sweep",
+  partial["complete"] == false and partial["remaining"] == 2 and
+    partial["addresses_checked"] == 4 and length(logged.()) == 4
+)
+
 {bad_chain, state} = ask.(state, "ops", %{action: "sweep_report", chain: "nope"})
 
 Check.check(

@@ -147,6 +147,135 @@ Check.check(
   AllocStore.attempts() == [5] and conflict_state.next_index == 5
 )
 
+Check.check(
+  f,
+  "a store with no get_address_binding/1 keeps the old refusal exactly (no read to adopt from)",
+  conflict["address"] == nil
+)
+
+# ── R4-P4-I4: a conflict against a store that CAN say what the beneficiary is
+# bound to is ADOPTED, not refused. The old refusal was permanent — this
+# process's `state.bindings` was never repaired, so every later /topup by that
+# user on this instance failed identically, reported as "the DB is down" while
+# the store held the exact answer.
+defmodule AdoptStore do
+  @bound %{
+    beneficiary: "llmb_peer_written",
+    index: 11,
+    address: "0x1111111111111111111111111111111111111111",
+    namespace: "llm_quota"
+  }
+
+  def configure(mode), do: :persistent_term.put({__MODULE__, :mode}, mode)
+  def bound, do: @bound
+
+  def put_address_binding(binding) do
+    :persistent_term.put(
+      {__MODULE__, :attempts},
+      [binding.index | :persistent_term.get({__MODULE__, :attempts}, [])]
+    )
+
+    {:error, :binding_conflict}
+  end
+
+  def attempts, do: :persistent_term.get({__MODULE__, :attempts}, []) |> Enum.reverse()
+
+  def get_address_binding(_beneficiary) do
+    case :persistent_term.get({__MODULE__, :mode}) do
+      :ok -> {:ok, @bound}
+      :foreign -> {:ok, %{@bound | namespace: "someone_else"}}
+      :missing -> {:ok, nil}
+      :down -> {:error, :db_down}
+    end
+  end
+
+  def list_address_bindings, do: {:ok, []}
+  def get_last_scanned_block(_chain), do: {:ok, nil}
+  def put_last_scanned_block(_chain, _block), do: :ok
+  def payment_seen?(_key), do: {:ok, false}
+  def record_payment(_payment), do: :ok
+  def list_settlements_since(_after, _limit), do: {:ok, %{settlements: [], max_seq: 0}}
+end
+
+adopt_boot = fn ->
+  :persistent_term.put({AdoptStore, :attempts}, [])
+
+  Payments.init!(%{
+    xpub: xpub,
+    allow_test_xpub: true,
+    namespace: ns,
+    trusted_sources: ["commands"],
+    targets: ["llm_proxy"],
+    store_mod: AdoptStore,
+    auto_tick: false
+  })
+end
+
+AdoptStore.configure(:ok)
+adopt_state = adopt_boot.()
+{adopted, adopt_state} = ask.(adopt_state, "llmb_peer_written")
+
+Check.check(
+  f,
+  "a binding_conflict serves the STORED address instead of refusing",
+  adopted["ok"] == true and adopted["address"] == AdoptStore.bound().address
+)
+
+Check.check(
+  f,
+  "the adopted address is the store's, never a fresh derivation at this hub's index",
+  AdoptStore.attempts() == [0] and adopted["address"] != nil
+)
+
+Check.check(
+  f,
+  "the in-memory map is REPAIRED, so the next /topup is a plain hit with no second write",
+  adopt_state.bindings["llmb_peer_written"].address == AdoptStore.bound().address and
+    adopt_state.next_index == 12
+)
+
+{again, _adopt_state} = ask.(adopt_state, "llmb_peer_written")
+
+Check.check(
+  f,
+  "the SAME beneficiary can never end up with two addresses",
+  again["address"] == adopted["address"] and AdoptStore.attempts() == [0]
+)
+
+# A binding under a FOREIGN namespace must not be served: settlements to it
+# would be HELD, so handing it out invites a deposit into a black hole.
+AdoptStore.configure(:foreign)
+foreign_state = adopt_boot.()
+{foreign, foreign_state} = ask.(foreign_state, "llmb_peer_written")
+
+Check.check(
+  f,
+  "a binding under a FOREIGN namespace is refused, never adopted",
+  foreign["ok"] == false and foreign["error"] == "namespace_mismatch" and
+    MapSet.member?(foreign_state.foreign_namespace_bindings, "llmb_peer_written")
+)
+
+# "You are bound" followed by "I cannot say to what" is a store defect, not an
+# answer — and it must never become a second derivation.
+AdoptStore.configure(:missing)
+{missing, missing_state} = ask.(adopt_boot.(), "llmb_peer_written")
+
+Check.check(
+  f,
+  "a conflict whose read-back finds NO row refuses (never derives a second address)",
+  missing["ok"] == false and missing["error"] == "store_unavailable" and
+    missing_state.bindings["llmb_peer_written"] == nil
+)
+
+AdoptStore.configure(:down)
+{read_down, _} = ask.(adopt_boot.(), "llmb_peer_written")
+
+Check.check(
+  f,
+  "a conflict whose read-back ERRORS refuses",
+  read_down["ok"] == false and read_down["error"] == "store_unavailable"
+)
+
 # ── retries are bounded ────────────────────────────────────────────────────
 AllocStore.configure(Enum.to_list(0..500))
 exhausted_state = boot.()

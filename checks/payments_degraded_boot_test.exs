@@ -104,6 +104,41 @@ health = Jason.decode!(health_json)
 
 Check.check(f, "health reports degraded_boot true", health["degraded_boot"] == true)
 
+# ── R4-P4-I1: the degraded payment_status refusal is TAGGED and ECHOED.
+# It was the one operator reply carrying neither, so on the wire it was
+# indistinguishable from the untagged `deposit_address` refusal a host routes
+# to an END USER: an unrelated user got "I can't mint your deposit address",
+# their real answer was then uncorrelated and dropped, and the operator who
+# asked got silence — in the exact state where an operator most needs an
+# answer. The `action` tag is what makes the two reply families separable.
+{:reply, status_json, _state} =
+  Payments.handle_message(
+    "ingress",
+    Jason.encode!(%{action: "payment_status", beneficiary: "llmb_alice"}),
+    state
+  )
+
+status = Jason.decode!(status_json)
+
+Check.check(
+  f,
+  "the degraded payment_status refusal is action-tagged (never mistakable for a /topup answer)",
+  status["action"] == "payment_status" and status["ok"] == false and
+    status["error"] == "degraded_boot"
+)
+
+Check.check(
+  f,
+  "and it echoes the beneficiary, so the caller correlates exactly instead of guessing",
+  status["beneficiary"] == "llmb_alice"
+)
+
+Check.check(
+  f,
+  "the /topup-facing deposit_address refusal stays UNTAGGED (the two families remain distinct)",
+  not Map.has_key?(dep, "action")
+)
+
 # ── A1 counterpart: a healthy store (list_address_bindings succeeds) boots
 # normally — degraded_boot false, poll/deposit_address both work.
 defmodule HealthyStore do

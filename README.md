@@ -25,6 +25,18 @@ Every capability is fail-closed, gated by two allowlists:
   reads the outbox are trusted, and neither has any business releasing money.
   Both gates apply — an operator source that is not also trusted can never
   act, and is warned about at boot.
+
+  Read this for what it is: a SOURCE-IDENTITY gate. Against objects that are
+  not on it (a cron, an outbox consumer) it is a real barrier. Against an
+  object that IS on it and also relays ordinary end-user traffic, it is not a
+  second factor at all — every message that object sends carries the same
+  source identity, so this hub cannot tell an operator-authorized action from
+  any other action that object was talked into sending. In that shape the real
+  control is the caller-side operator gate, and this list only narrows WHICH
+  object holds it. Two independent factors need either a dedicated
+  operator-only object between the glue and this hub, or a config-injected
+  shared secret in the action payload validated here; neither is invented for
+  the host by this package.
 - **`targets`** — who may receive `payment_confirmed`. Empty `targets` means
   nobody is ever credited, even though settlement still records durably.
   The `settlements_since` action additionally requires its authenticated
@@ -283,9 +295,15 @@ interval; this package owns the settlement/watch logic, not the clock.
 - `{"action": "sweep_report", "chain": "...", "limit": M}` — D4 measurement:
   how many derived addresses hold a balance and how much. One ERC-20
   `balanceOf` (`eth_call`, selector `0x70a08231`) per address against the
-  chain's configured token, bounded by `limit` (default 50, clamps to 1..200,
-  addresses walked in HD-index order). Reports `nonzero`, `total_usd`,
-  `largest`, up to 50 non-zero rows, `unreadable` and `complete`. It NEVER
+  chain's configured token, bounded by `limit` (default 10, clamps to 1..25,
+  addresses walked in HD-index order) AND by a wall-clock budget
+  (`sweep_budget_ms`, default 20_000). Every call is sequential and synchronous
+  inside this object's callback, so the time bound is the one that matters: an
+  exhausted budget returns a PARTIAL report (`complete: false`, `remaining`,
+  `budget_spent: true`) instead of holding the hub's mailbox while every
+  `deposit_address` and chain tick queues behind it. Reports `nonzero`,
+  `total_usd`, `largest`, up to 50 non-zero rows, `unreadable` and `complete`.
+  It NEVER
   moves funds — this object holds an xPUB, not an xprv — and an unreadable
   balance is reported as `unreadable`, never folded into zero. With several
   chains configured and no `chain` argument it refuses (`chain_required`)
@@ -349,8 +367,8 @@ refuses unless the hub explicitly booted in ephemeral mode.
 
 | Callback | Purpose |
 |---|---|
-| `put_address_binding/1` | persist `%{beneficiary, index, address, namespace}`; `{:error, :index_taken}` when another beneficiary owns that index/address (the hub advances and retries), `{:error, :binding_conflict}` when THIS beneficiary is already bound to a different one (never retried, never rebound) |
-| `get_address_binding/1` | fetch a binding by beneficiary |
+| `put_address_binding/1` | persist `%{beneficiary, index, address, namespace}`; `{:error, :index_taken}` when another beneficiary owns that index/address (the hub advances and retries), `{:error, :binding_conflict}` when THIS beneficiary is already bound to a different one (never retried, never rebound — the hub reads `get_address_binding/1` and serves the address the store already committed to) |
+| `get_address_binding/1` | fetch a binding by beneficiary; the hub calls it on `{:error, :binding_conflict}` and ADOPTS the stored address (never re-derives, never rebinds) — a store that answers `binding_conflict` should export this, or that beneficiary is permanently refused on that instance |
 | `list_address_bindings/0` | boot: rebuild the watched set + next index |
 | `payment_seen?/1` | settlement dedup by idempotency key — must be durable in prod |
 | `record_payment/1` | record one settlement (`status` `"settled"` or `"quarantined"`); return `:ok`, `{:ok, positive_seq}` (settled rows only), or `{:error, term}` — `{:error, :unsupported_status}` for a status the schema does not know |

@@ -69,7 +69,22 @@ defmodule Genswarms.Payments do
   # ask the store (or the chain) for unbounded work.
   @quarantined_status_limit 20
   @quarantined_action_limit 100
-  @sweep_address_limit 200
+
+  # (R4-P4-I6) The sweep is bounded in COUNT and in TIME, and the time bound is
+  # the one that matters. Each address is one sequential synchronous RPC inside
+  # this object's GenServer callback, and the transport's own deadline is 20s,
+  # so a 200-address cap is a 66-minute mailbox stall on an operator keystroke —
+  # taken, by construction, exactly when the RPC endpoint is degraded, i.e.
+  # during the incident that prompted the sweep. Every `/topup` deposit_address
+  # and every chain-scan tick queues behind it.
+  #
+  # So: a small hard cap AND a wall-clock budget. When the budget is spent the
+  # report returns what it measured with `complete: false` and `remaining`, the
+  # same honest-partial stance `unreadable` already takes. No new async
+  # machinery — the work is bounded, not moved.
+  @sweep_address_limit 25
+  @sweep_default_limit 10
+  @sweep_budget_ms 20_000
   @sweep_row_limit 50
 
   # Bound on the "another allocator took that HD index" retry (see
@@ -178,6 +193,10 @@ defmodule Genswarms.Payments do
       max_issuance_per_window_usd: max_issuance_per_window_usd,
       small_topup_usd: small_topup_usd,
       issuance_window_hours: issuance_window_hours,
+      # (R4-P4-I6) Wall-clock budget for one sweep_report, in ms. Configurable
+      # because the right number is the host's RPC latency times a handful of
+      # addresses, not a package constant — but it is bounded either way.
+      sweep_budget_ms: positive_integer_config!(config, :sweep_budget_ms, @sweep_budget_ms),
       degraded_boot: degraded_boot?,
       ephemeral_outbox:
         Map.get(config, :allow_ephemeral) == true and
@@ -260,6 +279,23 @@ defmodule Genswarms.Payments do
   # apply). That is a config mistake, so it is loud at boot rather than
   # silently dead at 3am — but it is not fatal: refusing to boot the money
   # path over a stale name in a list is the worse failure.
+  #
+  # (R4-P4-I7) WHAT THIS ALLOWLIST IS AND IS NOT, stated plainly so no reader
+  # takes it for more than it is. It is a SOURCE-IDENTITY gate: it decides
+  # which objects may send operator actions. It is a real barrier against the
+  # cron and the outbox consumer, which are on `trusted_sources` and are NOT on
+  # this list — neither can release money, by construction.
+  #
+  # It is NOT a second factor against the object that IS on it. When a host
+  # lists an object that also relays ordinary end-user traffic, every message
+  # that object sends carries the same source identity, so this hub cannot tell
+  # an operator-authorized action from any other action that object was talked
+  # into sending. In that shape the REAL control is the caller-side operator
+  # gate, and this list only narrows WHICH object holds it. A host that wants
+  # two independent factors needs either a dedicated operator-only object
+  # between the glue and this hub, or a config-injected shared secret carried in
+  # the action payload and validated here — neither is invented for the host,
+  # and no combination of the two lists here substitutes for it.
   defp validate_operator_sources!(config, trusted) do
     raw = Map.get(config, :operator_sources, [])
 
@@ -1421,13 +1457,26 @@ defmodule Genswarms.Payments do
   # watched set, so an "ok:true, payments:[]" answer here would be
   # indistinguishable from "genuinely zero payments" when it's really "we
   # don't know". Checked ahead of the generic clause below.
+  #
+  # (R4-P4-I1) TAGGED and ECHOED like every other operator reply. This was the
+  # ONE operator answer that carried neither, and an untagged refusal is
+  # indistinguishable on the wire from the untagged `deposit_address` refusal a
+  # caller routes to an END USER: a host correlating replies by shape answered
+  # an unrelated user's top-up with this, and the operator who asked got
+  # silence — in the exact state (a degraded hub) where an operator most needs
+  # an answer. The tag is what makes the two reply families separable at all;
+  # the echo is what makes the correlation exact rather than most-recent.
   defp handle_action(
          "payment_status",
-         %{"beneficiary" => _ben},
+         %{"beneficiary" => _ben} = msg,
          %{degraded_boot: true} = state,
          _from
        ) do
-    {:reply, Jason.encode!(%{ok: false, error: "degraded_boot"}), state}
+    {:reply,
+     Jason.encode!(
+       %{action: "payment_status", ok: false, error: "degraded_boot"}
+       |> Map.merge(operator_echo(msg))
+     ), state}
   end
 
   # D3: settled money AND held money, in one answer. The two legs come from
@@ -1439,7 +1488,7 @@ defmodule Genswarms.Payments do
   #
   # Either leg erroring refuses the WHOLE reply: "no held rows" and "I could not
   # read held rows" are different sentences, and only one of them is true.
-  defp handle_action("payment_status", %{"beneficiary" => ben}, state, _from)
+  defp handle_action("payment_status", %{"beneficiary" => ben} = msg, state, _from)
        when is_binary(ben) do
     with {:ok, rows, durable?} <- status_settled_rows(state, ben),
          {:ok, held_rows, held_durable?} <- status_held_rows(state, ben) do
@@ -1460,16 +1509,26 @@ defmodule Genswarms.Payments do
          held_durable: held_durable?
        }), state}
     else
+      # (R4-P4-M1) Echoed like every other refusal: a refusal that names nothing
+      # can only be correlated by "most recent", which cross-delivers when two
+      # operators ask at once.
       {:error, _why} ->
         {:reply,
-         Jason.encode!(%{action: "payment_status", ok: false, error: "store_unavailable"}), state}
+         Jason.encode!(
+           %{action: "payment_status", ok: false, error: "store_unavailable"}
+           |> Map.merge(operator_echo(msg))
+         ), state}
     end
   end
 
   # The operator's held-money queue for the whole namespace (`/payments held`),
   # capped. Refuses rather than answering an empty queue it cannot see.
-  defp handle_action("quarantined", _msg, %{degraded_boot: true} = state, _from) do
-    {:reply, Jason.encode!(%{action: "quarantined", ok: false, error: "degraded_boot"}), state}
+  defp handle_action("quarantined", msg, %{degraded_boot: true} = state, _from) do
+    {:reply,
+     Jason.encode!(
+       %{action: "quarantined", ok: false, error: "degraded_boot"}
+       |> Map.merge(operator_echo(msg))
+     ), state}
   end
 
   defp handle_action("quarantined", msg, state, _from) do
@@ -1479,13 +1538,16 @@ defmodule Genswarms.Payments do
 
       case quarantined_lookup(state, beneficiary, limit) do
         {:ok, rows} ->
+          {total, unparsable} = sum_amount_with_defects(rows)
+
           render_reply(state, "quarantined", %{
             action: "quarantined",
             ok: true,
             namespace: state.namespace,
             beneficiary: beneficiary,
             count: length(rows),
-            total_usd: Decimal.to_string(sum_amount(rows)),
+            total_usd: Decimal.to_string(total),
+            amounts_unparsable: unparsable,
             held: Enum.map(rows, &held_row_view/1),
             complete: length(rows) < limit
           })
@@ -1518,11 +1580,14 @@ defmodule Genswarms.Payments do
   #   * it does not double-credit. A row that is already settled is an
   #     idempotent success with no push: the outbox already carries it, and
   #     the consumer's key dedup would refuse a second credit anyway.
-  defp handle_action("release_payment", _msg, %{degraded_boot: true} = state, _from) do
+  defp handle_action("release_payment", msg, %{degraded_boot: true} = state, _from) do
     emit_metric(state, "payments_hold", %{stage: "degraded_boot", action: "release_payment"})
 
-    {:reply, Jason.encode!(%{action: "release_payment", ok: false, error: "degraded_boot"}),
-     state}
+    {:reply,
+     Jason.encode!(
+       %{action: "release_payment", ok: false, error: "degraded_boot"}
+       |> Map.merge(operator_echo(msg))
+     ), state}
   end
 
   defp handle_action("release_payment", msg, state, _from) do
@@ -1548,7 +1613,7 @@ defmodule Genswarms.Payments do
   end
 
   defp handle_action("sweep_report", msg, state, _from) do
-    with {:ok, raw_limit} <- action_non_negative_integer(msg, "limit", 50),
+    with {:ok, raw_limit} <- action_non_negative_integer(msg, "limit", @sweep_default_limit),
          {:ok, chain} <- sweep_chain(msg, state) do
       limit = clamp_integer(raw_limit, 1, @sweep_address_limit)
       render_reply(state, "sweep_report", sweep_report(chain, limit, state))
@@ -2537,11 +2602,22 @@ defmodule Genswarms.Payments do
   # stayed broken on that instance long after the restart finished. That is a
   # livelock, not a race: nothing about it self-heals.
   #
-  # So: on `:index_taken` advance and retry, bounded. Everything else keeps its
-  # old meaning — a store outage still fails closed (never hand out an address
-  # whose binding is not durable), and `:binding_conflict` (THIS beneficiary is
-  # already bound to a different address) is still refused outright, because a
-  # rebind would strand money already sent to the first address.
+  # So: on `:index_taken` advance and retry, bounded. A store outage still
+  # fails closed (never hand out an address whose binding is not durable).
+  #
+  # (R4-P4-I4) `:binding_conflict` no longer refuses blindly. It means THIS
+  # beneficiary is already bound durably — to an address this process does not
+  # have in `state.bindings` because a peer instance (or a pre-restart
+  # incarnation of this one) wrote it. Refusing there was a permanent break,
+  # not a race: `state.bindings` was never repaired, so every later `/topup` by
+  # that user on this instance failed identically for the life of the process,
+  # reported as "the store is down" when the store was in fact holding the exact
+  # answer the user asked for. So: ADOPT the stored binding — read it back and
+  # serve it. Never re-derive, never rebind. The invariant the old refusal was
+  # protecting ("a beneficiary must never end up with two deposit addresses") is
+  # strictly better served by adoption, because adoption serves the ONE address
+  # the durable table already committed to, and derivation is never consulted.
+  # We refuse only when the read-back cannot prove which address that is.
   defp allocate_binding(ben, state, attempts_left) do
     index = state.next_index
 
@@ -2580,6 +2656,9 @@ defmodule Genswarms.Payments do
 
             {:error, :store_unavailable, %{state | next_index: index + 1}}
 
+          {:error, :binding_conflict} ->
+            adopt_binding(ben, state)
+
           {:error, why} ->
             Logger.error(
               "payments: binding persist failed (#{inspect(why)}) — refusing allocation"
@@ -2595,6 +2674,119 @@ defmodule Genswarms.Payments do
 
       {:error, why} ->
         {:error, why, state}
+    end
+  end
+
+  # (R4-P4-I4) The read half of the conflict. `get_address_binding/1` existed in
+  # the contract for exactly this and had no caller; this is the caller.
+  #
+  # Four outcomes, and only one of them serves an address:
+  #
+  #   * a row under THIS namespace with a usable index+address — adopt it into
+  #     `state.bindings` (repairing the in-memory map, so the NEXT `/topup` by
+  #     this beneficiary is a plain hit) and serve it. The address is the
+  #     store's, never a fresh derivation;
+  #   * a row under a FOREIGN namespace — refuse with `namespace_mismatch` and
+  #     remember it, the same way `deposit_address` already refuses a binding
+  #     loaded under a foreign namespace at boot: settlements to that address
+  #     would be HELD, so serving it would invite a deposit into a black hole;
+  #   * no row / an unusable row — the store said "this beneficiary is bound"
+  #     and then could not say to what. That is a store defect, not an answer;
+  #   * the store not exporting the read, or erroring — refuse. Never derive a
+  #     second address for a beneficiary the store says is already bound.
+  defp adopt_binding(ben, state) do
+    case binding_lookup(state.store_mod, ben) do
+      {:ok, row} when is_map(row) ->
+        index = normalize_integer(row_get(row, :index) || row_get(row, :hd_index))
+        address = row_get(row, :address)
+        namespace = to_string(row_get(row, :namespace) || state.namespace)
+
+        cond do
+          not (is_integer(index) and index >= 0 and is_binary(address) and address != "") ->
+            Logger.error(
+              "payments: binding conflict for #{inspect(ben)} and the store's read-back is unusable (#{inspect(row)}) — refusing rather than deriving a second address"
+            )
+
+            emit_metric(state, "payments_hold", %{
+              stage: "address_binding",
+              beneficiary: ben,
+              reason: "unusable_binding_readback"
+            })
+
+            {:error, :store_unavailable, state}
+
+          namespace != state.namespace ->
+            Logger.error(
+              "payments: beneficiary #{inspect(ben)} is bound under namespace #{inspect(namespace)} while this hub is #{inspect(state.namespace)} — refusing to serve an address whose settlements would be HELD"
+            )
+
+            emit_metric(state, "payments_namespace_mismatch", %{
+              stage: "address_binding",
+              beneficiary: ben,
+              binding_namespace: namespace,
+              hub_namespace: state.namespace
+            })
+
+            {:error, :namespace_mismatch,
+             %{
+               state
+               | foreign_namespace_bindings:
+                   MapSet.put(state.foreign_namespace_bindings, ben)
+             }}
+
+          true ->
+            binding = %{index: index, address: address, namespace: namespace}
+
+            Logger.warning(
+              "payments: adopting the durable binding for #{inspect(ben)} (index #{index}) — it was written by another instance; serving the stored address, never a new one"
+            )
+
+            emit_metric(state, "payments_binding_adopted", %{
+              beneficiary: ben,
+              index: index
+            })
+
+            {:ok, binding,
+             %{
+               state
+               | bindings: Map.put(state.bindings, ben, binding),
+                 next_index: max(state.next_index, index + 1)
+             }}
+        end
+
+      {:ok, nil} ->
+        Logger.error(
+          "payments: store answered :binding_conflict for #{inspect(ben)} and then reported no binding — refusing"
+        )
+
+        emit_metric(state, "payments_hold", %{
+          stage: "address_binding",
+          beneficiary: ben,
+          reason: "conflict_without_binding"
+        })
+
+        {:error, :store_unavailable, state}
+
+      other ->
+        Logger.error(
+          "payments: binding conflict for #{inspect(ben)} and the binding read-back failed (#{inspect(other)}) — refusing"
+        )
+
+        emit_metric(state, "payments_hold", %{
+          stage: "address_binding",
+          beneficiary: ben,
+          reason: "binding_readback_failed"
+        })
+
+        {:error, :store_unavailable, state}
+    end
+  end
+
+  defp binding_lookup(store_mod, ben) do
+    if exported?(store_mod, :get_address_binding, 1) do
+      store_result(store_mod, :get_address_binding, [ben], {:error, :store_failed})
+    else
+      {:error, :no_binding_read}
     end
   end
 
@@ -2788,7 +2980,17 @@ defmodule Genswarms.Payments do
            beneficiary: row_get(row, :beneficiary),
            amount_usd: money_text(row_get(row, :amount_usd)),
            outbox_seq: seq,
-           pushed: pushed?
+           pushed: pushed?,
+           # (R4-P4-M4) `pushed: false` has exactly ONE cause here — a row
+           # missing beneficiary/method/ref/amount (a delivery failure still
+           # counts as pushed; the outbox is the authority either way). The
+           # consumer's poll validates the SAME four fields, so such a row is
+           # not creditable by the poll either: it will be classified permanent
+           # and quarantined consumer-side. Saying "the poll will credit it"
+           # there is fabricated success generated by the branch that detected
+           # the problem, so the reply states the truth and lets the render say
+           # it.
+           creditable: pushed?
          }), state}
     end
   end
@@ -2870,18 +3072,28 @@ defmodule Genswarms.Payments do
     }
   end
 
-  defp sum_amount(rows) do
-    Enum.reduce(rows, Decimal.new(0), fn row, acc ->
+  # (R4-P4-M7) A total is a money number, so an amount this hub cannot parse is
+  # COUNTED, never folded in as zero — the same stance the sweep takes with an
+  # unreadable balance. Unreachable from a `Decimal`-returning store, which is
+  # why it is a count next to the total rather than a refusal: silence about a
+  # row that was silently valued at $0 is the pattern, not this instance of it.
+  defp sum_amount_with_defects(rows) do
+    Enum.reduce(rows, {Decimal.new(0), 0}, fn row, {acc, unparsable} ->
       case row_get(row, :amount_usd) do
-        %Decimal{} = amount -> Decimal.add(acc, amount)
-        value when is_binary(value) -> Decimal.add(acc, parse_money(value))
-        _ -> acc
+        %Decimal{} = amount ->
+          {Decimal.add(acc, amount), unparsable}
+
+        value when is_binary(value) ->
+          if Regex.match?(@money_pattern, value) do
+            {Decimal.add(acc, Decimal.new(value)), unparsable}
+          else
+            {acc, unparsable + 1}
+          end
+
+        _ ->
+          {acc, unparsable + 1}
       end
     end)
-  end
-
-  defp parse_money(value) do
-    if Regex.match?(@money_pattern, value), do: Decimal.new(value), else: Decimal.new(0)
   end
 
   defp money_text(%Decimal{} = amount), do: Decimal.to_string(amount)
@@ -2923,28 +3135,51 @@ defmodule Genswarms.Payments do
     selected = Enum.take(ordered, limit)
     decimals = Map.get(chain, :decimals, 6)
     started_ms = System.monotonic_time(:millisecond)
+    budget_ms = Map.get(state, :sweep_budget_ms) || @sweep_budget_ms
+    deadline_ms = started_ms + budget_ms
 
-    {rows, unreadable} =
-      Enum.reduce(selected, {[], 0}, fn {beneficiary, binding}, {acc, unreadable} ->
-        case token_balance(chain, binding.address, decimals, state) do
-          {:ok, amount} ->
-            if Decimal.compare(amount, Decimal.new(0)) == :gt do
-              {[{beneficiary, binding, amount} | acc], unreadable}
-            else
-              {acc, unreadable}
-            end
+    # The budget is checked BEFORE each call, never mid-call: one in-flight RPC
+    # can still run to the transport's own deadline, so the true worst case is
+    # @sweep_budget_ms + one RPC timeout — bounded, and bounded by a number an
+    # operator can hold in their head.
+    {rows, unreadable, checked, budget_spent?} =
+      Enum.reduce_while(selected, {[], 0, 0, false}, fn {beneficiary, binding},
+                                                        {acc, unreadable, checked, _spent} ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          {:halt, {acc, unreadable, checked, true}}
+        else
+          case token_balance(chain, binding.address, decimals, state) do
+            {:ok, amount} ->
+              if Decimal.compare(amount, Decimal.new(0)) == :gt do
+                {:cont, {[{beneficiary, binding, amount} | acc], unreadable, checked + 1, false}}
+              else
+                {:cont, {acc, unreadable, checked + 1, false}}
+              end
 
-          {:error, why} ->
-            # NEVER counted as zero: an unreadable balance is an unknown, and
-            # a sweep decision made on a silently-zeroed unknown is exactly the
-            # wrong decision.
-            Logger.warning(
-              "payments: sweep balance unreadable for #{binding.address} on #{Map.get(chain, :name)}: #{inspect(why)}"
-            )
+            {:error, why} ->
+              # NEVER counted as zero: an unreadable balance is an unknown, and
+              # a sweep decision made on a silently-zeroed unknown is exactly the
+              # wrong decision.
+              Logger.warning(
+                "payments: sweep balance unreadable for #{binding.address} on #{Map.get(chain, :name)}: #{inspect(why)}"
+              )
 
-            {acc, unreadable + 1}
+              {:cont, {acc, unreadable + 1, checked + 1, false}}
+          end
         end
       end)
+
+    if budget_spent? do
+      Logger.warning(
+        "payments: sweep_report spent its #{budget_ms}ms budget after #{checked} of #{total_bindings} addresses on #{Map.get(chain, :name)} — returning a PARTIAL report rather than holding the money hub's mailbox"
+      )
+
+      emit_metric(state, "payments_sweep_truncated", %{
+        chain: to_string(Map.get(chain, :name)),
+        addresses_checked: checked,
+        bindings_total: total_bindings
+      })
+    end
 
     rows = Enum.sort_by(rows, fn {_ben, _binding, amount} -> Decimal.to_float(amount) end, :desc)
     total = Enum.reduce(rows, Decimal.new(0), fn {_b, _bi, amount}, acc -> Decimal.add(acc, amount) end)
@@ -2957,7 +3192,7 @@ defmodule Genswarms.Payments do
 
     emit_metric(state, "payments_sweep_report", %{
       chain: to_string(Map.get(chain, :name)),
-      addresses_checked: length(selected),
+      addresses_checked: checked,
       nonzero: length(rows),
       unreadable: unreadable,
       total_usd: Decimal.to_string(total)
@@ -2969,8 +3204,10 @@ defmodule Genswarms.Payments do
       chain: to_string(Map.get(chain, :name)),
       token_contract: Map.get(chain, :usdc_contract),
       bindings_total: total_bindings,
-      addresses_checked: length(selected),
-      complete: length(selected) >= total_bindings,
+      addresses_checked: checked,
+      complete: checked >= total_bindings,
+      remaining: max(total_bindings - checked, 0),
+      budget_spent: budget_spent?,
       unreadable: unreadable,
       nonzero: length(rows),
       total_usd: Decimal.to_string(total),

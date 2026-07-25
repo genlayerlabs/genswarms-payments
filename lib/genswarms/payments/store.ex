@@ -45,7 +45,20 @@ defmodule Genswarms.Payments.Store do
   """
   @callback put_address_binding(map()) :: :ok | {:error, term()}
 
-  @doc "Fetch a binding by beneficiary string; {:ok, nil} when unbound."
+  @doc """
+  Fetch a binding by beneficiary string; `{:ok, nil}` when unbound.
+
+  Rows carry `beneficiary`, `index` (or `hd_index`), `address` and `namespace`.
+
+  This is the read the hub makes on `{:error, :binding_conflict}`: the
+  beneficiary is bound durably to an address this hub process does not have in
+  memory (a peer instance wrote it, or this process booted before the write).
+  The hub ADOPTS what this callback returns and serves that address — it never
+  re-derives, never rebinds, and refuses outright when this read is missing,
+  errors, or cannot say which address the beneficiary is bound to. So a store
+  that answers `:binding_conflict` should export this too; without it a
+  conflict is a permanent refusal for that beneficiary on that instance.
+  """
   @callback get_address_binding(String.t()) :: {:ok, map() | nil} | {:error, term()}
 
   @doc "All bindings (boot: builds the watched address set + next index)."
