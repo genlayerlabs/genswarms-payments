@@ -13,12 +13,13 @@ expected = [
   get_last_scanned_block: 1,
   put_last_scanned_block: 2,
   list_payments: 1,
-  list_settlements_since: 2
+  list_settlements_since: 2,
+  issuance_totals_since: 3
 ]
 
 Check.check(
   f,
-  "Store behaviour declares all 9 callbacks",
+  "Store behaviour declares all 10 callbacks",
   Enum.all?(expected, &(&1 in callbacks))
 )
 

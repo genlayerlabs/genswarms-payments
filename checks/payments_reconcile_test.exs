@@ -143,14 +143,37 @@ receipt = fn tx_hash, raw_amount ->
   }
 end
 
-rpc_fn = fn chain, method, [tx_hash] ->
-  Agent.update(rpc_calls, &(&1 + 1))
-  true = chain.rpc_url == "https://independent.example/rpc"
-  true = method == "eth_getTransactionReceipt"
+# C2: the finality leg asks the SAME independent endpoint for the `finalized`
+# block tag. `finalized_head` is what that endpoint answers with; nil stands
+# for a node that does not serve the tag (JSON-RPC null).
+finalized_head = fn -> :persistent_term.get({__MODULE__, :finalized_head}, 200) end
+set_finalized_head = fn head -> :persistent_term.put({__MODULE__, :finalized_head}, head) end
 
-  case tx_hash do
-    "0xGOOD" -> {:ok, receipt.("0xGOOD", 2_500_000)}
-    "0xDRIFT" -> {:ok, receipt.("0xDRIFT", 2_400_000)}
+{:ok, finality_calls} = Agent.start_link(fn -> 0 end)
+
+rpc_fn = fn chain, method, params ->
+  true = chain.rpc_url == "https://independent.example/rpc"
+
+  case {method, params} do
+    {"eth_getTransactionReceipt", [tx_hash]} ->
+      Agent.update(rpc_calls, &(&1 + 1))
+
+      case tx_hash do
+        "0xGOOD" -> {:ok, receipt.("0xGOOD", 2_500_000)}
+        "0xDRIFT" -> {:ok, receipt.("0xDRIFT", 2_400_000)}
+      end
+
+    {"eth_getBlockByNumber", ["finalized", false]} ->
+      Agent.update(finality_calls, &(&1 + 1))
+
+      case finalized_head.() do
+        nil -> {:ok, nil}
+        head -> {:ok, %{"number" => "0x" <> Integer.to_string(head, 16)}}
+      end
+
+    {"eth_blockNumber", []} ->
+      Agent.update(finality_calls, &(&1 + 1))
+      {:ok, "0x" <> Integer.to_string(finalized_head.() + 20, 16)}
   end
 end
 
@@ -158,6 +181,7 @@ state =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ops"],
     targets: [],
     namespace: "llm_quota",
@@ -204,8 +228,32 @@ Check.check(
     "drift" => ["8453:0xDRIFT:0"],
     "unverifiable" => 1,
     "legacy" => 1,
-    "incomplete" => 1
+    "incomplete" => 1,
+    "unfinalized" => 0,
+    "finality_unverifiable" => 1
   } and is_integer(reply["elapsed_ms"]) and reply["elapsed_ms"] >= 0
+)
+
+# C2: the finality leg is informational and INDEPENDENT of the receipt leg —
+# the base rows sit at block 150 under a finalized head of 200, so they are
+# final; the chain without a second endpoint cannot be finality-checked at all
+# and is reported as such rather than assumed finalized.
+Check.check(
+  f,
+  "a chain with no reconcile endpoint reports finality_unverifiable, never finalized",
+  Enum.any?(metric_events, fn {event, meta} ->
+    event == "payments_reconcile_finality_unverifiable" and meta.chain == "other" and
+      meta.reason == "reconcile_rpc_url_missing"
+  end)
+)
+
+Check.check(
+  f,
+  "the finalized head is fetched ONCE per chain per run, not once per row",
+  Agent.get(finality_calls, & &1) == 1 and
+    Enum.count(metric_events, fn {event, meta} ->
+      event == "payments_reconcile_finality_unverifiable" and meta.chain == "other"
+    end) == 1
 )
 
 Check.check(
@@ -400,10 +448,127 @@ Check.check(
   match?({:ok, %{"ok" => false, "error" => "encode_failed"}}, poisoned_reconcile)
 )
 
+# ── C2: finality legs ───────────────────────────────────────────────────────
+# Crediting happens at fast_credit_depth (shallow, bounded by C1's caps).
+# Reconciliation is where finality is QUERIED: a settled row above the
+# `finalized` head is reported as unfinalized (informational — a credit is
+# never reversed here), and an endpoint that cannot answer the tag is
+# `finality_unverifiable`, NEVER silently treated as finalized.
+reset_reconcile = fn ->
+  ReconcileStore.reset(
+    [row],
+    %{
+      beneficiary: "budget:reconcile",
+      index: 0,
+      address: binding_address,
+      namespace: "llm_quota"
+    }
+  )
+
+  Agent.update(events, fn _ -> [] end)
+end
+
+reconcile_now = fn st ->
+  {:reply, json, _} = Payments.handle_message("ops", Jason.encode!(%{action: "reconcile"}), st)
+  {Jason.decode!(json), Agent.get(events, & &1)}
+end
+
+reset_reconcile.()
+set_finalized_head.(100)
+{unfinalized_reply, unfinalized_events} = reconcile_now.(state)
+
+Check.check(
+  f,
+  "a settled row above the finalized head is counted and metered as unfinalized",
+  unfinalized_reply["unfinalized"] == 1 and unfinalized_reply["checked"] == 1 and
+    unfinalized_reply["drift"] == [] and
+    Enum.any?(unfinalized_events, fn {event, meta} ->
+      event == "payments_reconcile_unfinalized" and meta.idempotency_key == "8453:0xGOOD:0" and
+        meta.block_number == 150 and meta.finality_head == 100
+    end)
+)
+
+reset_reconcile.()
+set_finalized_head.(nil)
+{null_finality_reply, null_finality_events} = reconcile_now.(state)
+
+Check.check(
+  f,
+  "a null answer to the finalized tag is unverifiable, never treated as finalized",
+  null_finality_reply["finality_unverifiable"] == 1 and
+    null_finality_reply["unfinalized"] == 0 and
+    Enum.any?(null_finality_events, fn {event, meta} ->
+      event == "payments_reconcile_finality_unverifiable" and meta.chain == "base" and
+        meta.reason == "finalized_tag_unsupported"
+    end)
+)
+
+confirmations_state =
+  Payments.init!(%{
+    name: :payments,
+    xpub: xpub,
+    allow_test_xpub: true,
+    trusted_sources: ["ops"],
+    targets: [],
+    namespace: "llm_quota",
+    store_mod: ReconcileStore,
+    auto_tick: false,
+    rpc_fn: rpc_fn,
+    metrics_fn: fn event, meta -> Agent.update(events, &[{event, meta} | &1]) end,
+    chains: [
+      %{
+        name: "base",
+        chain_id: 8453,
+        rpc_url: "https://primary.example/rpc",
+        reconcile_rpc_url: "https://independent.example/rpc",
+        usdc_contract: "0xCONTRACT",
+        finality: {:confirmations, 5}
+      }
+    ]
+  })
+
+reset_reconcile.()
+set_finalized_head.(100)
+{confirmations_reply, _} = reconcile_now.(confirmations_state)
+
+Check.check(
+  f,
+  "finality: {:confirmations, n} derives the head from eth_blockNumber instead of the tag",
+  confirmations_reply["unfinalized"] == 1 and confirmations_reply["finality_unverifiable"] == 0
+)
+
+set_finalized_head.(200)
+
+invalid_finality =
+  try do
+    Payments.init!(%{
+      xpub: xpub,
+      allow_test_xpub: true,
+      chains: [
+        %{
+          name: "base",
+          chain_id: 8453,
+          rpc_url: "https://primary.example/rpc",
+          usdc_contract: "0xCONTRACT",
+          finality: :probably
+        }
+      ]
+    })
+  rescue
+    error -> {:raised, error}
+  end
+
+Check.check(
+  f,
+  "an unknown finality mode is refused at init",
+  match?({:raised, %ArgumentError{}}, invalid_finality)
+)
+
 bad_reconcile_url =
   try do
     Payments.init!(%{
       xpub: xpub,
+      allow_test_xpub: true,
       chains: [
         %{
           name: "base",

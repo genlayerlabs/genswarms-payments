@@ -70,8 +70,7 @@ defmodule Genswarms.Payments.Usdc do
     case core.rpc_fn.(chain, "eth_blockNumber", []) do
       {:ok, latest_hex} ->
         latest = hex_int(latest_hex)
-        confirmations = Map.get(chain, :confirmations, 12)
-        safe_to = latest - confirmations
+        safe_to = latest - fast_credit_depth(chain)
 
         case scan_from(chain, core) do
           {:ok, from} when from > safe_to ->
@@ -89,6 +88,14 @@ defmodule Genswarms.Payments.Usdc do
       {:error, why} ->
         {:error, why}
     end
+  end
+
+  # The CREDIT leg's depth, explicitly labelled (C2). This is the fast,
+  # shallow path a user waits on — NOT finality, which the hub queries from
+  # the chain on the reconciliation leg (`finality: :finalized`). Defaults to
+  # the chain's `confirmations` so existing configs keep their current depth.
+  defp fast_credit_depth(chain) do
+    Map.get(chain, :fast_credit_depth, Map.get(chain, :confirmations, 12))
   end
 
   defp scan_from(chain, core) do

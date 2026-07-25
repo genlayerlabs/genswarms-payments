@@ -37,7 +37,8 @@ value_hex = "0x" <> String.pad_leading("4c4b40", 64, "0")
 
 state0 =
   Payments.init!(%{
-    name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt", trusted_sources: ["ingress"],
+    name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true, trusted_sources: ["ingress"],
     targets: ["llm_proxy"], namespace: "llm_quota", store_mod: ScanStore,
     auto_tick: false, now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
     deliver_fn: fn _, _, _ -> :ok end,
@@ -54,11 +55,12 @@ state0 =
 addr = Jason.decode!(j)["address"]
 
 canned = fn logs, latest ->
-  fn _chain, method, params ->
+  fn chain, method, params ->
     Agent.update(rpc_log, &[{method, params} | &1])
     case method do
       "eth_blockNumber" -> {:ok, "0x" <> Integer.to_string(latest, 16)}
       "eth_getLogs" -> {:ok, logs}
+      m -> Check.self_check_rpc(chain, m)
     end
   end
 end
@@ -115,6 +117,45 @@ Check.check(f, "previously-unconfirmed log settles after confirmations",
 Check.check(f, "no duplicate of the first payment",
   Enum.count(ScanStore.rows(), &(&1.idempotency_key == "8453:0xT1:0")) == 1)
 
+# ── C2: the CREDIT leg's depth is fast_credit_depth, explicitly labelled.
+# It is NOT finality (which the reconcile action queries from the chain's
+# `finalized` tag); it is the shallow, fast path a user waits on, bounded by
+# C1's caps. It defaults to `confirmations` so existing configs keep their
+# depth, and overrides it when set.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+state_fast =
+  Payments.init!(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"],
+    namespace: "llm_quota",
+    store_mod: ScanStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn _, _, _ -> :ok end,
+    chains: [%{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
+               confirmations: 10, fast_credit_depth: 40, decimals: 6, start_block: 100,
+               max_block_range: 1000, address_chunk: 2}],
+    rpc_fn: nil
+  })
+
+_state_fast = Payments.poll(%{state_fast | rpc_fn: canned.([mk_log.(addr, 150, "0xFAST", 0)], 200)})
+
+Check.check(f, "the credit leg scans to latest - fast_credit_depth (160), not - confirmations",
+  ScanStore.cursor("base") == 160 and
+    Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xFAST:0")))
+
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+_state_default_depth = Payments.poll(%{state0 | rpc_fn: canned.([], 200)})
+
+Check.check(f, "fast_credit_depth defaults to the chain's confirmations (unchanged behaviour)",
+  ScanStore.cursor("base") == 190)
+
 # getLogs range + address filter shape
 calls = Agent.get(rpc_log, &Enum.reverse(&1))
 get_logs = for {"eth_getLogs", [p]} <- calls, do: p
@@ -150,7 +191,8 @@ ScanStore.reset()
 ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
 
 state_chunk = Payments.init!(%{
-  name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt", trusted_sources: ["ingress"],
+  name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+  allow_test_xpub: true, trusted_sources: ["ingress"],
   targets: ["llm_proxy"], namespace: "llm_quota", store_mod: ScanStore,
   auto_tick: false, now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
   deliver_fn: fn _, _, _ -> :ok end,
@@ -172,11 +214,12 @@ _addr_ghi = Jason.decode!(jg)["address"]
 
 {:ok, rpc_log2} = Agent.start_link(fn -> [] end)
 canned_empty = fn latest ->
-  fn _chain, method, _params ->
+  fn chain, method, _params ->
     Agent.update(rpc_log2, &[method | &1])
     case method do
       "eth_blockNumber" -> {:ok, "0x" <> Integer.to_string(latest, 16)}
       "eth_getLogs" -> {:ok, []}
+      m -> Check.self_check_rpc(chain, m)
     end
   end
 end
@@ -196,10 +239,11 @@ Check.check(f, "address_chunk splits 3 bound addresses into 2 eth_getLogs calls"
 ScanStore.reset()
 ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
 
-null_block_rpc = fn _chain, method, _params ->
+null_block_rpc = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, nil}
     "eth_getLogs" -> {:ok, []}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -225,6 +269,7 @@ state_two_chain =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -254,6 +299,7 @@ mixed_rpc = fn chain, method, _params ->
     {"bad_chain", "eth_getLogs"} -> {:ok, []}
     {"good_chain", "eth_blockNumber"} -> {:ok, "0xc8"}
     {"good_chain", "eth_getLogs"} -> {:ok, [good_log]}
+    {_name, m} -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -307,6 +353,7 @@ state_ci =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -328,10 +375,11 @@ addr_ci = Jason.decode!(jci)["address"]
 
 log_ci = mk_log.(addr_ci, 5, "0xCI1", 0)
 
-rpc_ci = fn _chain, method, _params ->
+rpc_ci = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [log_ci]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -356,6 +404,7 @@ state_dedup =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -378,10 +427,11 @@ addr_dedup = Jason.decode!(jd)["address"]
 log_dedup = mk_log.(addr_dedup, 5, "0xDEDUP", 0)
 CursorInvariantStore.seed_seen("8453:0xDEDUP:0")
 
-rpc_dedup = fn _chain, method, _params ->
+rpc_dedup = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [log_dedup]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -429,6 +479,7 @@ state_raising0 =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -455,11 +506,12 @@ log_raising = mk_log.(addr_raising, 150, "0xRAISING", 0)
 
 {:ok, rpc_log_raising} = Agent.start_link(fn -> [] end)
 
-rpc_raising = fn _chain, method, _params ->
+rpc_raising = fn chain, method, _params ->
   Agent.update(rpc_log_raising, &[method | &1])
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [log_raising]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 

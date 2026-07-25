@@ -7,6 +7,7 @@ xpub =
 
 valid_config = %{
   xpub: xpub,
+  allow_test_xpub: true,
   trusted_sources: ["trusted"],
   targets: [],
   auto_tick: false,

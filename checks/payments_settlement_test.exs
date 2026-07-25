@@ -73,6 +73,7 @@ state =
     name: :payments,
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["llm_proxy", "audit_log"],
     store_mod: LedgerStore,
@@ -164,6 +165,7 @@ ok_dev =
     name: :p2,
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     targets: ["t"],
     allow_ephemeral: true,
     trusted_sources: [],
@@ -193,6 +195,7 @@ seq_state =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     targets: ["t"],
     store_mod: SequencedLedgerStore,
     auto_tick: false,
@@ -224,6 +227,7 @@ invalid_return_state =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     targets: ["t"],
     store_mod: InvalidReturnLedgerStore,
     auto_tick: false,
@@ -273,6 +277,7 @@ state_iso =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["flaky", "reliable"],
     allow_ephemeral: true,
@@ -310,6 +315,7 @@ state_exit =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["flaky2"],
     allow_ephemeral: true,
@@ -353,6 +359,7 @@ state_2a =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["down_by_return"],
     allow_ephemeral: true,
@@ -405,6 +412,7 @@ state_2a2 =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["bad_return", "good_target"],
     allow_ephemeral: true,
@@ -460,6 +468,7 @@ state_wo =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["t"],
     store_mod: WriteOnlyDownStore,
@@ -527,6 +536,7 @@ state_2d =
   Payments.init!(%{
     xpub:
       "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["peer_obj"],
     allow_ephemeral: true,

@@ -181,6 +181,7 @@ state =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["consumer", "trusted_non_target"],
     targets: ["consumer"],
     namespace: "llm_quota",
@@ -436,6 +437,7 @@ ephemeral =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["consumer"],
     targets: ["consumer"],
     allow_ephemeral: true,
@@ -481,6 +483,7 @@ raising_metrics =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     targets: ["consumer"],
     allow_ephemeral: true,
     namespace: "llm_quota",

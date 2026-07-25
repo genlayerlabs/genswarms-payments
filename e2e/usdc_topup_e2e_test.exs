@@ -248,6 +248,13 @@ defmodule E2E.Chain do
 
   def rpc(_chain, "eth_blockNumber", _params), do: {:ok, hex(d().latest)}
 
+  # D4: the hub proves the endpoint really is the configured chain before it
+  # scans anything — a fake chain answers truthfully here.
+  def rpc(chain, "eth_chainId", _params), do: {:ok, hex(chain.chain_id)}
+
+  def rpc(chain, "eth_call", [%{"data" => "0x313ce567"}, "latest"]),
+    do: {:ok, "0x" <> String.pad_leading(Integer.to_string(Map.get(chain, :decimals, 6), 16), 64, "0")}
+
   def rpc(_chain, "eth_getLogs", [params]) do
     from = hex_int(params["fromBlock"])
     to = hex_int(params["toBlock"])
@@ -411,6 +418,7 @@ hub_state =
     name: :payments,
     swarm_name: "e2e",
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress", "cron"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",

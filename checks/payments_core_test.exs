@@ -27,6 +27,7 @@ FakeStore.reset()
 config = %{
   name: :payments,
   xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+  allow_test_xpub: true,
   trusted_sources: ["telegram_ingress"],
   targets: ["llm_proxy"],
   allow_ephemeral: true,
@@ -93,6 +94,7 @@ end
 state_2c =
   Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["telegram_ingress"],
     targets: ["llm_proxy"],
     allow_ephemeral: true,
@@ -276,6 +278,7 @@ Check.check(f, "duplicate chain_ids are rejected clearly at init",
 # address allocation and settlement dedup.
 ephemeral_config = %{
   xpub: config.xpub,
+  allow_test_xpub: true,
   trusted_sources: ["ingress"],
   targets: ["llm_proxy"],
   store_mod: nil
@@ -302,6 +305,7 @@ Check.check(f, "allow_ephemeral:true is the explicit opt-out",
 {:ok, engine_state} =
   Genswarms.Payments.init(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     allow_ephemeral: true

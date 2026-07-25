@@ -65,6 +65,7 @@ state =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -130,6 +131,7 @@ healthy_state =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     store_mod: HealthyStore,
@@ -156,6 +158,7 @@ Check.check(f, "store exporting only put_address_binding (no list_address_bindin
     (try do
        Payments.init!(%{
          xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+         allow_test_xpub: true,
          store_mod: OnlyPutAddressStore
        })
        {:ok, :did_not_raise}
@@ -174,6 +177,7 @@ Check.check(f, "store exporting only payment_seen? (no record_payment) raises at
     (try do
        Payments.init!(%{
          xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+         allow_test_xpub: true,
          store_mod: OnlySeenStore
        })
        {:ok, :did_not_raise}
@@ -185,6 +189,7 @@ Check.check(f, "store exporting only payment_seen? (no record_payment) raises at
 Check.check(f, "store with both groups fully covered boots without raising",
   match?(%{}, Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     store_mod: HealthyStore
   })))
 
@@ -194,12 +199,13 @@ Check.check(f, "store with both groups fully covered boots without raising",
 {:ok, rpc_log} = Agent.start_link(fn -> [] end)
 
 canned = fn logs, latest ->
-  fn _chain, method, params ->
+  fn chain, method, params ->
     Agent.update(rpc_log, &[{method, params} | &1])
 
     case method do
       "eth_blockNumber" -> {:ok, "0x" <> Integer.to_string(latest, 16)}
       "eth_getLogs" -> {:ok, logs}
+      m -> Check.self_check_rpc(chain, m)
     end
   end
 end
@@ -208,6 +214,7 @@ mirror_state =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     allow_ephemeral: true,
