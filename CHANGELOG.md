@@ -2,6 +2,39 @@
 
 ## 0.2.0 — Unreleased
 
+- Added the D3 operator surface, gated by a NEW `operator_sources` allowlist
+  that is separate from `trusted_sources` and defaults to `[]`.
+  `release_payment` is the only path that turns a quarantined row back into
+  creditable money: the new optional `Store.release_quarantined_payment/2`
+  flips `status` to `"settled"` and mints a FRESH `outbox_seq` at release
+  time in one namespace-scoped atomic statement, which is what puts the row
+  above every consumer cursor; the hub then emits the SAME
+  `payment_confirmed` a normal settlement emits, so a release credits through
+  the consumer's ordinary validating path and never through a bypass.
+  Releasing an already-settled row is an idempotent no-op success (no second
+  sequence, no second push). Refusals are distinct: `unknown_key`,
+  `not_quarantined`, `namespace_mismatch`, `no_release_store`,
+  `degraded_boot`, `store_unavailable`. Added the `quarantined` action (the
+  operator's held-money queue, via the new optional
+  `Store.list_quarantined_payments/3`), extended `payment_status` with a
+  `held`/`held_durable` view of the same rows, and started persisting the
+  quarantine `reason` with the row (as an audit fact) so the queue can answer
+  "why is this held?" days later.
+- Added the D4 `sweep_report` action: a bounded, READ-ONLY per-address ERC-20
+  `balanceOf` measurement (how many derived addresses hold a balance, the
+  total, the largest) so consolidation economics become data-driven. It never
+  moves funds, and an unreadable balance is reported as `unreadable` rather
+  than folded into zero.
+- Fixed an address-allocation LIVELOCK under two hubs on one database (any
+  rolling restart). `put_address_binding/1` now distinguishes
+  `{:error, :index_taken}` (another beneficiary owns that HD index/address)
+  from `{:error, :binding_conflict}` (THIS beneficiary is already bound to a
+  different address). The hub advances its index and retries on the former
+  (bounded at 25 attempts) instead of re-offering the same permanently-taken
+  index to every subsequent new beneficiary forever; the latter is still
+  refused outright, so a rebind never strands money sent to the first
+  address. A store that cannot distinguish the two keeps the old behaviour.
+
 - Added per-settlement and aggregate issuance caps. `max_payment_usd`
   (default `"10000"`) bounds one settlement; `max_issuance_per_window_usd`
   (default `nil` = disabled) bounds the settled total inside a trailing

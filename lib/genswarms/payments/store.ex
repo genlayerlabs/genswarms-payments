@@ -20,7 +20,29 @@ defmodule Genswarms.Payments.Store do
   Money is `Decimal`. Addresses are EIP-55 checksummed strings.
   """
 
-  @doc "Persist a beneficiary↔address binding: %{beneficiary, index, address, namespace}."
+  @doc """
+  Persist a beneficiary↔address binding: %{beneficiary, index, address, namespace}.
+
+  Identity is immutable: a replay carrying the SAME beneficiary/index/address
+  is `:ok`, and one that would move an existing beneficiary to a different
+  index/address is refused.
+
+  Two refusals are DISTINCT, and the difference is load-bearing under
+  concurrency (two hubs on one database, e.g. a rolling restart):
+
+  - `{:error, :index_taken}` — the hd_index (or the address derived from it)
+    is already owned by ANOTHER beneficiary. The hub reads this as "that slot
+    is gone", advances its allocation index and retries, so a concurrent
+    allocator can never wedge it. The write is idempotent and the store MUST
+    NOT have mutated anything.
+  - `{:error, :binding_conflict}` — THIS beneficiary is already bound to a
+    different index/address. Never retried and never rebound: the address a
+    user was told to pay is permanent.
+
+  A store that cannot tell the two apart may answer `:binding_conflict` for
+  both; the hub then behaves exactly as it did before this distinction
+  existed (refuse, no retry) — it just cannot self-heal the concurrent case.
+  """
   @callback put_address_binding(map()) :: :ok | {:error, term()}
 
   @doc "Fetch a binding by beneficiary string; {:ok, nil} when unbound."
@@ -115,7 +137,78 @@ defmodule Genswarms.Payments.Store do
   @callback list_settlements_since(after_seq :: non_neg_integer(), limit :: pos_integer()) ::
               {:ok, %{settlements: [map()], max_seq: non_neg_integer()}} | {:error, term()}
 
+  @doc """
+  Release ONE quarantined settlement (the phase-4 operator action).
+
+  Exactly the two field changes the quarantine contract above names, applied
+  in ONE atomic statement on the existing row:
+
+      UPDATE <settlements>
+         SET status = 'settled',
+             outbox_seq = <fresh sequence from the same monotone generator
+                           every settled row is minted from>
+       WHERE idempotency_key = $2 AND namespace = $1 AND status = 'quarantined'
+
+  Three properties the store MUST hold, each of which is a money bug if it
+  does not:
+
+  1. The sequence is minted AT RELEASE TIME from the same generator, so the
+     released row lands ABOVE every consumer cursor and appears at the head
+     of the next poll. A record-time sequence would sit below an advanced
+     cursor forever and never be credited.
+  2. `namespace` scopes the statement. One hub must not be able to release
+     another hub's money; a row under a foreign namespace answers
+     `{:error, :not_found}` here, exactly like a key that does not exist.
+  3. It is IDEMPOTENT. A row already `"settled"` is reported as
+     `{:ok, :already_settled, row}` — never re-sequenced, never re-credited.
+
+  Returns:
+
+  - `{:ok, :released, row}` — this call flipped it. `row` carries the row's
+    settlement fields with the FRESH `outbox_seq` and `status: "settled"`.
+  - `{:ok, :already_settled, row}` — nothing changed; the row was settled
+    before this call (a replay, or a second operator). The hub answers
+    success and pushes nothing: the outbox already carries it.
+  - `{:error, :not_found}` — no row with that key in this namespace.
+  - `{:error, {:not_releasable, status}}` — the row exists but is in a status
+    that is neither `"quarantined"` nor `"settled"`.
+  - `{:error, term()}` — anything else. The hub refuses; it never reports a
+    release it cannot prove.
+
+  Optional. A store without it makes `release_payment` refuse with a distinct
+  `no_release_store` — never a silent success.
+  """
+  @callback release_quarantined_payment(
+              namespace :: String.t(),
+              idempotency_key :: String.t()
+            ) ::
+              {:ok, :released, map()}
+              | {:ok, :already_settled, map()}
+              | {:error, :not_found}
+              | {:error, {:not_releasable, String.t()}}
+              | {:error, term()}
+
+  @doc """
+  QUARANTINED rows, newest first — the operator's held-money queue.
+
+  `beneficiary` is `nil` for the whole namespace, or a beneficiary string to
+  scope to one. `limit` bounds the returned rows (the caller clamps it).
+  Scoped to `namespace` for the same reason the release is: another hub's
+  held money is not this operator surface's business.
+
+  Read-only and optional; `payment_status` and `quarantined` degrade to
+  "this store cannot answer" rather than reporting an empty queue, because
+  "no held money" and "I cannot see held money" are different sentences.
+  """
+  @callback list_quarantined_payments(
+              namespace :: String.t(),
+              beneficiary :: String.t() | nil,
+              limit :: pos_integer()
+            ) :: {:ok, [map()]} | {:error, term()}
+
   @optional_callbacks put_address_binding: 1,
+                      release_quarantined_payment: 2,
+                      list_quarantined_payments: 3,
                       get_address_binding: 1,
                       list_address_bindings: 0,
                       payment_seen?: 1,

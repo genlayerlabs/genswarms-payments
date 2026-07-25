@@ -9,6 +9,9 @@ valid_config = %{
   xpub: xpub,
   allow_test_xpub: true,
   trusted_sources: ["trusted"],
+  # The D3 operator actions carry their OWN allowlist; the shape check drives
+  # them through the same source, so it must be on both lists.
+  operator_sources: ["trusted"],
   targets: [],
   auto_tick: false,
   chains: []
@@ -84,7 +87,10 @@ action_messages = %{
   "payment_status" => %{"action" => "payment_status", "beneficiary" => "budget:shape"},
   "settlements_since" => %{"action" => "settlements_since"},
   "reconcile" => %{"action" => "reconcile"},
-  "ingest_event" => %{"action" => "ingest_event"}
+  "ingest_event" => %{"action" => "ingest_event"},
+  "release_payment" => %{"action" => "release_payment", "idempotency_key" => "shape:1"},
+  "quarantined" => %{"action" => "quarantined"},
+  "sweep_report" => %{"action" => "sweep_report"}
 }
 
 Check.check(

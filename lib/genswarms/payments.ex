@@ -63,6 +63,20 @@ defmodule Genswarms.Payments do
                     ])
   @money_pattern ~r/\A(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/
 
+  # D3/D4 operator-surface bounds. Held rows inside a `payment_status` answer
+  # are a per-beneficiary tail; the standalone queue and the sweep are the
+  # operator's paged views. All three are clamped so no operator keystroke can
+  # ask the store (or the chain) for unbounded work.
+  @quarantined_status_limit 20
+  @quarantined_action_limit 100
+  @sweep_address_limit 200
+  @sweep_row_limit 50
+
+  # Bound on the "another allocator took that HD index" retry (see
+  # ensure_binding/2). Deliberately small: it exists to step over indices a
+  # concurrent hub has just taken, not to walk a large gap.
+  @binding_index_attempts 25
+
   # Engine contract (Genswarms.Objects.ObjectHandler): init/1 MUST return
   # {:ok, state} — ObjectServer matches on the tuple and a bare map crash-loops
   # the object at swarm boot. init!/1 returns the bare state for tests and
@@ -124,6 +138,9 @@ defmodule Genswarms.Payments do
     issuance_window_hours = positive_integer_config!(config, :issuance_window_hours, 24)
     validate_issuance_window_store!(store_mod, max_issuance_per_window_usd)
 
+    trusted = MapSet.new(Map.get(config, :trusted_sources, []) |> Enum.map(&to_string/1))
+    operator_sources = validate_operator_sources!(config, trusted)
+
     {bindings, degraded_boot?, foreign_namespace_bindings} =
       init_bindings(store_mod, namespace, metrics_fn)
 
@@ -134,8 +151,8 @@ defmodule Genswarms.Payments do
       name: Map.get(config, :name, :payments),
       swarm_name: Map.get(config, :swarm_name, "swarm"),
       xpub: xpub,
-      trusted_sources:
-        MapSet.new(Map.get(config, :trusted_sources, []) |> Enum.map(&to_string/1)),
+      trusted_sources: trusted,
+      operator_sources: operator_sources,
       targets: targets,
       namespace: namespace,
       store_mod: store_mod,
@@ -229,6 +246,43 @@ defmodule Genswarms.Payments do
     else
       {%{}, false, MapSet.new()}
     end
+  end
+
+  # D3: value-affecting and operator-scope actions get their OWN allowlist,
+  # never `trusted_sources`. `trusted_sources` is the ordinary bot glue — the
+  # cron that ticks the watcher, the consumer that reads the outbox, the
+  # command object that mints deposit addresses. Releasing quarantined money
+  # (and enumerating every beneficiary's address and balance) is a different
+  # kind of authority, so it defaults to the EMPTY set: an operator surface
+  # nobody configured is an operator surface nobody has.
+  #
+  # A source that is operator-but-not-trusted can never act (both gates
+  # apply). That is a config mistake, so it is loud at boot rather than
+  # silently dead at 3am — but it is not fatal: refusing to boot the money
+  # path over a stale name in a list is the worse failure.
+  defp validate_operator_sources!(config, trusted) do
+    raw = Map.get(config, :operator_sources, [])
+
+    unless is_list(raw) do
+      raise ArgumentError, "payments: operator_sources must be a list of source names"
+    end
+
+    operator = MapSet.new(raw, &to_string/1)
+    orphans = MapSet.difference(operator, trusted)
+
+    unless MapSet.size(orphans) == 0 do
+      Logger.error(
+        "payments: operator_sources #{inspect(MapSet.to_list(orphans))} are not in trusted_sources — they can never act (both gates apply); fix the config"
+      )
+    end
+
+    if MapSet.size(operator) > 0 and MapSet.equal?(operator, trusted) do
+      Logger.warning(
+        "payments: operator_sources equals trusted_sources — every ordinary caller can release quarantined money; the separation is the point of the second allowlist"
+      )
+    end
+
+    operator
   end
 
   # Init-time coherence gate: a store that implements only HALF of a callback
@@ -576,6 +630,24 @@ defmodule Genswarms.Payments do
       {:ok, %{"action" => "tick"}} ->
         if trusted?(from, state), do: {:noreply, poll(state)}, else: {:noreply, state}
 
+      # D3 operator actions: trusted AND on the separate operator allowlist.
+      # An untrusted or merely-trusted sender gets an explicit refusal (these
+      # are typed by a human at a console and a silent drop is indistinguishable
+      # from a broken hub) plus a metric — a probe at the release door is worth
+      # seeing.
+      {:ok, %{"action" => action} = msg}
+      when action in ~w(release_payment quarantined sweep_report) ->
+        cond do
+          not trusted?(from, state) ->
+            operator_refusal(state, action, msg, from, "untrusted_source")
+
+          not operator?(from, state) ->
+            operator_refusal(state, action, msg, from, "not_an_operator")
+
+          true ->
+            handle_action(action, msg, state, from)
+        end
+
       {:ok, %{"action" => action} = msg}
       when action in ~w(deposit_address payment_status ingest_event settlements_since reconcile) ->
         if trusted?(from, state) do
@@ -860,6 +932,11 @@ defmodule Genswarms.Payments do
       |> Map.put(:at, state.now_fn.())
       |> Map.put(:outbox_seq, nil)
       |> Map.put(:status, status)
+      # D3: the cap decision travels WITH the row, not only into a metric and a
+      # one-shot cast. The operator queue is read back days later ("why is this
+      # $120 held?"), and a queue that cannot answer that question sends the
+      # operator to a log search. Stores keep unknown keys as audit facts.
+      |> maybe_put_quarantine_reason(status, reason)
 
     case record_payment_write(state.store_mod, row) do
       result when result in [:memory, :ok] ->
@@ -907,6 +984,11 @@ defmodule Genswarms.Payments do
         {:skipped, state}
     end
   end
+
+  defp maybe_put_quarantine_reason(row, "quarantined", reason) when not is_nil(reason),
+    do: Map.put(row, :quarantine_reason, reason_text(reason))
+
+  defp maybe_put_quarantine_reason(row, _status, _reason), do: row
 
   defp finish_recorded_settlement(
          %{status: "settled"} = row,
@@ -1263,6 +1345,40 @@ defmodule Genswarms.Payments do
 
   defp trusted?(from, state), do: MapSet.member?(state.trusted_sources, to_string(from))
 
+  defp operator?(from, state),
+    do: MapSet.member?(Map.get(state, :operator_sources, MapSet.new()), to_string(from))
+
+  defp operator_refusal(state, action, msg, from, reason) do
+    Logger.warning("payments: #{reason} #{inspect(from)} sent operator action #{action}")
+
+    emit_metric(state, "payments_operator_refused", %{
+      action: action,
+      reason: reason,
+      source: to_string(from)
+    })
+
+    {:reply,
+     Jason.encode!(
+       %{action: action, ok: false, error: reason}
+       |> Map.merge(operator_echo(msg))
+     ), state}
+  end
+
+  # Every operator reply — success or refusal — echoes the thing the request
+  # named, so the caller can correlate an async reply without guessing.
+  defp operator_echo(msg) do
+    %{}
+    |> maybe_echo(msg, "idempotency_key")
+    |> maybe_echo(msg, "beneficiary")
+  end
+
+  defp maybe_echo(acc, msg, key) do
+    case Map.get(msg, key) do
+      value when is_binary(value) and value != "" -> Map.put(acc, key, value)
+      _ -> acc
+    end
+  end
+
   defp handle_action(
          "deposit_address",
          %{"beneficiary" => _ben},
@@ -1314,32 +1430,132 @@ defmodule Genswarms.Payments do
     {:reply, Jason.encode!(%{ok: false, error: "degraded_boot"}), state}
   end
 
+  # D3: settled money AND held money, in one answer. The two legs come from
+  # two different callbacks because the contracts are different — `list_payments`
+  # is "money this beneficiary received" and must never carry a quarantined row
+  # — but an operator asking "what happened to my user's payment" needs both,
+  # and a status surface that shows only the settled half is how a held payment
+  # becomes invisible.
+  #
+  # Either leg erroring refuses the WHOLE reply: "no held rows" and "I could not
+  # read held rows" are different sentences, and only one of them is true.
   defp handle_action("payment_status", %{"beneficiary" => ben}, state, _from)
        when is_binary(ben) do
-    case list_payments_lookup(state.store_mod, ben) do
+    with {:ok, rows, durable?} <- status_settled_rows(state, ben),
+         {:ok, held_rows, held_durable?} <- status_held_rows(state, ben) do
+      payments =
+        Enum.map(rows, &(Map.take(&1, [:amount_usd, :method, :ref, :at]) |> stringify()))
+
+      binding = Map.get(state.bindings, ben)
+
+      {:reply,
+       Jason.encode!(%{
+         action: "payment_status",
+         ok: true,
+         beneficiary: ben,
+         address: binding && binding.address,
+         payments: payments,
+         durable: durable?,
+         held: Enum.map(held_rows, &held_row_view/1),
+         held_durable: held_durable?
+       }), state}
+    else
       {:error, _why} ->
-        {:reply, Jason.encode!(%{ok: false, error: "store_unavailable"}), state}
-
-      lookup ->
-        {rows, durable?} =
-          case lookup do
-            {:ok, rows} -> {rows, true}
-            :no_store -> {[], false}
-          end
-
-        payments =
-          Enum.map(rows, &(Map.take(&1, [:amount_usd, :method, :ref, :at]) |> stringify()))
-
-        binding = Map.get(state.bindings, ben)
-
         {:reply,
-         Jason.encode!(%{
-           ok: true,
-           beneficiary: ben,
-           address: binding && binding.address,
-           payments: payments,
-           durable: durable?
-         }), state}
+         Jason.encode!(%{action: "payment_status", ok: false, error: "store_unavailable"}), state}
+    end
+  end
+
+  # The operator's held-money queue for the whole namespace (`/payments held`),
+  # capped. Refuses rather than answering an empty queue it cannot see.
+  defp handle_action("quarantined", _msg, %{degraded_boot: true} = state, _from) do
+    {:reply, Jason.encode!(%{action: "quarantined", ok: false, error: "degraded_boot"}), state}
+  end
+
+  defp handle_action("quarantined", msg, state, _from) do
+    with {:ok, raw_limit} <- action_non_negative_integer(msg, "limit", 20) do
+      limit = clamp_integer(raw_limit, 1, @quarantined_action_limit)
+      beneficiary = optional_string(msg, "beneficiary")
+
+      case quarantined_lookup(state, beneficiary, limit) do
+        {:ok, rows} ->
+          render_reply(state, "quarantined", %{
+            action: "quarantined",
+            ok: true,
+            namespace: state.namespace,
+            beneficiary: beneficiary,
+            count: length(rows),
+            total_usd: Decimal.to_string(sum_amount(rows)),
+            held: Enum.map(rows, &held_row_view/1),
+            complete: length(rows) < limit
+          })
+
+        :no_store ->
+          read_refusal(state, "quarantined", "no_quarantine_store")
+
+        {:error, _why} ->
+          read_refusal(state, "quarantined", "store_unavailable")
+      end
+    else
+      {:error, :bad_request} -> read_refusal(state, "quarantined", "bad_request")
+    end
+  end
+
+  # ── D3: release ─────────────────────────────────────────────────────────────
+  #
+  # The ONE action that turns held money back into creditable money, and the
+  # only one in this package that changes a settled/quarantined decision after
+  # the fact. Three things it deliberately does NOT do:
+  #
+  #   * it does not credit. It flips the durable row and emits the SAME
+  #     `payment_confirmed` a normal settlement emits, so the consumer credits
+  #     through its own validating path (and dedups on its own key). There is
+  #     no bypass around that path anywhere in this repo, on purpose;
+  #   * it does not mint the sequence itself. The store mints it at RELEASE
+  #     time from the same monotone generator, which is what puts the row at
+  #     the HEAD of the outbox — above every consumer cursor, including one
+  #     that already advanced past the row's original position;
+  #   * it does not double-credit. A row that is already settled is an
+  #     idempotent success with no push: the outbox already carries it, and
+  #     the consumer's key dedup would refuse a second credit anyway.
+  defp handle_action("release_payment", _msg, %{degraded_boot: true} = state, _from) do
+    emit_metric(state, "payments_hold", %{stage: "degraded_boot", action: "release_payment"})
+
+    {:reply, Jason.encode!(%{action: "release_payment", ok: false, error: "degraded_boot"}),
+     state}
+  end
+
+  defp handle_action("release_payment", msg, state, _from) do
+    case optional_string(msg, "idempotency_key") do
+      nil ->
+        {:reply, Jason.encode!(%{action: "release_payment", ok: false, error: "bad_request"}),
+         state}
+
+      key ->
+        release_one(key, state)
+    end
+  end
+
+  # ── D4: sweep MEASUREMENT (never a sweep) ───────────────────────────────────
+  #
+  # "Measure the sweep, don't design it": how many derived addresses hold a
+  # balance and how much, so consolidation becomes a decision with a number
+  # attached. This hub is watch-only — it holds an xPUB, not an xprv — so
+  # there is nothing here that could move a coin even if it wanted to. The
+  # only chain traffic is `balanceOf` reads, bounded by `limit`.
+  defp handle_action("sweep_report", _msg, %{degraded_boot: true} = state, _from) do
+    {:reply, Jason.encode!(%{action: "sweep_report", ok: false, error: "degraded_boot"}), state}
+  end
+
+  defp handle_action("sweep_report", msg, state, _from) do
+    with {:ok, raw_limit} <- action_non_negative_integer(msg, "limit", 50),
+         {:ok, chain} <- sweep_chain(msg, state) do
+      limit = clamp_integer(raw_limit, 1, @sweep_address_limit)
+      render_reply(state, "sweep_report", sweep_report(chain, limit, state))
+    else
+      {:error, :bad_request} -> read_refusal(state, "sweep_report", "bad_request")
+      {:error, :chain_required} -> read_refusal(state, "sweep_report", "chain_required")
+      {:error, :unknown_chain} -> read_refusal(state, "sweep_report", "unknown_chain")
     end
   end
 
@@ -2309,39 +2525,505 @@ defmodule Genswarms.Payments do
         {:ok, binding, state}
 
       :error ->
-        index = state.next_index
+        allocate_binding(ben, state, @binding_index_attempts)
+    end
+  end
 
-        case HD.address(state.xpub, index) do
-          {:ok, address} ->
-            binding = %{index: index, address: address, namespace: state.namespace}
-            row = Map.put(binding, :beneficiary, ben)
+  # I2: `next_index` is an in-memory allocator over a SHARED durable table, so
+  # two orchestrators (any rolling restart) can hold the same value. Whoever
+  # loses the insert must step over the taken index — the previous code
+  # returned the error with `next_index` UNCHANGED, so the loser re-offered the
+  # same permanently-taken index to every subsequent new user and `/topup`
+  # stayed broken on that instance long after the restart finished. That is a
+  # livelock, not a race: nothing about it self-heals.
+  #
+  # So: on `:index_taken` advance and retry, bounded. Everything else keeps its
+  # old meaning — a store outage still fails closed (never hand out an address
+  # whose binding is not durable), and `:binding_conflict` (THIS beneficiary is
+  # already bound to a different address) is still refused outright, because a
+  # rebind would strand money already sent to the first address.
+  defp allocate_binding(ben, state, attempts_left) do
+    index = state.next_index
 
-            # Fail CLOSED: with a configured store erroring, never hand out an
-            # address whose binding isn't durable — the watcher would credit
-            # nobody for money sent to it.
-            case store_write(state.store_mod, :put_address_binding, [row]) do
-              :ok ->
-                {:ok, binding,
-                 %{state | bindings: Map.put(state.bindings, ben, binding), next_index: index + 1}}
+    case HD.address(state.xpub, index) do
+      {:ok, address} ->
+        binding = %{index: index, address: address, namespace: state.namespace}
+        row = Map.put(binding, :beneficiary, ben)
 
-              {:error, why} ->
-                Logger.error(
-                  "payments: binding persist failed (#{inspect(why)}) — refusing allocation"
-                )
+        case store_write(state.store_mod, :put_address_binding, [row]) do
+          :ok ->
+            {:ok, binding,
+             %{state | bindings: Map.put(state.bindings, ben, binding), next_index: index + 1}}
 
-                emit_metric(state, "payments_hold", %{
-                  stage: "address_binding",
-                  beneficiary: ben
-                })
+          {:error, :index_taken} when attempts_left > 1 ->
+            Logger.warning(
+              "payments: HD index #{index} is already taken by another allocator — advancing and retrying (#{attempts_left - 1} left)"
+            )
 
-                {:error, :store_unavailable, state}
-            end
+            emit_metric(state, "payments_binding_index_taken", %{
+              beneficiary: ben,
+              index: index
+            })
+
+            allocate_binding(ben, %{state | next_index: index + 1}, attempts_left - 1)
+
+          {:error, :index_taken} ->
+            Logger.error(
+              "payments: exhausted HD index retries at #{index} — every candidate was taken; refusing allocation"
+            )
+
+            emit_metric(state, "payments_hold", %{
+              stage: "address_binding",
+              beneficiary: ben,
+              reason: "index_retries_exhausted"
+            })
+
+            {:error, :store_unavailable, %{state | next_index: index + 1}}
 
           {:error, why} ->
-            {:error, why, state}
+            Logger.error(
+              "payments: binding persist failed (#{inspect(why)}) — refusing allocation"
+            )
+
+            emit_metric(state, "payments_hold", %{
+              stage: "address_binding",
+              beneficiary: ben
+            })
+
+            {:error, :store_unavailable, state}
+        end
+
+      {:error, why} ->
+        {:error, why, state}
+    end
+  end
+
+  # ── D3 operator surface: release + held queue ───────────────────────────────
+
+  defp status_settled_rows(state, ben) do
+    case list_payments_lookup(state.store_mod, ben) do
+      {:ok, rows} -> {:ok, rows, true}
+      :no_store -> {:ok, [], false}
+      {:error, why} -> {:error, why}
+    end
+  end
+
+  defp status_held_rows(state, ben) do
+    case quarantined_lookup(state, ben, @quarantined_status_limit) do
+      {:ok, rows} -> {:ok, rows, true}
+      :no_store -> {:ok, [], false}
+      {:error, why} -> {:error, why}
+    end
+  end
+
+  defp release_one(key, state) do
+    if exported?(state.store_mod, :release_quarantined_payment, 2) do
+      state.store_mod
+      |> store_result(:release_quarantined_payment, [state.namespace, key], {:error, :store_failed})
+      |> release_result(key, state)
+    else
+      Logger.error(
+        "payments: release_payment refused for #{inspect(key)} — the configured store exports no release_quarantined_payment/2; the row stays quarantined"
+      )
+
+      {:reply,
+       Jason.encode!(%{
+         action: "release_payment",
+         ok: false,
+         error: "no_release_store",
+         idempotency_key: key
+       }), state}
+    end
+  end
+
+  defp release_result({:ok, :released, row}, key, state) when is_map(row) do
+    released_settlement(key, row, state)
+  end
+
+  defp release_result({:ok, :already_settled, _row}, key, state) do
+    # Idempotent success. No push: the row already carries a sequence, so the
+    # outbox already offers it to every consumer, and a second credit would be
+    # refused by the consumer's own key dedup anyway.
+    Logger.info("payments: release_payment #{inspect(key)} — already settled, no-op")
+
+    {:reply,
+     Jason.encode!(%{
+       action: "release_payment",
+       ok: true,
+       released: false,
+       already: "settled",
+       idempotency_key: key
+     }), state}
+  end
+
+  defp release_result({:error, :not_found}, key, state) do
+    {:reply,
+     Jason.encode!(%{
+       action: "release_payment",
+       ok: false,
+       error: "unknown_key",
+       idempotency_key: key
+     }), state}
+  end
+
+  defp release_result({:error, {:not_releasable, status}}, key, state) do
+    {:reply,
+     Jason.encode!(%{
+       action: "release_payment",
+       ok: false,
+       error: "not_quarantined",
+       status: to_string(status),
+       idempotency_key: key
+     }), state}
+  end
+
+  defp release_result({:error, why}, key, state) do
+    Logger.error("payments: release_payment #{inspect(key)} failed: #{inspect(why)}")
+
+    emit_metric(state, "payments_release_failed", %{
+      idempotency_key: key,
+      reason: reason_text(why)
+    })
+
+    {:reply,
+     Jason.encode!(%{
+       action: "release_payment",
+       ok: false,
+       error: "store_unavailable",
+       idempotency_key: key
+     }), state}
+  end
+
+  defp release_result(_other, key, state) do
+    release_result({:error, :bad_store_return}, key, state)
+  end
+
+  # The released row is the store's word about money, so it is checked like
+  # every other store return before anything is delivered on the strength of
+  # it. The SEQUENCE is the one field that must be right: with it the poll
+  # credits the row whatever happens to this push, without it nothing ever
+  # will.
+  defp released_settlement(key, row, state) do
+    seq = outbox_seq(row)
+    status = to_string(row_get(row, :status))
+    namespace = row_get(row, :namespace)
+
+    cond do
+      not (is_integer(seq) and seq > 0) ->
+        Logger.error(
+          "payments: store released #{inspect(key)} without a fresh outbox sequence (#{inspect(seq)}) — a row with no sequence is invisible to every consumer; refusing to report a release"
+        )
+
+        emit_metric(state, "payments_release_defect", %{
+          idempotency_key: key,
+          reason: "no_outbox_seq"
+        })
+
+        {:reply,
+         Jason.encode!(%{
+           action: "release_payment",
+           ok: false,
+           error: "invalid_store_result",
+           idempotency_key: key
+         }), state}
+
+      status != "settled" ->
+        emit_metric(state, "payments_release_defect", %{
+          idempotency_key: key,
+          reason: "status_#{status}"
+        })
+
+        {:reply,
+         Jason.encode!(%{
+           action: "release_payment",
+           ok: false,
+           error: "invalid_store_result",
+           idempotency_key: key
+         }), state}
+
+      not namespace_match?(row, state.namespace) ->
+        # Scoping is the store's job (the callback takes the namespace); a row
+        # from elsewhere coming back means the store ignored it.
+        Logger.error(
+          "payments: store released #{inspect(key)} under namespace #{inspect(namespace)} while this hub is #{inspect(state.namespace)} — refusing to announce another namespace's money"
+        )
+
+        emit_metric(state, "payments_namespace_mismatch", %{
+          stage: "release",
+          idempotency_key: key,
+          binding_namespace: namespace,
+          hub_namespace: state.namespace
+        })
+
+        {:reply,
+         Jason.encode!(%{
+           action: "release_payment",
+           ok: false,
+           error: "namespace_mismatch",
+           idempotency_key: key
+         }), state}
+
+      true ->
+        emit_metric(state, "payments_released", %{
+          idempotency_key: key,
+          outbox_seq: seq,
+          beneficiary: row_get(row, :beneficiary),
+          amount_usd: money_text(row_get(row, :amount_usd))
+        })
+
+        Logger.warning(
+          "payments: RELEASED #{key} — #{money_text(row_get(row, :amount_usd))} USD for #{inspect(row_get(row, :beneficiary))} is creditable again at outbox_seq #{seq}"
+        )
+
+        pushed? = push_released_settlement(key, row, seq, state)
+
+        state = %{state | seen_keys: MapSet.put(state.seen_keys, key)}
+
+        {:reply,
+         Jason.encode!(%{
+           action: "release_payment",
+           ok: true,
+           released: true,
+           idempotency_key: key,
+           beneficiary: row_get(row, :beneficiary),
+           amount_usd: money_text(row_get(row, :amount_usd)),
+           outbox_seq: seq,
+           pushed: pushed?
+         }), state}
+    end
+  end
+
+  # The release announces itself with exactly the `payment_confirmed` a normal
+  # settlement announces — same fields, same one-shot best-effort cast, same
+  # consumer-side validation and dedup. A release-specific credit message would
+  # be a second, less-tested way to move money; there isn't one.
+  #
+  # An incomplete row cannot be announced (the consumer would refuse it as
+  # malformed), but it HAS been released: the poll picks it up from the outbox,
+  # which is the authoritative path anyway. Say that plainly instead of
+  # reporting a push that did not happen.
+  defp push_released_settlement(key, row, seq, state) do
+    beneficiary = row_get(row, :beneficiary)
+    method = row_get(row, :method)
+    ref = row_get(row, :ref)
+    amount = money_text(row_get(row, :amount_usd))
+
+    if is_binary(beneficiary) and beneficiary != "" and is_binary(method) and method != "" and
+         is_binary(ref) and ref != "" and amount != nil do
+      content =
+        Jason.encode!(%{
+          action: "payment_confirmed",
+          beneficiary: beneficiary,
+          amount_usd: amount,
+          method: method,
+          ref: ref,
+          namespace: to_string(row_get(row, :namespace)),
+          at: at_text(row_get(row, :at)) || DateTime.to_iso8601(state.now_fn.()),
+          outbox_seq: seq
+        })
+
+      Enum.each(state.targets, fn target ->
+        deliver_one(state, target, state.name, content, key, "payment_confirmed")
+      end)
+
+      true
+    else
+      Logger.error(
+        "payments: released row #{inspect(key)} is missing push fields (beneficiary/method/ref/amount) — it IS released (outbox_seq #{seq}) and the consumer's poll will credit it; no push sent"
+      )
+
+      emit_metric(state, "payments_release_defect", %{
+        idempotency_key: key,
+        reason: "incomplete_push_row"
+      })
+
+      false
+    end
+  end
+
+  defp quarantined_lookup(state, beneficiary, limit) do
+    if exported?(state.store_mod, :list_quarantined_payments, 3) do
+      case store_result(
+             state.store_mod,
+             :list_quarantined_payments,
+             [state.namespace, beneficiary, limit],
+             {:error, :store_failed}
+           ) do
+        {:ok, rows} when is_list(rows) -> {:ok, rows}
+        {:error, why} -> {:error, why}
+        _other -> {:error, :store_failed}
+      end
+    else
+      :no_store
+    end
+  end
+
+  defp held_row_view(row) do
+    %{
+      idempotency_key: row_get(row, :idempotency_key),
+      beneficiary: row_get(row, :beneficiary),
+      amount_usd: money_text(row_get(row, :amount_usd)),
+      method: row_get(row, :method),
+      ref: row_get(row, :ref),
+      reason: row_get(row, :quarantine_reason),
+      at: at_text(row_get(row, :at))
+    }
+  end
+
+  defp sum_amount(rows) do
+    Enum.reduce(rows, Decimal.new(0), fn row, acc ->
+      case row_get(row, :amount_usd) do
+        %Decimal{} = amount -> Decimal.add(acc, amount)
+        value when is_binary(value) -> Decimal.add(acc, parse_money(value))
+        _ -> acc
+      end
+    end)
+  end
+
+  defp parse_money(value) do
+    if Regex.match?(@money_pattern, value), do: Decimal.new(value), else: Decimal.new(0)
+  end
+
+  defp money_text(%Decimal{} = amount), do: Decimal.to_string(amount)
+  defp money_text(value) when is_binary(value), do: value
+  defp money_text(_), do: nil
+
+  defp at_text(%DateTime{} = at), do: DateTime.to_iso8601(at)
+  defp at_text(value) when is_binary(value), do: value
+  defp at_text(_), do: nil
+
+  defp optional_string(msg, key) do
+    case Map.get(msg, key) do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  # ── D4 sweep measurement ────────────────────────────────────────────────────
+
+  defp sweep_chain(msg, state) do
+    case optional_string(msg, "chain") do
+      nil ->
+        case state.chains do
+          [chain] -> {:ok, chain}
+          _ -> {:error, :chain_required}
+        end
+
+      name ->
+        case Enum.find(state.chains, &(to_string(Map.get(&1, :name)) == name)) do
+          nil -> {:error, :unknown_chain}
+          chain -> {:ok, chain}
         end
     end
   end
+
+  defp sweep_report(chain, limit, state) do
+    ordered = state.bindings |> Enum.sort_by(fn {_ben, binding} -> binding.index end)
+    total_bindings = length(ordered)
+    selected = Enum.take(ordered, limit)
+    decimals = Map.get(chain, :decimals, 6)
+    started_ms = System.monotonic_time(:millisecond)
+
+    {rows, unreadable} =
+      Enum.reduce(selected, {[], 0}, fn {beneficiary, binding}, {acc, unreadable} ->
+        case token_balance(chain, binding.address, decimals, state) do
+          {:ok, amount} ->
+            if Decimal.compare(amount, Decimal.new(0)) == :gt do
+              {[{beneficiary, binding, amount} | acc], unreadable}
+            else
+              {acc, unreadable}
+            end
+
+          {:error, why} ->
+            # NEVER counted as zero: an unreadable balance is an unknown, and
+            # a sweep decision made on a silently-zeroed unknown is exactly the
+            # wrong decision.
+            Logger.warning(
+              "payments: sweep balance unreadable for #{binding.address} on #{Map.get(chain, :name)}: #{inspect(why)}"
+            )
+
+            {acc, unreadable + 1}
+        end
+      end)
+
+    rows = Enum.sort_by(rows, fn {_ben, _binding, amount} -> Decimal.to_float(amount) end, :desc)
+    total = Enum.reduce(rows, Decimal.new(0), fn {_b, _bi, amount}, acc -> Decimal.add(acc, amount) end)
+
+    largest =
+      case rows do
+        [{_ben, binding, amount} | _] -> %{address: binding.address, balance_usd: Decimal.to_string(amount)}
+        [] -> nil
+      end
+
+    emit_metric(state, "payments_sweep_report", %{
+      chain: to_string(Map.get(chain, :name)),
+      addresses_checked: length(selected),
+      nonzero: length(rows),
+      unreadable: unreadable,
+      total_usd: Decimal.to_string(total)
+    })
+
+    %{
+      action: "sweep_report",
+      ok: true,
+      chain: to_string(Map.get(chain, :name)),
+      token_contract: Map.get(chain, :usdc_contract),
+      bindings_total: total_bindings,
+      addresses_checked: length(selected),
+      complete: length(selected) >= total_bindings,
+      unreadable: unreadable,
+      nonzero: length(rows),
+      total_usd: Decimal.to_string(total),
+      largest: largest,
+      addresses:
+        rows
+        |> Enum.take(@sweep_row_limit)
+        |> Enum.map(fn {beneficiary, binding, amount} ->
+          %{
+            beneficiary: beneficiary,
+            index: binding.index,
+            address: binding.address,
+            balance_usd: Decimal.to_string(amount)
+          }
+        end),
+      elapsed_ms: max(System.monotonic_time(:millisecond) - started_ms, 0)
+    }
+  end
+
+  # ERC-20 `balanceOf(address)` — selector 0x70a08231 + the 32-byte padded
+  # address. A read, and only ever a read: this object holds an xPUB, so it
+  # could not move a token if the report asked it to.
+  defp token_balance(chain, address, decimals, state) do
+    data = "0x70a08231" <> String.pad_leading(strip_hex_prefix(address), 64, "0")
+
+    try do
+      case state.rpc_fn.(chain, "eth_call", [
+             %{"to" => Map.get(chain, :usdc_contract), "data" => data},
+             "latest"
+           ]) do
+        {:ok, raw} ->
+          case normalize_integer(raw) do
+            value when is_integer(value) and value >= 0 ->
+              {:ok, Decimal.div(Decimal.new(value), Decimal.new(Integer.pow(10, decimals)))}
+
+            _ ->
+              {:error, {:bad_balance, safe_inspect(raw)}}
+          end
+
+        {:error, why} ->
+          {:error, why}
+
+        other ->
+          {:error, {:bad_rpc_return, safe_inspect(other)}}
+      end
+    catch
+      kind, reason -> {:error, {kind, safe_inspect(reason)}}
+    end
+  end
+
+  defp strip_hex_prefix("0x" <> hex), do: String.downcase(hex)
+  defp strip_hex_prefix("0X" <> hex), do: String.downcase(hex)
+  defp strip_hex_prefix(value) when is_binary(value), do: String.downcase(value)
 
   # ── store seam helpers ──────────────────────────────────────────────────────
   # Reads fall back to the default; writes fail closed only when a store IS

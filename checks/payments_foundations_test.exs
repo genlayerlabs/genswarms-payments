@@ -14,12 +14,17 @@ expected = [
   put_last_scanned_block: 2,
   list_payments: 1,
   list_settlements_since: 2,
-  issuance_totals_since: 3
+  issuance_totals_since: 3,
+  # D3 operator surface (phase 4): release is the ONLY writer that turns a
+  # quarantined row back into creditable money, and the quarantined read is the
+  # operator's held-money queue.
+  release_quarantined_payment: 2,
+  list_quarantined_payments: 3
 ]
 
 Check.check(
   f,
-  "Store behaviour declares all 10 callbacks",
+  "Store behaviour declares all 12 callbacks",
   Enum.all?(expected, &(&1 in callbacks))
 )
 

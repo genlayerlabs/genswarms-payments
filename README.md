@@ -17,6 +17,14 @@ Every capability is fail-closed, gated by two allowlists:
   `deposit_address`, `payment_status`, `settlements_since`, `reconcile`,
   `tick`, or `ingest_event` message gets silent `{:noreply, _}` (only
   `health` is unauthenticated). Empty `trusted_sources` means nobody can act.
+- **`operator_sources`** — who may take a VALUE-AFFECTING or operator-scope
+  action: `release_payment` (turning quarantined money back into creditable
+  money), `quarantined` (the held-money queue) and `sweep_report` (every
+  beneficiary's address and balance). Deliberately NOT `trusted_sources`, and
+  it defaults to `[]`: the cron that ticks the watcher and the consumer that
+  reads the outbox are trusted, and neither has any business releasing money.
+  Both gates apply — an operator source that is not also trusted can never
+  act, and is warned about at boot.
 - **`targets`** — who may receive `payment_confirmed`. Empty `targets` means
   nobody is ever credited, even though settlement still records durably.
   The `settlements_since` action additionally requires its authenticated
@@ -38,6 +46,7 @@ push method ships yet; `ingest_event` currently always replies
   xpub: System.fetch_env!("PAYMENTS_XPUB"),   # required — watch-only, see Custody below
   allow_test_xpub: false,             # explicit opt-out for a publicly known test xpub (default false)
   trusted_sources: ["telegram_ingress", "cron"],  # required for anything to work (default [])
+  operator_sources: ["commands"],     # SEPARATE allowlist for value-affecting actions (default [] = nobody)
   targets: ["downstream_object"],     # required for anyone to get credited (default [])
   allow_ephemeral: false,             # explicit dev-only opt-out when targets are non-empty (default false)
   namespace: "default",               # stamped on bindings/deliveries; caller-defined meaning (default "default")
@@ -249,6 +258,44 @@ interval; this package owns the settlement/watch logic, not the clock.
 - `{"action": "ingest_event", ...}` — trusted only; reserved for future push
   methods, currently always refuses.
 
+### Operator actions (`operator_sources`)
+
+- `{"action": "release_payment", "idempotency_key": "..."}` — the ONLY thing
+  that turns a quarantined row back into creditable money. The store flips
+  `status` to `"settled"` and mints a FRESH `outbox_seq` at release time in one
+  atomic statement, so the row lands at the HEAD of the outbox — above every
+  consumer cursor, including one that already advanced past the position the
+  row would have had when it was recorded. It then emits exactly the
+  `payment_confirmed` a normal settlement emits, so the consumer credits
+  through its own validating, deduping path; there is no release-specific
+  credit message anywhere. Idempotent: an already-settled row answers
+  `{"ok": true, "released": false, "already": "settled"}` with no second
+  sequence and no second push. Distinct refusals: `unknown_key`,
+  `not_quarantined` (plus the row's `status`), `namespace_mismatch`,
+  `no_release_store` (the store exports no `release_quarantined_payment/2`),
+  `degraded_boot`, `store_unavailable`, `bad_request`.
+- `{"action": "quarantined", "beneficiary": "...", "limit": M}` — the
+  operator's held-money queue for this namespace, newest first;
+  `beneficiary` is optional, `limit` defaults to 20 and clamps to 1..100.
+  Reports `count`, `total_usd` and the rows (key, beneficiary, amount, method,
+  ref, quarantine reason, `at`). Refuses with `no_quarantine_store` rather
+  than reporting an empty queue it cannot see.
+- `{"action": "sweep_report", "chain": "...", "limit": M}` — D4 measurement:
+  how many derived addresses hold a balance and how much. One ERC-20
+  `balanceOf` (`eth_call`, selector `0x70a08231`) per address against the
+  chain's configured token, bounded by `limit` (default 50, clamps to 1..200,
+  addresses walked in HD-index order). Reports `nonzero`, `total_usd`,
+  `largest`, up to 50 non-zero rows, `unreadable` and `complete`. It NEVER
+  moves funds — this object holds an xPUB, not an xprv — and an unreadable
+  balance is reported as `unreadable`, never folded into zero. With several
+  chains configured and no `chain` argument it refuses (`chain_required`)
+  rather than guessing which token to measure.
+
+`payment_status` also gains a held view: alongside `payments` (settled money
+only) it returns `held` (this beneficiary's quarantined rows, capped at 20) and
+`held_durable`. Either leg failing refuses the whole answer — "no held rows"
+and "I could not read held rows" are different sentences.
+
 The primary single-BEAM consumer seam is synchronous and does not depend on
 object routing:
 
@@ -302,7 +349,7 @@ refuses unless the hub explicitly booted in ephemeral mode.
 
 | Callback | Purpose |
 |---|---|
-| `put_address_binding/1` | persist `%{beneficiary, index, address, namespace}` |
+| `put_address_binding/1` | persist `%{beneficiary, index, address, namespace}`; `{:error, :index_taken}` when another beneficiary owns that index/address (the hub advances and retries), `{:error, :binding_conflict}` when THIS beneficiary is already bound to a different one (never retried, never rebound) |
 | `get_address_binding/1` | fetch a binding by beneficiary |
 | `list_address_bindings/0` | boot: rebuild the watched set + next index |
 | `payment_seen?/1` | settlement dedup by idempotency key — must be durable in prod |
@@ -312,6 +359,8 @@ refuses unless the hub explicitly booted in ephemeral mode.
 | `put_last_scanned_block/2` | advance a chain's scan cursor |
 | `list_payments/1` | settled payments for a beneficiary, newest first |
 | `list_settlements_since/2` | ascending sequenced outbox page plus whole-table `max_seq` |
+| `release_quarantined_payment/2` | operator release: ONE atomic namespace-scoped flip to `"settled"` with a FRESH release-time `outbox_seq`; `{:ok, :released, row}` / `{:ok, :already_settled, row}` / `{:error, :not_found}` / `{:error, {:not_releasable, status}}` |
+| `list_quarantined_payments/3` | the operator's held-money queue: quarantined rows for a namespace (optionally one beneficiary), newest first, capped |
 
 Unlike budget *reads* in sibling packages, settlement **writes** fail closed:
 if a configured store errors on the dedup read or the record write, the
@@ -339,7 +388,9 @@ write settlements but never check `payment_seen?` (or vice versa) always
 looks unseen and double-credits. Implement all of a group's callbacks or
 none of them. `list_payments/1`, `list_settlements_since/2`, and
 `get_address_binding/1` are independent read callbacks, not part of either
-group.
+group, as are the two operator callbacks — a store without them makes the
+operator actions refuse distinctly (`no_release_store`, `no_quarantine_store`)
+rather than answer an empty or fabricated success.
 
 ## Settlement fail-closed rule and the cursor invariant
 
