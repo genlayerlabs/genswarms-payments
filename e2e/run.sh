@@ -23,6 +23,15 @@ fi
 LLM_PROXY_PATH="$proxy_path"
 export LLM_PROXY_PATH
 
+# Build OUTSIDE the package tree. The host pins this package by hashing its
+# directory, and _build/ is gitignored — so compiling in-tree silently changed
+# the attested digest while `git status` stayed clean, arming a boot crash-loop
+# in any consumer that had already pinned us. A test run must not be able to do
+# that. deps/ is left in-tree (it is part of the source contract, and deps.get
+# is idempotent).
+MIX_BUILD_PATH="${MIX_BUILD_PATH:-$(mktemp -d /tmp/payments-e2e-build.XXXXXX)/build}"
+export MIX_BUILD_PATH
+
 mix deps.get >/dev/null
 
 fail=0
