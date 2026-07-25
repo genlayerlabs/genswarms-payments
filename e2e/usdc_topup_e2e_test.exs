@@ -453,7 +453,7 @@ end
 balance = fn -> Proxy.credit_balance(proxy.state_pid, E2E.ProxyStore, beneficiary) end
 
 poll_outbox = fn after_seq ->
-  {:ok, %{settlements: rows, max_seq: max_seq}} =
+  {:ok, %{settlements: rows, next_seq: next_seq, max_seq: max_seq}} =
     Payments.settlements_since(
       %{store_mod: E2E.HubStore, namespace: "llm_quota"},
       after_seq,
@@ -477,7 +477,6 @@ poll_outbox = fn after_seq ->
       Jason.decode!(json)
     end)
 
-  next_seq = Enum.reduce(rows, after_seq, &max(&1.outbox_seq, &2))
   %{rows: rows, replies: replies, next_seq: next_seq, max_seq: max_seq}
 end
 

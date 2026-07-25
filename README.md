@@ -102,17 +102,21 @@ interval; this package owns the settlement/watch logic, not the clock.
   indistinguishable from "no payments" — see Reconciliation below).
 - `{"action": "settlements_since", "after_seq": N, "limit": M}` — trusted
   target only. `after_seq` defaults to 0; `limit` defaults to 100 and clamps
-  to 1..500. Returns namespace-filtered, ascending outbox rows with
-  `action: "settlements_since"`, `next_seq`, whole-table `max_seq`, and
+  to 1..500. Present values must be non-negative integers or the action
+  refuses with `bad_request`. Returns namespace-filtered, ascending outbox rows
+  with `action: "settlements_since"`, `next_seq`, whole-table `max_seq`, and
   `complete`; the action key keeps a routed response visible to a consumer's
   dispatcher. It refuses distinctly on degraded boot, store failure, or a
   non-ephemeral store without the outbox callback. Explicit ephemeral mode
   reads the in-memory settlement mirror.
 - `{"action": "reconcile", "limit": M}` — trusted only; defaults to 50 and
-  clamps to 1..200. Re-fetches recent full-fact rows through each chain's
+  clamps to 1..200; a present non-integer or negative limit is `bad_request`.
+  Re-fetches recent full-fact rows through each chain's
   independent `reconcile_rpc_url`, reporting checked rows, drift keys,
-  unverifiable rows, and legacy rows. Detection alarms only; it never
-  reverses a credit.
+  unverifiable rows, legacy rows, incomplete 0.2.0-era rows, and `elapsed_ms`.
+  A run makes at most `limit` sequential receipt RPCs; the default RPC seam's
+  existing 20-second curl timeout bounds endpoint delay to at most
+  `limit × 20s`. Detection alarms only; it never reverses a credit.
 - `{"action": "ingest_event", ...}` — trusted only; reserved for future push
   methods, currently always refuses.
 
@@ -129,7 +133,10 @@ Genswarms.Payments.settlements_since(
 
 It returns the store error unchanged, returns `:no_outbox_store` when the
 optional callback is absent, and never converts a failed read into an empty
-success.
+success. Its `next_seq` is the highest sequence in the unfiltered store page
+(`after_seq` for an empty page), and `complete` says whether that raw page was
+last. Consumers must advance by `next_seq`, not by the filtered rows, so a page
+containing only another namespace cannot stall polling.
 
 ## Degraded boot
 
@@ -254,20 +261,22 @@ durable and readable.
 ## Reconciliation and metrics
 
 The chain reconciliation action reads the most recent namespace rows, treats
-pre-0.2.0 rows without the complete chain-fact set as `legacy`, and uses the
-configured chain's optional `reconcile_rpc_url` as a second endpoint. It
-fetches `eth_getTransactionReceipt`, locates the stored log index, and
-compares raw amount, token contract, bound destination address, block number,
-log index, and transaction hash. Missing independent endpoints and RPC
-failures are counted as unverifiable; mismatches are logged and returned as
-drift. No result automatically changes credited money.
+pre-0.2.0 rows without the complete chain-fact set as `legacy`, and counts a
+0.2.0-era row carrying `chain_id` but missing another required fact as
+`incomplete`. It uses the configured chain's optional `reconcile_rpc_url` as a
+second endpoint, fetches `eth_getTransactionReceipt`, locates the stored log
+index, and compares raw amount, token contract, stored sender address, bound
+destination address, block number, log index, and transaction hash. Missing
+independent endpoints and RPC failures are counted as unverifiable; mismatches
+and incomplete rows are logged and metered. No result automatically changes
+credited money.
 
 `metrics_fn` receives `payments_settled`, `payments_hold`,
 `payments_push_failed`, `payments_read_refused`,
-`payments_reconcile_drift`, and `payments_reconcile_unverifiable`. Every
-invocation is isolated with `try/catch`; telemetry failure cannot affect
-settlement or another money path. The default implementation logs through
-`Logger`.
+`payments_reconcile_drift`, `payments_reconcile_incomplete`, and
+`payments_reconcile_unverifiable`. Every invocation is isolated with
+`try/catch`; telemetry failure cannot affect settlement or another money path.
+The default implementation logs through `Logger`.
 
 ## In-tree USDC watcher
 

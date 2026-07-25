@@ -274,7 +274,9 @@ defmodule Genswarms.Payments do
 
   The store callback is optional. A missing callback returns
   `{:error, :no_outbox_store}`; store errors are returned unchanged. Rows are
-  filtered to the configured namespace after the store read.
+  filtered to the configured namespace after the store read, while `next_seq`
+  and `complete` describe the unfiltered store page so a foreign-namespace-only
+  page still advances the consumer.
   """
   def settlements_since(
         %{store_mod: store_mod, namespace: namespace} = config,
@@ -291,10 +293,14 @@ defmodule Genswarms.Payments do
 
     case result do
       {:ok, %{settlements: rows, max_seq: max_seq}} ->
+        next_seq = highest_seq(rows, after_seq)
+
         {:ok,
          %{
            settlements: Enum.filter(rows, &namespace_match?(&1, namespace)),
-           max_seq: max_seq
+           max_seq: max_seq,
+           next_seq: next_seq,
+           complete: rows == [] or length(rows) < limit or next_seq >= max_seq
          }}
 
       {:error, why} = error ->
@@ -717,48 +723,70 @@ defmodule Genswarms.Payments do
         read_refusal(state, "settlements_since", "degraded_boot")
 
       true ->
-        after_seq = non_negative_integer(Map.get(msg, "after_seq"), 0)
-        limit = clamped_integer(Map.get(msg, "limit"), 100, 1, 500)
+        with {:ok, after_seq} <- action_non_negative_integer(msg, "after_seq", 0),
+             {:ok, raw_limit} <- action_non_negative_integer(msg, "limit", 100) do
+          limit = clamp_integer(raw_limit, 1, 500)
 
-        case state_outbox_page(state, after_seq, limit) do
-          {:ok, %{settlements: rows, next_seq: next_seq, max_seq: max_seq, complete: complete}} ->
-            {:reply,
-             Jason.encode!(%{
-               action: "settlements_since",
-               ok: true,
-               settlements: Enum.map(rows, &json_safe/1),
-               next_seq: next_seq,
-               max_seq: max_seq,
-               complete: complete
-             }), state}
+          case state_outbox_page(state, after_seq, limit) do
+            {:ok, %{settlements: rows, next_seq: next_seq, max_seq: max_seq, complete: complete}} ->
+              render_reply(state, "settlements_since", %{
+                action: "settlements_since",
+                ok: true,
+                settlements: Enum.map(rows, &json_safe/1),
+                next_seq: next_seq,
+                max_seq: max_seq,
+                complete: complete
+              })
 
-          {:error, :no_outbox_store} ->
-            read_refusal(state, "settlements_since", "no_outbox_store")
+            {:error, :no_outbox_store} ->
+              read_refusal(state, "settlements_since", "no_outbox_store")
 
-          {:error, _why} ->
-            read_refusal(state, "settlements_since", "store_unavailable")
+            {:error, :invalid_store_result} ->
+              read_refusal(state, "settlements_since", "invalid_store_result")
+
+            {:error, _why} ->
+              read_refusal(state, "settlements_since", "store_unavailable")
+          end
+        else
+          {:error, :bad_request} ->
+            read_refusal(state, "settlements_since", "bad_request")
         end
     end
   end
 
   defp handle_action("reconcile", msg, state, _from) do
-    limit = clamped_integer(Map.get(msg, "limit"), 50, 1, 200)
-
     cond do
       state.degraded_boot ->
         read_refusal(state, "reconcile", "degraded_boot")
 
       true ->
-        case recent_settlements(state, limit) do
-          {:ok, rows} ->
-            result = reconcile_rows(rows, state)
-            {:reply, Jason.encode!(Map.put(result, :ok, true)), state}
+        with {:ok, raw_limit} <- action_non_negative_integer(msg, "limit", 50) do
+          limit = clamp_integer(raw_limit, 1, 200)
+          started_ms = System.monotonic_time(:millisecond)
 
-          {:error, :no_outbox_store} ->
-            read_refusal(state, "reconcile", "no_outbox_store")
+          case recent_settlements(state, limit) do
+            {:ok, rows} ->
+              result = reconcile_rows(rows, state, limit)
+              elapsed_ms = max(System.monotonic_time(:millisecond) - started_ms, 0)
 
-          {:error, _why} ->
-            read_refusal(state, "reconcile", "store_unavailable")
+              render_reply(
+                state,
+                "reconcile",
+                result |> Map.put(:ok, true) |> Map.put(:elapsed_ms, elapsed_ms)
+              )
+
+            {:error, :no_outbox_store} ->
+              read_refusal(state, "reconcile", "no_outbox_store")
+
+            {:error, :invalid_store_result} ->
+              read_refusal(state, "reconcile", "invalid_store_result")
+
+            {:error, _why} ->
+              read_refusal(state, "reconcile", "store_unavailable")
+          end
+        else
+          {:error, :bad_request} ->
+            read_refusal(state, "reconcile", "bad_request")
         end
     end
   end
@@ -912,10 +940,14 @@ defmodule Genswarms.Payments do
       case apply(store_mod, :list_settlements_since, [after_seq, limit]) do
         {:ok, %{settlements: rows, max_seq: max_seq}}
         when is_list(rows) and is_integer(max_seq) and max_seq >= 0 ->
-          if Enum.all?(rows, &(is_integer(outbox_seq(&1)) and outbox_seq(&1) > after_seq)) do
+          if Enum.all?(
+               rows,
+               &(is_integer(outbox_seq(&1)) and outbox_seq(&1) > after_seq and
+                   outbox_seq(&1) <= max_seq)
+             ) do
             {:ok, %{settlements: rows, max_seq: max_seq}}
           else
-            {:error, :bad_store_return}
+            {:error, :invalid_store_result}
           end
 
         {:error, _why} = error ->
@@ -994,43 +1026,73 @@ defmodule Genswarms.Payments do
     end
   end
 
-  defp reconcile_rows(rows, state) do
-    Enum.reduce(rows, %{checked: 0, drift: [], unverifiable: 0, legacy: 0}, fn row, acc ->
-      key = row_get(row, :idempotency_key)
+  defp reconcile_rows(rows, state, rpc_limit) do
+    # Each complete row makes at most one receipt call. Taking the action's
+    # clamped limit here makes the wall-clock bound explicit even if a future
+    # read implementation accidentally returns too many rows. The production
+    # Rpc.call/3 seam retains its existing per-call curl timeout.
+    rows
+    |> Enum.take(rpc_limit)
+    |> Enum.reduce(
+      %{checked: 0, drift: [], unverifiable: 0, legacy: 0, incomplete: 0},
+      fn row, acc ->
+        key = row_get(row, :idempotency_key)
 
-      if full_chain_facts?(row) do
-        case reconcile_row(row, state) do
-          :ok ->
-            %{acc | checked: acc.checked + 1}
+        case chain_fact_status(row) do
+          :complete ->
+            case reconcile_row(row, state) do
+              :ok ->
+                %{acc | checked: acc.checked + 1}
 
-          {:drift, reasons} ->
-            emit_metric(state, "payments_reconcile_drift", %{
+              {:drift, reasons} ->
+                emit_metric(state, "payments_reconcile_drift", %{
+                  idempotency_key: key,
+                  reasons: reasons
+                })
+
+                Logger.error(
+                  "payments: reconciliation drift for #{inspect(key)}: #{Enum.join(reasons, ", ")}"
+                )
+
+                %{acc | checked: acc.checked + 1, drift: acc.drift ++ [key]}
+
+              {:unverifiable, reason} ->
+                emit_metric(state, "payments_reconcile_unverifiable", %{
+                  idempotency_key: key,
+                  reason: reason
+                })
+
+                Logger.error(
+                  "payments: reconciliation unverifiable for #{inspect(key)}: #{inspect(reason)}"
+                )
+
+                %{acc | unverifiable: acc.unverifiable + 1}
+            end
+
+          :incomplete ->
+            missing_facts = missing_chain_facts(row)
+
+            emit_metric(state, "payments_reconcile_incomplete", %{
               idempotency_key: key,
-              reasons: reasons
+              missing_facts: missing_facts
             })
 
-            Logger.error("payments: reconciliation drift for #{key}: #{Enum.join(reasons, ", ")}")
+            Logger.error(
+              "payments: incomplete 0.2.0 settlement #{inspect(key)}; missing #{inspect(missing_facts)}"
+            )
 
-            %{acc | checked: acc.checked + 1, drift: acc.drift ++ [key]}
+            %{acc | incomplete: acc.incomplete + 1}
 
-          {:unverifiable, reason} ->
+          :legacy ->
             emit_metric(state, "payments_reconcile_unverifiable", %{
               idempotency_key: key,
-              reason: reason
+              reason: "legacy_unverifiable"
             })
 
-            Logger.error("payments: reconciliation unverifiable for #{key}: #{inspect(reason)}")
-            %{acc | unverifiable: acc.unverifiable + 1}
+            %{acc | legacy: acc.legacy + 1}
         end
-      else
-        emit_metric(state, "payments_reconcile_unverifiable", %{
-          idempotency_key: key,
-          reason: "legacy_unverifiable"
-        })
-
-        %{acc | legacy: acc.legacy + 1}
       end
-    end)
+    )
   end
 
   @chain_fact_keys [
@@ -1045,12 +1107,18 @@ defmodule Genswarms.Payments do
     :from_address
   ]
 
-  defp full_chain_facts?(row) do
-    Enum.all?(@chain_fact_keys, fn key ->
-      value = row_get(row, key)
-      not is_nil(value) and value != ""
-    end)
+  defp chain_fact_status(row) do
+    cond do
+      missing_chain_facts(row) == [] -> :complete
+      present_fact?(row_get(row, :chain_id)) -> :incomplete
+      true -> :legacy
+    end
   end
+
+  defp missing_chain_facts(row),
+    do: Enum.reject(@chain_fact_keys, &present_fact?(row_get(row, &1)))
+
+  defp present_fact?(value), do: not is_nil(value) and value != ""
 
   defp reconcile_row(row, state) do
     case reconcile_chain(row, state.chains) do
@@ -1118,11 +1186,12 @@ defmodule Genswarms.Payments do
           binding -> row_get(binding, :address)
         end
 
-      comparisons = [
+      stored_comparisons = [
         {"raw_amount",
          normalize_integer(rpc_get(log, :data)) == normalize_integer(row_get(row, :raw_amount))},
         {"token_contract", same_hex?(rpc_get(log, :address), row_get(row, :token_contract))},
-        {"to_address", same_hex?(topic_address(rpc_get(log, :topics), 2), binding_address)},
+        {"from_address",
+         same_hex?(topic_address(rpc_get(log, :topics), 1), row_get(row, :from_address))},
         {"block_number",
          normalize_integer(rpc_get(log, :block_number)) ==
            normalize_integer(row_get(row, :block_number)) and
@@ -1134,8 +1203,21 @@ defmodule Genswarms.Payments do
            present_same_hex?(rpc_get(log, :transaction_hash), row_get(row, :tx_hash))}
       ]
 
-      reasons = for {name, false} <- comparisons, do: name
-      if reasons == [], do: :ok, else: {:drift, reasons}
+      stored_reasons = for {name, false} <- stored_comparisons, do: name
+
+      cond do
+        stored_reasons != [] ->
+          {:drift, stored_reasons}
+
+        is_nil(binding_address) ->
+          {:unverifiable, :binding_missing}
+
+        not same_hex?(topic_address(rpc_get(log, :topics), 2), binding_address) ->
+          {:drift, ["to_address"]}
+
+        true ->
+          :ok
+      end
     end
   end
 
@@ -1181,6 +1263,19 @@ defmodule Genswarms.Payments do
 
   # ── telemetry and wire normalization ────────────────────────────────────────
 
+  defp render_reply(state, action, payload) do
+    try do
+      {:reply, Jason.encode!(payload), state}
+    catch
+      kind, reason ->
+        Logger.error(
+          "payments: #{action} reply encoding failed (#{kind}: #{safe_inspect(reason)}); refusing"
+        )
+
+        read_refusal(state, action, "encode_failed")
+    end
+  end
+
   defp read_refusal(state, action, error) do
     emit_metric(state, "payments_read_refused", %{action: action, reason: error})
     {:reply, Jason.encode!(%{action: action, ok: false, error: error}), state}
@@ -1210,22 +1305,64 @@ defmodule Genswarms.Payments do
     Logger.info("payments metric #{event}: #{inspect(meta)}")
   end
 
-  defp json_safe(%Decimal{} = value), do: Decimal.to_string(value)
-  defp json_safe(%DateTime{} = value), do: DateTime.to_iso8601(value)
-  defp json_safe(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
-  defp json_safe(%Date{} = value), do: Date.to_iso8601(value)
-  defp json_safe(%Time{} = value), do: Time.to_iso8601(value)
-  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
-  defp json_safe(value) when is_map(value), do: Map.new(value, fn {k, v} -> {k, json_safe(v)} end)
-  defp json_safe(value), do: value
-
-  defp non_negative_integer(value, _default) when is_integer(value), do: max(value, 0)
-  defp non_negative_integer(_value, default), do: default
-
-  defp clamped_integer(value, default, minimum, maximum) do
-    value = if is_integer(value), do: value, else: default
-    value |> max(minimum) |> min(maximum)
+  defp json_safe(value) do
+    try do
+      json_safe_value(value)
+    catch
+      _kind, _reason -> safe_inspect(value)
+    end
   end
+
+  defp json_safe_value(%Decimal{} = value), do: Decimal.to_string(value)
+  defp json_safe_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp json_safe_value(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
+  defp json_safe_value(%Date{} = value), do: Date.to_iso8601(value)
+  defp json_safe_value(%Time{} = value), do: Time.to_iso8601(value)
+  defp json_safe_value(%_{} = value), do: safe_inspect(value)
+  defp json_safe_value(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+
+  defp json_safe_value(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {json_safe_key(key), json_safe(nested)} end)
+  end
+
+  defp json_safe_value(value)
+       when is_tuple(value) or is_pid(value) or is_function(value) or is_reference(value) or
+              is_port(value),
+       do: safe_inspect(value)
+
+  defp json_safe_value(value) do
+    case Jason.encode(value) do
+      {:ok, _json} -> value
+      {:error, _reason} -> safe_inspect(value)
+    end
+  end
+
+  defp json_safe_key(key) when is_atom(key), do: Atom.to_string(key)
+
+  defp json_safe_key(key) when is_binary(key) do
+    if String.valid?(key), do: key, else: safe_inspect(key)
+  end
+
+  defp json_safe_key(key), do: safe_inspect(key)
+
+  defp safe_inspect(value) do
+    try do
+      inspect(value)
+    catch
+      _kind, _reason -> "#Inspect.Error<unrenderable>"
+    end
+  end
+
+  defp action_non_negative_integer(msg, key, default) do
+    case Map.fetch(msg, key) do
+      :error -> {:ok, default}
+      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
+      {:ok, _invalid} -> {:error, :bad_request}
+    end
+  end
+
+  defp clamp_integer(value, minimum, maximum),
+    do: value |> max(minimum) |> min(maximum)
 
   defp row_get(nil, _key), do: nil
 

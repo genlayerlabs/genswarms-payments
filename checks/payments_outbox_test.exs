@@ -10,11 +10,13 @@ defmodule OutboxStore do
     :persistent_term.put({__MODULE__, :rows}, rows)
     :persistent_term.put({__MODULE__, :calls}, [])
     :persistent_term.put({__MODULE__, :error}, nil)
+    :persistent_term.put({__MODULE__, :max_seq}, nil)
   end
 
   def rows, do: :persistent_term.get({__MODULE__, :rows}, [])
   def calls, do: :persistent_term.get({__MODULE__, :calls}, [])
   def fail!(reason), do: :persistent_term.put({__MODULE__, :error}, reason)
+  def max_seq!(max_seq), do: :persistent_term.put({__MODULE__, :max_seq}, max_seq)
 
   def list_settlements_since(after_seq, limit) do
     :persistent_term.put({__MODULE__, :calls}, calls() ++ [{after_seq, limit}])
@@ -30,7 +32,11 @@ defmodule OutboxStore do
              |> Enum.filter(&(&1.outbox_seq > after_seq))
              |> Enum.sort_by(& &1.outbox_seq)
              |> Enum.take(limit),
-           max_seq: Enum.reduce(sequenced, 0, &max(&1.outbox_seq, &2))
+           max_seq:
+             :persistent_term.get(
+               {__MODULE__, :max_seq},
+               Enum.reduce(sequenced, 0, &max(&1.outbox_seq, &2))
+             ) || Enum.reduce(sequenced, 0, &max(&1.outbox_seq, &2))
          }}
 
       reason ->
@@ -95,7 +101,56 @@ Check.check(
     0,
     10
   ) ==
-    {:ok, %{settlements: [full_row, last_row], max_seq: 3}}
+    {:ok,
+     %{
+       settlements: [full_row, last_row],
+       max_seq: 3,
+       next_seq: 3,
+       complete: true
+     }}
+)
+
+foreign_rows =
+  for seq <- 1..5 do
+    %{
+      full_row
+      | idempotency_key: "8453:0xFOREIGN#{seq}:0",
+        namespace: "other",
+        outbox_seq: seq
+    }
+  end
+
+own_after_foreign = %{
+  full_row
+  | idempotency_key: "8453:0xOWN:0",
+    ref: "0xOWN:0",
+    tx_hash: "0xOWN",
+    outbox_seq: 6
+}
+
+OutboxStore.reset(foreign_rows ++ [own_after_foreign])
+
+{:ok, first_foreign_page} =
+  Payments.settlements_since(
+    %{store_mod: OutboxStore, namespace: "llm_quota"},
+    0,
+    3
+  )
+
+{:ok, second_foreign_page} =
+  Payments.settlements_since(
+    %{store_mod: OutboxStore, namespace: "llm_quota"},
+    first_foreign_page.next_seq,
+    3
+  )
+
+Check.check(
+  f,
+  "stateless consumer advances across a full foreign-namespace page and reaches its own row",
+  first_foreign_page.settlements == [] and first_foreign_page.next_seq == 3 and
+    first_foreign_page.complete == false and
+    second_foreign_page.settlements == [own_after_foreign] and
+    second_foreign_page.next_seq == 6 and second_foreign_page.complete == true
 )
 
 OutboxStore.fail!(:db_down)
@@ -187,6 +242,54 @@ Check.check(
     )
 )
 
+tuple_protocol_probe =
+  try do
+    Jason.encode!(%{poison: {:ok, :tuple}})
+    :unexpectedly_encoded
+  rescue
+    error in Protocol.UndefinedError -> {:protocol_undefined, error}
+  end
+
+poisoned_row =
+  Map.merge(full_row, %{
+    tuple_value: {:ok, :tuple},
+    struct_value: 1..3
+  })
+
+OutboxStore.reset([poisoned_row])
+
+poisoned_reply =
+  try do
+    {:reply, json, _} =
+      Payments.handle_message(
+        "consumer",
+        Jason.encode!(%{action: "settlements_since"}),
+        state
+      )
+
+    {:ok, Jason.decode!(json)}
+  rescue
+    error -> {:raised, error}
+  catch
+    kind, reason -> {kind, reason}
+  end
+
+Check.check(
+  f,
+  "tuple Protocol.UndefinedError probe is contained and tuple/struct row values render",
+  match?({:protocol_undefined, %Protocol.UndefinedError{}}, tuple_protocol_probe) and
+    match?(
+      {:ok,
+       %{
+         "ok" => true,
+         "settlements" => [
+           %{"tuple_value" => "{:ok, :tuple}", "struct_value" => "1..3"}
+         ]
+       }},
+      poisoned_reply
+    )
+)
+
 OutboxStore.reset([full_row])
 
 {:reply, _clamped_high, _} =
@@ -211,6 +314,65 @@ Check.check(
   f,
   "action defaults after_seq and clamps limit to [1, 500]",
   high_clamped? and Enum.any?(OutboxStore.calls(), &(&1 == {0, 1}))
+)
+
+OutboxStore.reset([full_row])
+
+invalid_param_replies =
+  [
+    %{after_seq: 1.0},
+    %{after_seq: "1"},
+    %{after_seq: -1},
+    %{limit: 1.0},
+    %{limit: "1"},
+    %{limit: -1}
+  ]
+  |> Enum.map(fn params ->
+    {:reply, json, _} =
+      Payments.handle_message(
+        "consumer",
+        Jason.encode!(Map.put(params, :action, "settlements_since")),
+        state
+      )
+
+    Jason.decode!(json)
+  end)
+
+Check.check(
+  f,
+  "non-integer and negative action cursors/limits refuse as bad_request",
+  Enum.all?(
+    invalid_param_replies,
+    &match?(%{"ok" => false, "error" => "bad_request"}, &1)
+  ) and OutboxStore.calls() == []
+)
+
+lying_row = %{full_row | outbox_seq: 10}
+OutboxStore.reset([lying_row])
+OutboxStore.max_seq!(3)
+
+invalid_stateless =
+  Payments.settlements_since(
+    %{store_mod: OutboxStore, namespace: "llm_quota"},
+    0,
+    10
+  )
+
+{:reply, invalid_action_json, _} =
+  Payments.handle_message(
+    "consumer",
+    Jason.encode!(%{action: "settlements_since"}),
+    state
+  )
+
+Check.check(
+  f,
+  "rows above max_seq are invalid_store_result in stateless and action reads",
+  invalid_stateless == {:error, :invalid_store_result} and
+    match?(
+      %{"ok" => false, "error" => "invalid_store_result"},
+      Jason.decode!(invalid_action_json)
+    )
 )
 
 {:reply, degraded_json, _} =

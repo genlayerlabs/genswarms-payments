@@ -5,10 +5,12 @@
 - Added the optional `Store.list_settlements_since/2` transactional-outbox
   read contract, the synchronous `Genswarms.Payments.settlements_since/3`
   host seam, and the trusted-target message action. Reads are namespace
-  filtered, carry whole-table `max_seq`, clamp action limits to 1..500, and
-  refuse distinctly rather than masking degraded/store/missing-callback
-  failures as empty success. Explicit ephemeral hubs can serve the same
-  action from their sequenced settlement mirror.
+  filtered, carry whole-table `max_seq`, and expose an unfiltered-page
+  `next_seq`/`complete` cursor so foreign namespaces cannot stall consumers.
+  Action limits clamp to 1..500, malformed params and inconsistent store
+  sequence bounds refuse distinctly, and poisoned row values cannot crash
+  reply encoding. Explicit ephemeral hubs can serve the same action from
+  their sequenced settlement mirror.
 - Removed the in-memory `undelivered` queue and tick-time redelivery
   machinery. `payment_confirmed` is now a one-shot best-effort latency path:
   target failures are isolated, logged, and metered, while the durable
@@ -16,13 +18,15 @@
 - Added the trusted `reconcile` action and optional per-chain
   `reconcile_rpc_url`, validated and called through the same scrubbed,
   tempfile-hardened RPC path as the primary endpoint. Recent full-fact rows
-  are checked against independent receipts/logs; drift, unverifiable chains,
-  and legacy pre-0.2.0 rows are reported without automatically reversing
-  credits.
+  are checked against independent receipts/logs, including the stored sender
+  address. Drift, unverifiable chains, legacy pre-0.2.0 rows, and incomplete
+  0.2.0-era rows are reported without automatically reversing credits.
+  Reconcile caps receipt RPC calls to the action limit and reports elapsed
+  milliseconds.
 - Added the isolated `metrics_fn` seam (default `Logger`) for settlements,
-  fail-closed holds, failed pushes, refused reads, reconciliation drift, and
-  unverifiable reconciliation. Raising/exiting telemetry cannot affect a
-  settlement or other money path.
+  fail-closed holds, failed pushes, refused reads, reconciliation drift,
+  incomplete rows, and unverifiable reconciliation. Raising/exiting telemetry
+  cannot affect a settlement or other money path.
 - Updated the cross-package e2e lost-ack and proxy-store-outage scenarios:
   both now recover by reading `settlements_since` and applying the returned
   row through the proxy's real validating ingress, rather than relying on
