@@ -119,6 +119,47 @@
   instead of crash-looping it. `init!/1` retains the raising contract for
   tests and embedders.
 
+### Hardening (adversarial review of the caps/quarantine phase)
+
+- The durable outbox READ now enforces creditability itself: any row a store
+  returns whose `status` is present and is not `"settled"` is dropped from
+  `settlements_since` (message action, host seam, and reconciliation alike),
+  logged, and metered as `payments_outbox_poisoned_row` with the idempotency
+  key. Previously the hub only refused to PUBLISH such a row at record time —
+  a store that had already persisted a sequence on a quarantined row would
+  have served it to the consumer on every subsequent page. Paging bookkeeping
+  (`next_seq`, `max_seq`, `complete`, and the internal scan cursor) is still
+  computed over the raw store page, so a dropped row can neither end a page
+  early nor hide the rows behind it. Status-less pre-0.2.0 rows keep flowing.
+- The known-test-xpub denylist now matches the decoded 33-byte compressed
+  public key rather than only the published base58 string. Re-serializing the
+  denylisted key under a different chain code produced a different string that
+  used to boot without an opt-out, while its child private keys stay derivable
+  from the same publicly known parent. The string list remains the source of
+  truth and is decoded at `init/1`.
+- `settle/2` now HOLDS a non-positive `amount_usd` as `invalid_amount`
+  instead of settling it. A negative Decimal cleared both caps (never `:gt`)
+  and, once recorded `"settled"`, subtracted from the trailing-window totals,
+  widening the window for a later over-credit.
+- `deposit_address` now refuses a beneficiary whose binding was loaded under a
+  foreign namespace with `{"ok": false, "error": "namespace_mismatch"}` and a
+  `payments_namespace_mismatch` alarm (`stage: "deposit_address"`). It used to
+  re-serve the address while every settlement to it would be held — and the
+  hold freezes that chain's cursor.
+- The first-tick decimals check now distinguishes "the endpoint answered
+  nothing readable" (`decimals_unverifiable`, with the method and the raw
+  answer) from "the token reports another number" (`decimals_mismatch`, now
+  also carrying `observed_decimals`). Both still hold the chain.
+- A reconcile row whose own `block_number` cannot be parsed now emits
+  `payments_reconcile_finality_unverifiable` (reason
+  `block_number_unparseable`) instead of only incrementing the reply counter.
+- A chain configured `finality: {:confirmations, n}` with no
+  `reconcile_rpc_url` no longer emits the per-run
+  `payments_reconcile_finality_unverifiable` alarm: it opted out of the
+  finality leg rather than failing it. The reply still counts those rows as
+  `finality_unverifiable` — they are never called finalized — and chains that
+  were actually asked and could not answer keep alarming.
+
 ## 0.1.1 — 2026-07-24
 
 - FIX (engine contract): `init/1` now returns `{:ok, state}` as

@@ -105,7 +105,12 @@ A quarantined settlement is:
 - **deduped** exactly like a settled one (`payment_seen?` answers true), so a
   re-presented log neither re-alarms nor re-notifies;
 - **never delivered as `payment_confirmed` and never visible to
-  `settlements_since`** — the sequence marks *creditable*, not *recorded*;
+  `settlements_since`** — the sequence marks *creditable*, not *recorded*.
+  Both ends are defended: the hub refuses to publish a quarantined row, and
+  the outbox read drops any row a store returns whose `status` is present and
+  is not `"settled"` (alarmed as `payments_outbox_poisoned_row`; paging is
+  computed over the raw store page, so the drop cannot hide the rows behind
+  it). Status-less pre-0.2.0 rows keep flowing;
 - **alarmed** through `metrics_fn` as `payments_quarantined` with the
   idempotency key, beneficiary, amount, and reason (`max_payment` |
   `aggregate`);
@@ -143,19 +148,26 @@ Crediting is never gated on finality: putting a quarter-hour wall in front of
 re-checks recent settled rows against the `finalized` head and reports
 `unfinalized` counts (informational — it never reverses a credit), while a
 reorged-out row shows up on the existing receipt leg as drift. A null, absent,
-or unparseable answer to the `finalized` tag is reported as
-`finality_unverifiable` and alarmed; it is never treated as finalized. The
-head is fetched at most once per chain per reconcile run.
+or unparseable answer to the `finalized` tag — or a row whose own
+`block_number` cannot be parsed — is reported as `finality_unverifiable` and
+alarmed; it is never treated as finalized. The head is fetched at most once
+per chain per reconcile run. One exception to the alarm: a chain configured
+`finality: {:confirmations, n}` with no `reconcile_rpc_url` opted out of the
+finality leg rather than failing it, so it is still counted
+`finality_unverifiable` but does not alarm every run.
 
 ## Boot and first-tick gates
 
 - **Known test xpubs (D7).** A publicly known test xpub — the BIP32
   `abandon abandon … about` key at `m/44'/60'/0'` — is refused at `init/1`,
   because its private key is in every tutorial: watching it means crediting
-  deposits anyone can sweep. `allow_test_xpub: true` is the explicit opt-out
-  for a local testnet rig; a mainnet hub must never set it. The list is a
-  floor, not a guarantee — a leaked key of your own belongs in your own
-  refusal path.
+  deposits anyone can sweep. The gate matches the decoded 33-byte compressed
+  public key, not just the published base58 string, so re-serializing that key
+  under a different chain code does not slip past it (its children are still
+  derived from the same publicly known parent private key).
+  `allow_test_xpub: true` is the explicit opt-out for a local testnet rig; a
+  mainnet hub must never set it. The list is a floor, not a guarantee — a
+  leaked key of your own belongs in your own refusal path.
 - **Namespace coherence (D2).** Every binding loaded at boot whose
   `namespace` differs from the hub's is logged, metered
   (`payments_namespace_mismatch`), and kept in the watched set — but its
@@ -163,12 +175,18 @@ head is fetched at most once per chain per reconcile run.
   silently re-namespaced. Held means held: that chain's cursor does not
   advance past such a settlement and the alarm repeats every tick until an
   operator repairs the binding (or points the hub at the right namespace).
+  `deposit_address` refuses such a beneficiary with `namespace_mismatch` for
+  the same reason: handing the address back would invite a deposit that can
+  only ever be held.
 - **On-chain self-check (D4).** Before a chain is scanned for the first time,
   the endpoint must prove it is the configured chain: `eth_chainId` equal to
   `chain_id`, and — for a chain with a token contract — that contract's
   `decimals()` equal to the configured `decimals`. A mismatch, an RPC error, or
   an unparseable answer holds **that chain only** (no scanning, no settling)
-  with a `payments_chain_self_check_failed` alarm, and is retried next tick, so
+  with a `payments_chain_self_check_failed` alarm whose `reason` separates the
+  two repairs — `chain_id_mismatch` / `decimals_mismatch` (wrong config) from
+  `unverifiable` / `decimals_unverifiable` (the endpoint never answered
+  readably) — and is retried next tick, so
   a healed RPC recovers by itself. A pass is cached per chain. This runs at the
   first tick, not at boot, because an endpoint that is merely down at boot must
   not crash-loop the object.
@@ -188,6 +206,9 @@ interval; this package owns the settlement/watch logic, not the clock.
   below). No reply. A no-op while `degraded_boot` (see below).
 - `{"action": "deposit_address", "beneficiary": "..."}` — trusted only;
   returns the beneficiary's stable address, minting one on first ask.
+  Refused with `{"ok": false, "error": "namespace_mismatch"}` for a
+  beneficiary whose binding was loaded under a foreign namespace (its
+  settlements would be held — see D2 below).
   Refused with `{"ok": false, "error": "degraded_boot"}` while
   `degraded_boot` (distinct from `{"ok": false, "error": "store_unavailable"}`,
   which means boot was fine but *this* allocation's write just failed).
@@ -380,6 +401,7 @@ changes credited money.
 `payments_hold`, `payments_namespace_mismatch`,
 `payments_chain_self_check_failed`, `payments_store_version_skew`,
 `payments_push_failed`, `payments_read_refused`,
+`payments_outbox_poisoned_row`,
 `payments_reconcile_drift`, `payments_reconcile_incomplete`,
 `payments_reconcile_unverifiable`, `payments_reconcile_unfinalized`, and
 `payments_reconcile_finality_unverifiable`. Every invocation is isolated with

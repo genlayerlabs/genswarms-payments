@@ -179,6 +179,72 @@ Check.check(
     end)
 )
 
+Check.check(
+  f,
+  "the decimals mismatch reports what the token actually answered",
+  Enum.any?(Agent.get(events, & &1), fn {event, meta} ->
+    event == "payments_chain_self_check_failed" and meta.reason == "decimals_mismatch" and
+      meta.observed_decimals == 18
+  end)
+)
+
+# M4: "the endpoint said nothing readable" is the SAME hold but a completely
+# different repair from "the token says another number" — a proxy address
+# with no code answers `0x`, which is a broken endpoint, not a wrong config.
+SelfCheckStore.reset()
+Agent.update(events, fn _ -> [] end)
+Agent.update(log, fn _ -> [] end)
+
+empty_decimals =
+  endpoint.(%{
+    log: log,
+    chain_id: truthful_chain_id,
+    decimals: fn -> {:ok, "0x"} end,
+    logs: fn _params -> logs end
+  })
+
+state_empty_decimals = Payments.poll(%{state | rpc_fn: empty_decimals})
+
+Check.check(
+  f,
+  "M4: an unparseable decimals() answer holds the chain as decimals_unverifiable, NOT a mismatch",
+  not Enum.any?(Agent.get(log, & &1), fn {_chain, method} -> method == "eth_getLogs" end) and
+    SelfCheckStore.rows() == [] and MapSet.size(state_empty_decimals.chain_self_checks) == 0 and
+    Enum.any?(Agent.get(events, & &1), fn {event, meta} ->
+      event == "payments_chain_self_check_failed" and meta.reason == "decimals_unverifiable" and
+        meta.method == "eth_call" and meta.configured == 6 and
+        meta.token_contract == "0xCONTRACT"
+    end) and
+    not Enum.any?(Agent.get(events, & &1), fn {_event, meta} ->
+      Map.get(meta, :reason) == "decimals_mismatch"
+    end)
+)
+
+# A nil body (a node answering JSON-RPC null) takes the same label.
+SelfCheckStore.reset()
+Agent.update(events, fn _ -> [] end)
+
+nil_decimals =
+  endpoint.(%{
+    log: log,
+    chain_id: truthful_chain_id,
+    decimals: fn -> {:ok, nil} end,
+    logs: fn _params -> logs end
+  })
+
+_state_nil_decimals = Payments.poll(%{state | rpc_fn: nil_decimals})
+
+Check.check(
+  f,
+  "M4: a null decimals() answer is unverifiable too, never read as a mismatch",
+  Enum.any?(Agent.get(events, & &1), fn {event, meta} ->
+    event == "payments_chain_self_check_failed" and meta.reason == "decimals_unverifiable"
+  end) and
+    not Enum.any?(Agent.get(events, & &1), fn {_event, meta} ->
+      Map.get(meta, :reason) == "decimals_mismatch"
+    end)
+)
+
 # ── unverifiable ⇒ held, and a healed RPC recovers ──────────────────────────
 SelfCheckStore.reset()
 Agent.update(events, fn _ -> [] end)

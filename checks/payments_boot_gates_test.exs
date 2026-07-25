@@ -15,11 +15,16 @@ alias Genswarms.Payments
 test_xpub =
   "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt"
 
-# A structurally valid xpub that is NOT on the denylist, minted here by
-# re-chain-coding the denylisted one (same on-curve pubkey, different chain
-# code ⇒ a different extended key, different serialization, different
-# checksum). Minted rather than pasted so this check never has to assert the
-# provenance of some other published key.
+# Two structurally valid xpubs, both minted here so this check never has to
+# assert the provenance of some other published key:
+#
+#   * `other_xpub` re-chain-codes the DENYLISTED one — same on-curve pubkey,
+#     different chain code ⇒ different extended key, different serialization,
+#     different checksum, and yet every child private key under it is still
+#     f(the publicly known parent privkey, this chain code): just as sweepable.
+#     M1: the gate matches key material, so this must be refused too.
+#   * `unrelated_xpub` carries a DIFFERENT pubkey (derived from a private key
+#     minted here) — genuinely off the denylist, and must boot with no opt-out.
 base58_alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 base58_decode = fn string ->
@@ -46,6 +51,14 @@ payload = binary_part(raw, 0, byte_size(raw) - 4)
 <<header::binary-13, _chain_code::binary-32, pubkey::binary-33>> = payload
 
 other_xpub = base58check_encode.(header <> :binary.copy(<<7>>, 32) <> pubkey)
+
+unrelated_pubkey =
+  :binary.copy(<<0>>, 31)
+  |> Kernel.<>(<<7>>)
+  |> Curvy.Key.from_privkey()
+  |> Curvy.Key.to_pubkey(compressed: true)
+
+unrelated_xpub = base58check_encode.(header <> :binary.copy(<<7>>, 32) <> unrelated_pubkey)
 
 init = fn config ->
   try do
@@ -86,8 +99,22 @@ Check.check(
 
 Check.check(
   f,
-  "D7: an xpub outside the denylist needs no opt-out",
-  match?({:ok, %{}}, init.(%{xpub: other_xpub}))
+  "D7 (M1): a re-encoded serialization of the denylisted KEY MATERIAL is refused too",
+  match?({:raised, %ArgumentError{}}, init.(%{xpub: other_xpub})) and
+    other_xpub != test_xpub and
+    Exception.message(elem(init.(%{xpub: other_xpub}), 1)) =~ "publicly known test xpub"
+)
+
+Check.check(
+  f,
+  "D7 (M1): the same re-encoded key still boots under the explicit opt-out",
+  match?({:ok, %{}}, init.(%{xpub: other_xpub, allow_test_xpub: true}))
+)
+
+Check.check(
+  f,
+  "D7: an xpub carrying DIFFERENT key material needs no opt-out",
+  match?({:ok, %{}}, init.(%{xpub: unrelated_xpub}))
 )
 
 Check.check(
@@ -228,6 +255,55 @@ Check.check(
   f,
   "D2: a held settlement keeps its chain's cursor back (the key is not resolved)",
   not MapSet.member?(hub.seen_keys, "ns:foreign")
+)
+
+# M3: the read side of the same hold. Handing out the foreign binding's
+# address would invite a deposit that can only ever be HELD — and that hold
+# freezes the whole chain's cursor. Refuse the address, alarm with the same
+# metric, and keep serving every healthy beneficiary.
+Agent.update(boot_events, fn _ -> [] end)
+
+{:reply, foreign_address_json, hub} =
+  Payments.handle_message(
+    "ops",
+    Jason.encode!(%{action: "deposit_address", beneficiary: "budget:foreign"}),
+    hub
+  )
+
+Check.check(
+  f,
+  "M3: deposit_address for a foreign-namespace beneficiary is REFUSED, not re-served",
+  match?(
+    %{"ok" => false, "error" => "namespace_mismatch"},
+    Jason.decode!(foreign_address_json)
+  ) and
+    not Map.has_key?(Jason.decode!(foreign_address_json), "address")
+)
+
+Check.check(
+  f,
+  "M3: the refusal alarms with stage deposit_address and both namespaces",
+  Enum.any?(Agent.get(boot_events, & &1), fn {event, meta} ->
+    event == "payments_namespace_mismatch" and meta.stage == "deposit_address" and
+      meta.beneficiary == "budget:foreign" and meta.binding_namespace == "other_hub" and
+      meta.hub_namespace == "llm_quota"
+  end)
+)
+
+{:reply, home_address_json, hub} =
+  Payments.handle_message(
+    "ops",
+    Jason.encode!(%{action: "deposit_address", beneficiary: "budget:home"}),
+    hub
+  )
+
+Check.check(
+  f,
+  "M3: a same-namespace beneficiary still gets its address",
+  match?(
+    %{"ok" => true, "address" => "0xHOME", "namespace" => "llm_quota"},
+    Jason.decode!(home_address_json)
+  )
 )
 
 {settled_home, _hub} =

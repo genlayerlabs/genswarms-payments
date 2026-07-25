@@ -386,6 +386,144 @@ Check.check(
     end)
 )
 
+# I1: the record-time refusal above happens AFTER the defective store has
+# already persisted the row with a sequence. The durable outbox read is the
+# authoritative credit path, so it is the one that must not serve it — no
+# matter what the store answers. Belt (record) and braces (read).
+defmodule PoisonedOutboxStore do
+  @rows [
+    %{
+      idempotency_key: "poison:1",
+      status: "settled",
+      namespace: "llm_quota",
+      outbox_seq: 1,
+      beneficiary: "budget:q",
+      amount_usd: "1"
+    },
+    %{
+      idempotency_key: "poison:2",
+      status: "quarantined",
+      namespace: "llm_quota",
+      outbox_seq: 2,
+      beneficiary: "budget:q",
+      amount_usd: "100000"
+    },
+    %{
+      idempotency_key: "poison:3",
+      status: "settled",
+      namespace: "llm_quota",
+      outbox_seq: 3,
+      beneficiary: "budget:q",
+      amount_usd: "1"
+    },
+    # No `status` key at all: a pre-0.2.0 row. It must keep flowing.
+    %{
+      idempotency_key: "poison:4",
+      namespace: "llm_quota",
+      outbox_seq: 4,
+      beneficiary: "budget:q",
+      amount_usd: "1"
+    }
+  ]
+
+  def list_settlements_since(after_seq, limit) do
+    {:ok,
+     %{
+       settlements:
+         @rows |> Enum.filter(&(&1.outbox_seq > after_seq)) |> Enum.take(limit),
+       max_seq: 4
+     }}
+  end
+
+  def payment_seen?(_key), do: {:ok, false}
+  def record_payment(_row), do: :ok
+  def list_address_bindings, do: {:ok, []}
+  def put_address_binding(_binding), do: :ok
+  def get_last_scanned_block(_chain), do: {:ok, nil}
+  def put_last_scanned_block(_chain, _block), do: :ok
+end
+
+{:ok, deliveries8} = Agent.start_link(fn -> [] end)
+{:ok, events8} = Agent.start_link(fn -> [] end)
+
+poisoned_hub = new_hub.(%{store_mod: PoisonedOutboxStore}, deliveries8, events8)
+
+read_page = fn hub, after_seq, limit ->
+  {:reply, json, hub} =
+    Payments.handle_message(
+      "llm_proxy",
+      Jason.encode!(%{action: "settlements_since", after_seq: after_seq, limit: limit}),
+      hub
+    )
+
+  {Jason.decode!(json), hub}
+end
+
+{full_page, poisoned_hub} = read_page.(poisoned_hub, 0, 100)
+
+Check.check(
+  f,
+  "a durable store that persisted a sequence on a quarantined row NEVER serves it to the consumer",
+  full_page["ok"] == true and
+    Enum.map(full_page["settlements"], & &1["idempotency_key"]) ==
+      ["poison:1", "poison:3", "poison:4"]
+)
+
+Check.check(
+  f,
+  "the dropped row alarms per read so the store defect is visible, with its key",
+  Enum.any?(Agent.get(events8, & &1), fn {event, meta} ->
+    event == "payments_outbox_poisoned_row" and meta.idempotency_key == "poison:2" and
+      meta.status == "quarantined" and meta.outbox_seq == 2
+  end)
+)
+
+Check.check(
+  f,
+  "dropping the row does not distort the page's own sequence bookkeeping",
+  full_page["next_seq"] == 4 and full_page["max_seq"] == 4 and full_page["complete"] == true
+)
+
+# Paging is described by the RAW store page, so a poisoned row inside a FULL
+# page can neither end the page early nor hide the rows behind it.
+{first_page, poisoned_hub} = read_page.(poisoned_hub, 0, 2)
+{second_page, poisoned_hub} = read_page.(poisoned_hub, first_page["next_seq"], 2)
+
+Check.check(
+  f,
+  "pagination is unaffected: every creditable row is still delivered exactly once",
+  Enum.map(first_page["settlements"], & &1["idempotency_key"]) == ["poison:1", "poison:3"] and
+    first_page["next_seq"] == 3 and first_page["complete"] == false and
+    Enum.map(second_page["settlements"], & &1["idempotency_key"]) == ["poison:4"] and
+    second_page["next_seq"] == 4 and second_page["complete"] == true
+)
+
+# The synchronous host seam reads the same durable page — same refusal.
+{:ok, host_page} = Payments.settlements_since(poisoned_hub, 0, 100)
+
+Check.check(
+  f,
+  "the host seam settlements_since/3 drops the poisoned row too",
+  Enum.map(host_page.settlements, & &1.idempotency_key) ==
+    ["poison:1", "poison:3", "poison:4"] and
+    host_page.next_seq == 4 and host_page.complete == true
+)
+
+# Reconciliation reads the same seam; a quarantined row is not a settlement
+# to reconcile, and must not be reported as one.
+{:reply, poisoned_reconcile_json, _poisoned_hub} =
+  Payments.handle_message("ops", Jason.encode!(%{action: "reconcile", limit: 100}), poisoned_hub)
+
+poisoned_reconcile = Jason.decode!(poisoned_reconcile_json)
+
+Check.check(
+  f,
+  "reconcile never sees the poisoned row either (3 rows in, none of them it)",
+  poisoned_reconcile["ok"] == true and
+    poisoned_reconcile["legacy"] + poisoned_reconcile["incomplete"] +
+      poisoned_reconcile["checked"] == 3
+)
+
 # ── cursor semantics: quarantine is a decision, a hold is not ───────────────
 {:ok, deliveries7} = Agent.start_link(fn -> [] end)
 {:ok, events7} = Agent.start_link(fn -> [] end)
@@ -399,6 +537,62 @@ Check.check(
   f,
   "a quarantined settlement does not hold its chain: the key is durably resolved",
   MapSet.member?(cursor_hub.seen_keys, "cursor:1")
+)
+
+# ── M2: a non-positive amount is not a payment ──────────────────────────────
+# A negative Decimal clears both caps (never `:gt`) and, once recorded
+# "settled", SUBTRACTS from the trailing-window totals — widening the window
+# for a later over-credit. Zero is filtered by the in-tree watcher today; the
+# check pins that it stays out regardless of which producer appears next.
+{:ok, deliveries9} = Agent.start_link(fn -> [] end)
+{:ok, events9} = Agent.start_link(fn -> [] end)
+
+sign_hub =
+  new_hub.(
+    %{max_payment_usd: "100", max_issuance_per_window_usd: "50", small_topup_usd: "0"},
+    deliveries9,
+    events9
+  )
+
+{seeded_n, sign_hub} = Payments.settle([settlement.("sign:seed", "budget:x", "40")], sign_hub)
+{negative_n, sign_hub} = Payments.settle([settlement.("sign:neg", "budget:x", "-30")], sign_hub)
+{zero_n, sign_hub} = Payments.settle([settlement.("sign:zero", "budget:x", "0")], sign_hub)
+
+Check.check(
+  f,
+  "M2: a negative amount is HELD, never settled and never quarantined",
+  seeded_n == 1 and negative_n == 0 and
+    Enum.count(sign_hub.settlement_mirror, &(&1.idempotency_key == "sign:neg")) == 0 and
+    not MapSet.member?(sign_hub.seen_keys, "sign:neg")
+)
+
+Check.check(
+  f,
+  "M2: a zero amount is HELD too",
+  zero_n == 0 and
+    Enum.count(sign_hub.settlement_mirror, &(&1.idempotency_key == "sign:zero")) == 0
+)
+
+Check.check(
+  f,
+  "M2: both are metered as an invalid_amount hold at cap evaluation",
+  Enum.all?(["sign:neg", "sign:zero"], fn key ->
+    Enum.any?(Agent.get(events9, & &1), fn {event, meta} ->
+      event == "payments_hold" and meta.idempotency_key == key and
+        meta.stage == "cap_evaluation" and meta.reason == "invalid_amount"
+    end)
+  end)
+)
+
+# The window total must be unchanged by the rejected negative: 40 of the 50
+# cap is spent, so 11 is still over the cap.
+{after_negative_n, _sign_hub} =
+  Payments.settle([settlement.("sign:after", "budget:x", "11")], sign_hub)
+
+Check.check(
+  f,
+  "M2: a rejected negative amount does NOT shrink the trailing-window total",
+  after_negative_n == 0
 )
 
 # ── config validation for every new key ─────────────────────────────────────

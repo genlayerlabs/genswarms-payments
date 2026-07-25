@@ -31,7 +31,9 @@ defmodule Genswarms.Payments do
   `max_issuance_per_window_usd` inside the trailing `issuance_window_hours`
   window, it is recorded `quarantined` instead of settled: durable, deduped,
   alarmed, notified to targets as `payment_held`, and never creditable
-  (`outbox_seq` stays NULL, so the outbox read cannot see it). The aggregate
+  (`outbox_seq` stays NULL, AND the outbox read itself drops any row a store
+  returns whose status says it is not settled — the read is the path that
+  credits, so it defends itself). The aggregate
   cap carries a per-beneficiary `small_topup_usd` carve-out so one whale
   cannot deny everyone else's small top-ups for the rest of the window.
 
@@ -410,13 +412,47 @@ defmodule Genswarms.Payments do
     :ok
   end
 
+  # The denylist's source of truth is the published serialization, but the
+  # thing that is compromised is the KEY MATERIAL: every child private key
+  # under this xpub is f(the publicly known parent private key, the chain code
+  # carried in the clear inside the xpub). Re-serializing the same 33-byte
+  # compressed pubkey under a different chain code (or a different version
+  # prefix) yields a fresh-looking base58 string whose funds are just as
+  # sweepable, so match the decoded pubkey rather than the string. String
+  # comparison stays as the cheap first leg (it also catches a string whose
+  # decode we would reject anyway).
   defp validate_test_xpub!(xpub, allow_test_xpub?) do
-    if MapSet.member?(@known_test_xpubs, xpub) and allow_test_xpub? != true do
+    if allow_test_xpub? != true and known_test_key_material?(xpub) do
       raise ArgumentError,
-            "payments: refusing publicly known test xpub; set allow_test_xpub: true only for an explicit local test rig (never on mainnet)"
+            "payments: refusing publicly known test xpub (its key material is on the denylist even under a re-encoded serialization); set allow_test_xpub: true only for an explicit local test rig (never on mainnet)"
     end
 
     :ok
+  end
+
+  defp known_test_key_material?(xpub) do
+    MapSet.member?(@known_test_xpubs, xpub) or
+      case HD.parse_xpub(xpub) do
+        {:ok, %{pubkey: pubkey}} -> MapSet.member?(known_test_pubkeys(), pubkey)
+        {:error, _why} -> false
+      end
+  end
+
+  # Decoded on demand from the string list (one entry today): keeping the
+  # serializations as the source keeps the denylist auditable against the
+  # published test vectors, while the comparison happens on key material.
+  # An entry that fails to decode is a denylist bug, not a boot failure for
+  # the operator — it simply cannot match anything, and the string leg above
+  # still catches its exact serialization.
+  defp known_test_pubkeys do
+    @known_test_xpubs
+    |> Enum.flat_map(fn known ->
+      case HD.parse_xpub(known) do
+        {:ok, %{pubkey: pubkey}} -> [pubkey]
+        {:error, _why} -> []
+      end
+    end)
+    |> MapSet.new()
   end
 
   defp validate_unique_chain_field!(chains, field) do
@@ -483,23 +519,27 @@ defmodule Genswarms.Payments do
         limit
       )
       when is_integer(after_seq) and after_seq >= 0 and is_integer(limit) and limit > 0 do
+    metrics_fn = Map.get(config, :metrics_fn, &default_metrics_fn/2)
+
     result =
       if exported?(store_mod, :list_settlements_since, 2) do
-        outbox_store_read(store_mod, after_seq, limit)
+        outbox_store_read(store_mod, after_seq, limit, metrics_fn)
       else
         {:error, :no_outbox_store}
       end
 
     case result do
-      {:ok, %{settlements: rows, max_seq: max_seq}} ->
-        next_seq = highest_seq(rows, after_seq)
+      {:ok, %{settlements: rows, max_seq: max_seq, raw_count: raw_count, raw_max_seq: raw_max}} ->
+        # Paging is described by the RAW store page: a dropped poisoned row
+        # must not make the consumer think the page ended or replay a seq.
+        next_seq = max(after_seq, raw_max)
 
         {:ok,
          %{
            settlements: Enum.filter(rows, &namespace_match?(&1, namespace)),
            max_seq: max_seq,
            next_seq: next_seq,
-           complete: rows == [] or length(rows) < limit or next_seq >= max_seq
+           complete: raw_count == 0 or raw_count < limit or next_seq >= max_seq
          }}
 
       {:error, why} = error ->
@@ -664,6 +704,16 @@ defmodule Genswarms.Payments do
 
     cond do
       not match?(%Decimal{}, amount) ->
+        {:hold, :invalid_amount}
+
+      # A non-positive amount is never a payment. Zero is already filtered by
+      # the in-tree watcher and a negative one cannot come off a uint256, but
+      # `settle/2` is public and push modalities are the declared future: a
+      # negative Decimal would clear BOTH caps (never `:gt`) and then, recorded
+      # "settled", SUBTRACT from the trailing-window totals — widening the
+      # window for a later over-credit. Held, not quarantined: it is a
+      # malformed input, not a policy decision about real money.
+      Decimal.compare(amount, Decimal.new(0)) != :gt ->
         {:hold, :invalid_amount}
 
       Decimal.compare(amount, state.max_payment_usd) == :gt ->
@@ -1160,15 +1210,32 @@ defmodule Genswarms.Payments do
         with {:ok, observed} <- self_check_rpc(chain, state, "eth_call", params) do
           configured = Map.get(chain, :decimals, 6)
 
-          if normalize_integer(observed) == configured do
-            :ok
-          else
-            {:error, :decimals_mismatch,
-             %{
-               configured: configured,
-               observed: inspect(observed),
-               token_contract: to_string(contract)
-             }}
+          # "The call came back with nothing readable" and "the token says a
+          # different number" are the same hold but VERY different operator
+          # work: the first is a broken/mis-pointed endpoint (a proxy address
+          # with no code answers `0x`), the second is a wrong config that will
+          # mis-scale every amount. Label them apart.
+          case normalize_integer(observed) do
+            nil ->
+              {:error, :decimals_unverifiable,
+               %{
+                 method: "eth_call",
+                 configured: configured,
+                 detail: "unparseable decimals() answer: #{inspect(observed)}",
+                 token_contract: to_string(contract)
+               }}
+
+            ^configured ->
+              :ok
+
+            other ->
+              {:error, :decimals_mismatch,
+               %{
+                 configured: configured,
+                 observed: inspect(observed),
+                 observed_decimals: other,
+                 token_contract: to_string(contract)
+               }}
           end
         end
     end
@@ -1199,20 +1266,30 @@ defmodule Genswarms.Payments do
     {:reply, Jason.encode!(%{ok: false, error: "degraded_boot"}), state}
   end
 
+  # D2's other end: a beneficiary whose binding was loaded under a FOREIGN
+  # namespace has every settlement HELD (see `foreign_namespace_binding?/2`),
+  # and the hold freezes that chain's cursor too. Re-serving its address would
+  # invite a deposit into a black hole — money watched, never credited, and
+  # the chain stuck behind it. Refuse the read the same way the settle path
+  # refuses the credit, and alarm with the same metric so one repair closes
+  # both.
   defp handle_action("deposit_address", %{"beneficiary" => ben}, state, _from)
        when is_binary(ben) and ben != "" do
-    case ensure_binding(ben, state) do
-      {:ok, binding, state} ->
-        {:reply,
-         Jason.encode!(%{
-           ok: true,
-           beneficiary: ben,
-           address: binding.address,
-           namespace: binding.namespace
-         }), state}
+    if MapSet.member?(state.foreign_namespace_bindings, ben) do
+      Logger.error(
+        "payments: refusing deposit_address for #{inspect(ben)} — its binding is loaded under a foreign namespace, so settlements to that address would be HELD (repair the binding's namespace first)"
+      )
 
-      {:error, why, state} ->
-        {:reply, Jason.encode!(%{ok: false, error: to_string(why)}), state}
+      emit_metric(state, "payments_namespace_mismatch", %{
+        stage: "deposit_address",
+        beneficiary: ben,
+        binding_namespace: to_string(row_get(Map.get(state.bindings, ben, %{}), :namespace)),
+        hub_namespace: state.namespace
+      })
+
+      {:reply, Jason.encode!(%{ok: false, error: "namespace_mismatch"}), state}
+    else
+      deposit_address_reply(ben, state)
     end
   end
 
@@ -1359,7 +1436,13 @@ defmodule Genswarms.Payments do
   defp state_outbox_page(state, after_seq, limit) do
     cond do
       exported?(state.store_mod, :list_settlements_since, 2) ->
-        durable_namespace_page(state.store_mod, state.namespace, after_seq, limit)
+        durable_namespace_page(
+          state.store_mod,
+          state.namespace,
+          after_seq,
+          limit,
+          state.metrics_fn
+        )
 
       state.ephemeral_outbox ->
         memory_namespace_page(state, after_seq, limit)
@@ -1369,8 +1452,8 @@ defmodule Genswarms.Payments do
     end
   end
 
-  defp durable_namespace_page(store_mod, namespace, after_seq, limit) do
-    scan_namespace_page(store_mod, namespace, after_seq, after_seq, limit, [], nil)
+  defp durable_namespace_page(store_mod, namespace, after_seq, limit, metrics_fn) do
+    scan_namespace_page(store_mod, namespace, after_seq, after_seq, limit, [], nil, metrics_fn)
   end
 
   defp scan_namespace_page(
@@ -1380,29 +1463,39 @@ defmodule Genswarms.Payments do
          cursor,
          limit,
          acc,
-         known_max
+         known_max,
+         metrics_fn
        ) do
-    case outbox_store_read(store_mod, cursor, limit) do
-      {:ok, %{settlements: raw_rows, max_seq: max_seq}} ->
+    case outbox_store_read(store_mod, cursor, limit, metrics_fn) do
+      {:ok, %{settlements: rows, max_seq: max_seq, raw_count: raw_count, raw_max_seq: raw_max}} ->
         max_seq = if is_integer(known_max), do: max(known_max, max_seq), else: max_seq
-        raw_rows = Enum.sort_by(raw_rows, &outbox_seq/1)
+        rows = Enum.sort_by(rows, &outbox_seq/1)
         room = limit - length(acc)
 
         selected =
-          raw_rows
+          rows
           |> Enum.filter(&namespace_match?(&1, namespace))
           |> Enum.filter(&(outbox_seq(&1) > original_after))
           |> Enum.take(room)
 
         acc = acc ++ selected
-        raw_cursor = Enum.reduce(raw_rows, cursor, &max(outbox_seq(&1), &2))
+        # Cursor and page-exhaustion come from the RAW page, so dropping a
+        # poisoned row can never stall paging or hide the rows behind it.
+        raw_cursor = max(cursor, raw_max)
 
         cond do
           length(acc) == limit ->
             next_seq = highest_seq(acc, original_after)
 
             with {:ok, more?} <-
-                   namespace_exists_after?(store_mod, namespace, next_seq, max_seq, limit) do
+                   namespace_exists_after?(
+                     store_mod,
+                     namespace,
+                     next_seq,
+                     max_seq,
+                     limit,
+                     metrics_fn
+                   ) do
               {:ok,
                %{
                  settlements: acc,
@@ -1412,7 +1505,7 @@ defmodule Genswarms.Payments do
                }}
             end
 
-          raw_rows == [] or raw_cursor >= max_seq or length(raw_rows) < limit ->
+          raw_count == 0 or raw_cursor >= max_seq or raw_count < limit ->
             {:ok,
              %{
                settlements: acc,
@@ -1432,7 +1525,8 @@ defmodule Genswarms.Payments do
               raw_cursor,
               limit,
               acc,
-              max_seq
+              max_seq,
+              metrics_fn
             )
         end
 
@@ -1441,29 +1535,44 @@ defmodule Genswarms.Payments do
     end
   end
 
-  defp namespace_exists_after?(_store_mod, _namespace, cursor, max_seq, _limit)
+  defp namespace_exists_after?(_store_mod, _namespace, cursor, max_seq, _limit, _metrics_fn)
        when cursor >= max_seq,
        do: {:ok, false}
 
-  defp namespace_exists_after?(store_mod, namespace, cursor, max_seq, limit) do
-    case outbox_store_read(store_mod, cursor, limit) do
-      {:ok, %{settlements: rows, max_seq: observed_max}} ->
+  defp namespace_exists_after?(store_mod, namespace, cursor, max_seq, limit, metrics_fn) do
+    case outbox_store_read(store_mod, cursor, limit, metrics_fn) do
+      {:ok,
+       %{
+         settlements: rows,
+         max_seq: observed_max,
+         raw_count: raw_count,
+         raw_max_seq: raw_max
+       }} ->
         max_seq = max(max_seq, observed_max)
 
         cond do
+          # Only CREDITABLE rows count as "there is more for you" — a page of
+          # nothing but poisoned rows must not promise a consumer a next page.
           Enum.any?(rows, &namespace_match?(&1, namespace)) ->
             {:ok, true}
 
-          rows == [] ->
+          raw_count == 0 ->
             {:ok, false}
 
           true ->
-            next_cursor = Enum.reduce(rows, cursor, &max(outbox_seq(&1), &2))
+            next_cursor = max(cursor, raw_max)
 
             if next_cursor == cursor do
               {:error, :bad_store_return}
             else
-              namespace_exists_after?(store_mod, namespace, next_cursor, max_seq, limit)
+              namespace_exists_after?(
+                store_mod,
+                namespace,
+                next_cursor,
+                max_seq,
+                limit,
+                metrics_fn
+              )
             end
         end
 
@@ -1476,6 +1585,7 @@ defmodule Genswarms.Payments do
     rows =
       state.settlement_mirror
       |> Enum.filter(&(is_integer(outbox_seq(&1)) and outbox_seq(&1) > after_seq))
+      |> Enum.filter(&creditable_status?/1)
       |> Enum.filter(&namespace_match?(&1, state.namespace))
       |> Enum.sort_by(&outbox_seq/1)
 
@@ -1490,7 +1600,22 @@ defmodule Genswarms.Payments do
      }}
   end
 
-  defp outbox_store_read(store_mod, after_seq, limit) do
+  # THE choke point for every durable outbox read (the message action, the
+  # host seam, and reconciliation). Two jobs: validate the store's page shape,
+  # and refuse to serve a row that is not creditable.
+  #
+  # A1/C1 keep `outbox_seq` NULL on a quarantined row, so a correct store
+  # simply never returns one here — but the whole point of C1 is that the row
+  # is held even when the store is DEFECTIVE. `record_settlement` already
+  # alarms and refuses the push when a store mints a sequence for a
+  # quarantined row; by then the row is durably persisted with that sequence,
+  # and this read is the path that would credit it. Drop it, alarm per row.
+  # The returned page keeps the RAW shape (`raw_count`/`raw_max_seq`) so
+  # dropping rows never disturbs paging.
+  #
+  # The filter is "status present and not settled", not "status != settled":
+  # pre-0.2.0 rows carry no status at all and must keep flowing.
+  defp outbox_store_read(store_mod, after_seq, limit, metrics_fn) do
     try do
       case apply(store_mod, :list_settlements_since, [after_seq, limit]) do
         {:ok, %{settlements: rows, max_seq: max_seq}}
@@ -1500,7 +1625,13 @@ defmodule Genswarms.Payments do
                &(is_integer(outbox_seq(&1)) and outbox_seq(&1) > after_seq and
                    outbox_seq(&1) <= max_seq)
              ) do
-            {:ok, %{settlements: rows, max_seq: max_seq}}
+            {:ok,
+             %{
+               settlements: reject_uncreditable_rows(rows, metrics_fn),
+               max_seq: max_seq,
+               raw_count: length(rows),
+               raw_max_seq: highest_seq(rows, after_seq)
+             }}
           else
             {:error, :invalid_store_result}
           end
@@ -1515,6 +1646,36 @@ defmodule Genswarms.Payments do
       kind, reason ->
         Logger.error("payments: store list_settlements_since #{kind}-ed: #{inspect(reason)}")
         {:error, {kind, reason}}
+    end
+  end
+
+  defp reject_uncreditable_rows(rows, metrics_fn) do
+    Enum.reject(rows, fn row ->
+      if creditable_status?(row) do
+        false
+      else
+        key = row_get(row, :idempotency_key)
+        status = to_string(row_get(row, :status))
+
+        Logger.error(
+          "payments: durable outbox row #{inspect(key)} has status #{inspect(status)} but carries outbox_seq #{inspect(outbox_seq(row))} — NOT creditable, dropped from the read (store defect: only a settled row may hold a sequence)"
+        )
+
+        emit_metric(metrics_fn, "payments_outbox_poisoned_row", %{
+          idempotency_key: key,
+          status: status,
+          outbox_seq: outbox_seq(row)
+        })
+
+        true
+      end
+    end)
+  end
+
+  defp creditable_status?(row) do
+    case row_get(row, :status) do
+      nil -> true
+      status -> to_string(status) == "settled"
     end
   end
 
@@ -1536,12 +1697,15 @@ defmodule Genswarms.Payments do
   defp recent_settlements(state, limit) do
     cond do
       exported?(state.store_mod, :list_settlements_since, 2) ->
-        scan_recent_settlements(state.store_mod, state.namespace, 0, limit, [])
+        scan_recent_settlements(state.store_mod, state.namespace, 0, limit, [], state.metrics_fn)
 
       state.ephemeral_outbox ->
         rows =
           state.settlement_mirror
-          |> Enum.filter(&(is_integer(outbox_seq(&1)) and namespace_match?(&1, state.namespace)))
+          |> Enum.filter(
+            &(is_integer(outbox_seq(&1)) and creditable_status?(&1) and
+                namespace_match?(&1, state.namespace))
+          )
           |> Enum.sort_by(&outbox_seq/1, :desc)
           |> Enum.take(limit)
 
@@ -1555,25 +1719,25 @@ defmodule Genswarms.Payments do
   # The pinned store seam is forward-only. Reconciliation therefore streams
   # sequenced pages and retains only the newest `limit` namespace rows; this
   # remains correct across sequence gaps and interleaved namespaces.
-  defp scan_recent_settlements(store_mod, namespace, cursor, limit, newest) do
-    case outbox_store_read(store_mod, cursor, limit) do
-      {:ok, %{settlements: rows, max_seq: max_seq}} ->
+  defp scan_recent_settlements(store_mod, namespace, cursor, limit, newest, metrics_fn) do
+    case outbox_store_read(store_mod, cursor, limit, metrics_fn) do
+      {:ok, %{settlements: rows, max_seq: max_seq, raw_count: raw_count, raw_max_seq: raw_max}} ->
         newest =
           (newest ++ Enum.filter(rows, &namespace_match?(&1, namespace)))
           |> Enum.sort_by(&outbox_seq/1, :desc)
           |> Enum.take(limit)
 
-        next_cursor = Enum.reduce(rows, cursor, &max(outbox_seq(&1), &2))
+        next_cursor = max(cursor, raw_max)
 
         cond do
-          rows == [] or next_cursor >= max_seq or length(rows) < limit ->
+          raw_count == 0 or next_cursor >= max_seq or raw_count < limit ->
             {:ok, newest}
 
           next_cursor == cursor ->
             {:error, :bad_store_return}
 
           true ->
-            scan_recent_settlements(store_mod, namespace, next_cursor, limit, newest)
+            scan_recent_settlements(store_mod, namespace, next_cursor, limit, newest, metrics_fn)
         end
 
       {:error, _why} = error ->
@@ -1685,7 +1849,8 @@ defmodule Genswarms.Payments do
           {cached, heads}
 
         :error ->
-          computed = finality_head(reconcile_chain(row, state.chains), state)
+          chain = reconcile_chain(row, state.chains)
+          computed = finality_head(chain, state)
 
           case computed do
             {:ok, _head} ->
@@ -1696,10 +1861,12 @@ defmodule Genswarms.Payments do
                 "payments: finality is UNVERIFIABLE for chain #{chain_key} (#{inspect(reason)}) — rows on it are not treated as finalized"
               )
 
-              emit_metric(state, "payments_reconcile_finality_unverifiable", %{
-                chain: chain_key,
-                reason: reason_text(reason)
-              })
+              unless finality_opted_out?(chain, reason) do
+                emit_metric(state, "payments_reconcile_finality_unverifiable", %{
+                  chain: chain_key,
+                  reason: reason_text(reason)
+                })
+              end
           end
 
           {computed, Map.put(heads, chain_key, computed)}
@@ -1722,13 +1889,39 @@ defmodule Genswarms.Payments do
       {:ok, head} when is_integer(head) and is_integer(block_number) ->
         {acc, heads}
 
+      # Head answered, ROW unreadable: the head-level metric above never fires
+      # for this, so without an emit here the row is a number in the reply and
+      # nothing in telemetry — the one shape an operator cannot chase.
       {:ok, _head} ->
+        Logger.error(
+          "payments: finality is UNVERIFIABLE for #{inspect(key)} on chain #{chain_key} — block_number #{inspect(row_get(row, :block_number))} is unparseable; not treated as finalized"
+        )
+
+        emit_metric(state, "payments_reconcile_finality_unverifiable", %{
+          idempotency_key: key,
+          chain: chain_key,
+          reason: "block_number_unparseable",
+          block_number: inspect(row_get(row, :block_number))
+        })
+
         {%{acc | finality_unverifiable: acc.finality_unverifiable + 1}, heads}
 
       {:error, _reason} ->
         {%{acc | finality_unverifiable: acc.finality_unverifiable + 1}, heads}
     end
   end
+
+  # M6: a chain configured `finality: {:confirmations, n}` with no second
+  # endpoint has not FAILED to answer — its operator declined the finality
+  # leg. The reply counter still says "not verified" (never "finalized"), but
+  # the alarm is reserved for endpoints that were asked and could not answer,
+  # so upgrading does not hand legacy configs a metric that repeats forever
+  # and can never be cleared without new configuration.
+  defp finality_opted_out?(chain, :reconcile_rpc_url_missing) when is_map(chain) do
+    match?({:confirmations, _n}, Map.get(chain, :finality, :finalized))
+  end
+
+  defp finality_opted_out?(_chain, _reason), do: false
 
   defp finality_head(nil, _state), do: {:error, :chain_not_configured}
 
@@ -2084,6 +2277,22 @@ defmodule Genswarms.Payments do
 
       value ->
         value
+    end
+  end
+
+  defp deposit_address_reply(ben, state) do
+    case ensure_binding(ben, state) do
+      {:ok, binding, state} ->
+        {:reply,
+         Jason.encode!(%{
+           ok: true,
+           beneficiary: ben,
+           address: binding.address,
+           namespace: binding.namespace
+         }), state}
+
+      {:error, why, state} ->
+        {:reply, Jason.encode!(%{ok: false, error: to_string(why)}), state}
     end
   end
 

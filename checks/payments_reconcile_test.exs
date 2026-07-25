@@ -539,6 +539,110 @@ Check.check(
 
 set_finalized_head.(200)
 
+# M5: the head answered fine but the ROW's block_number is unreadable. That
+# is not finalized and not unfinalized — it is unverifiable, and it used to be
+# a number in the reply with nothing in telemetry behind it.
+unparseable_block_row = %{
+  row
+  | idempotency_key: "8453:0xBADBLOCK:0",
+    ref: "0xBADBLOCK:0",
+    block_number: "not-a-block"
+}
+
+ReconcileStore.reset(
+  [unparseable_block_row],
+  %{
+    beneficiary: "budget:reconcile",
+    index: 0,
+    address: binding_address,
+    namespace: "llm_quota"
+  }
+)
+
+Agent.update(events, fn _ -> [] end)
+{bad_block_reply, bad_block_events} = reconcile_now.(state)
+
+Check.check(
+  f,
+  "M5: a row with an unparseable block_number is counted AND metered as finality_unverifiable",
+  bad_block_reply["finality_unverifiable"] == 1 and bad_block_reply["unfinalized"] == 0 and
+    Enum.any?(bad_block_events, fn {event, meta} ->
+      event == "payments_reconcile_finality_unverifiable" and
+        meta.idempotency_key == "8453:0xBADBLOCK:0" and meta.chain == "base" and
+        meta.reason == "block_number_unparseable"
+    end)
+)
+
+# M6: a chain that declared `{:confirmations, n}` and never configured a
+# second endpoint did not FAIL to answer — its operator opted out of the
+# finality leg. The reply still refuses to call those rows finalized, but the
+# alarm is reserved for endpoints that were asked and could not answer, so an
+# upgrade does not hand legacy configs a metric that repeats forever.
+opted_out_state =
+  Payments.init!(%{
+    name: :payments,
+    xpub: xpub,
+    allow_test_xpub: true,
+    trusted_sources: ["ops"],
+    targets: [],
+    namespace: "llm_quota",
+    store_mod: ReconcileStore,
+    auto_tick: false,
+    rpc_fn: rpc_fn,
+    metrics_fn: fn event, meta -> Agent.update(events, &[{event, meta} | &1]) end,
+    chains: [
+      %{
+        name: "base",
+        chain_id: 8453,
+        rpc_url: "https://primary.example/rpc",
+        usdc_contract: "0xCONTRACT",
+        finality: {:confirmations, 5}
+      }
+    ]
+  })
+
+reset_reconcile.()
+{opted_out_reply, opted_out_events} = reconcile_now.(opted_out_state)
+
+Check.check(
+  f,
+  "M6: a {:confirmations, n} chain with no second endpoint still counts as finality_unverifiable",
+  opted_out_reply["finality_unverifiable"] == 1 and opted_out_reply["unfinalized"] == 0
+)
+
+Check.check(
+  f,
+  "M6: ...but does NOT emit the per-run alarm — an opt-out is not a broken endpoint",
+  not Enum.any?(opted_out_events, fn {event, _meta} ->
+    event == "payments_reconcile_finality_unverifiable"
+  end)
+)
+
+# The same chain WITHOUT the opt-out (default :finalized) keeps alarming.
+not_opted_out_state = %{
+  opted_out_state
+  | chains: [
+      %{
+        name: "base",
+        chain_id: 8453,
+        rpc_url: "https://primary.example/rpc",
+        usdc_contract: "0xCONTRACT"
+      }
+    ]
+}
+
+reset_reconcile.()
+{_default_reply, default_events} = reconcile_now.(not_opted_out_state)
+
+Check.check(
+  f,
+  "M6: the suppression is scoped to the opt-out — a default chain still alarms",
+  Enum.any?(default_events, fn {event, meta} ->
+    event == "payments_reconcile_finality_unverifiable" and meta.chain == "base" and
+      meta.reason == "reconcile_rpc_url_missing"
+  end)
+)
+
 invalid_finality =
   try do
     Payments.init!(%{
