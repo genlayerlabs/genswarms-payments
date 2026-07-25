@@ -2,6 +2,64 @@
 
 ## 0.2.0 — Unreleased
 
+- Added per-settlement and aggregate issuance caps. `max_payment_usd`
+  (default `"10000"`) bounds one settlement; `max_issuance_per_window_usd`
+  (default `nil` = disabled) bounds the settled total inside a trailing
+  `issuance_window_hours` window (default 24). A settlement past either cap is
+  recorded with `status: "quarantined"` and a NULL `outbox_seq` instead of
+  being settled: durable, deduped by idempotency key, excluded from the outbox
+  read and from `payment_confirmed` delivery, alarmed as
+  `payments_quarantined`, and announced to targets as a one-shot best-effort
+  `payment_held` cast (the user-visible hold hook). The aggregate cap carries a
+  per-beneficiary `small_topup_usd` carve-out (default `"5"`) so one large
+  payment cannot deny everyone else's small top-ups for the rest of the
+  window; the carve-out never overrides `max_payment_usd`. Releasing a held row
+  is an operator action, not implemented in this release — the row shape
+  defines it as `status: "settled"` plus a FRESH release-time `outbox_seq`.
+- Added the optional `Store.issuance_totals_since/3` callback (trailing-window
+  settled totals per namespace and beneficiary). `init/1` refuses a hub that
+  sets `max_issuance_per_window_usd` over a durable settlement store that does
+  not export it, because the cap could then only hold every settlement.
+  Memory-mode hubs compute the window from their settlement mirror. A store
+  read failure, an invalid store result, or `{:error, :unsupported_status}`
+  from `record_payment/1` HOLDS the settlement (cursor unmoved, retried next
+  tick) and emits `payments_store_version_skew`; a store that mints an
+  `outbox_seq` for a quarantined row is refused the same way rather than
+  crediting what the cap just declined.
+- Separated the two chain depths that were previously conflated. The CREDIT
+  leg uses each chain's new `fast_credit_depth` (default: that chain's
+  `confirmations`, so existing configs keep their depth) — shallow and fast on
+  purpose, bounded by the caps above. FINALITY is now queried on the
+  RECONCILE leg: per-chain `finality: :finalized` (default) asks the reconcile
+  endpoint for the `finalized` block tag, `{:confirmations, n}` serves chains
+  without the tag. `reconcile` gained `unfinalized` (rows above the finality
+  head — informational, never a credit reversal) and `finality_unverifiable`
+  counts, with `payments_reconcile_unfinalized` and
+  `payments_reconcile_finality_unverifiable` metrics. A null, absent, or
+  unparseable answer is never treated as finalized. The head is fetched at most
+  once per chain per run.
+- Added the first-tick on-chain self-check per chain: `eth_chainId` must equal
+  the configured `chain_id` and, for a chain with a token contract, its
+  `decimals()` must equal the configured `decimals`. A mismatch or an
+  unverifiable answer holds THAT chain (no scanning, no settling) with a
+  `payments_chain_self_check_failed` alarm and is retried next tick, so a healed
+  RPC recovers by itself; a pass is cached per chain. It deliberately runs at
+  the first tick rather than at boot: an endpoint that is merely down at boot
+  must not crash-loop the object.
+- Added the namespace-coherence gate: bindings loaded at boot under a namespace
+  other than the hub's are logged, metered as
+  `payments_namespace_mismatch`, and kept in the watched set, but their
+  settlements are HELD — money is never silently re-namespaced, and the
+  chain's cursor stays back until an operator repairs the binding.
+- Added a compiled-in denylist of publicly known test xpubs (the BIP32
+  `abandon abandon … about` key at `m/44'/60'/0'`). Booting one raises unless
+  `allow_test_xpub: true` is set explicitly; mainnet hubs must never set it.
+  `allow_test_xpub` and `allow_ephemeral` are now validated as booleans rather
+  than read as truthy.
+- Money configuration is parsed strictly: plain non-negative decimal strings
+  only, exponent forms rejected, positivity enforced where required, and
+  `issuance_window_hours`, `confirmations`, `fast_credit_depth`, `decimals`,
+  `finality`, and non-map/non-list `chains` entries all validated at `init/1`.
 - Added the optional `Store.list_settlements_since/2` transactional-outbox
   read contract, the synchronous `Genswarms.Payments.settlements_since/3`
   host seam, and the trusted-target message action. Reads are namespace

@@ -36,11 +36,16 @@ push method ships yet; `ingest_event` currently always replies
   name: :payments,                    # object name, stamped on every delivered message (default :payments)
   swarm_name: "my_swarm",             # used by the default deliver_fn (default "swarm")
   xpub: System.fetch_env!("PAYMENTS_XPUB"),   # required — watch-only, see Custody below
+  allow_test_xpub: false,             # explicit opt-out for a publicly known test xpub (default false)
   trusted_sources: ["telegram_ingress", "cron"],  # required for anything to work (default [])
   targets: ["downstream_object"],     # required for anyone to get credited (default [])
   allow_ephemeral: false,             # explicit dev-only opt-out when targets are non-empty (default false)
   namespace: "default",               # stamped on bindings/deliveries; caller-defined meaning (default "default")
   store_mod: MyApp.PaymentsStore,     # optional — see Store contract (default nil = memory)
+  max_payment_usd: "10000",           # per-settlement cap; above it a row is QUARANTINED (default "10000")
+  max_issuance_per_window_usd: nil,   # aggregate cap over the window; nil = disabled (default nil)
+  issuance_window_hours: 24,          # trailing window for the aggregate cap (default 24)
+  small_topup_usd: "5",               # per-beneficiary carve-out from the aggregate cap (default "5")
   chains: [
     %{
       name: "base",
@@ -48,8 +53,10 @@ push method ships yet; `ingest_event` currently always replies
       rpc_url: System.fetch_env!("BASE_RPC_URL"),
       reconcile_rpc_url: System.get_env("BASE_RECONCILE_RPC_URL"), # optional independent endpoint
       usdc_contract: "0x...",
-      confirmations: 12,              # default 12
-      decimals: 6,                    # default 6
+      confirmations: 12,              # default 12 — the fast_credit_depth default
+      fast_credit_depth: 12,          # CREDIT leg depth (default: this chain's confirmations)
+      finality: :finalized,           # RECONCILE leg: :finalized | {:confirmations, n} (default :finalized)
+      decimals: 6,                    # default 6 — asserted against the contract at the first tick
       start_block: 0,                 # default 0 — cold-start scan floor
       max_block_range: 2000,          # default 2000 — cap per poll round
       address_chunk: 200              # default 200 — addresses per eth_getLogs call
@@ -71,6 +78,100 @@ dedup, a restart can re-mint addresses and re-credit payment history. Local
 or test configurations may accept that risk only by setting
 `allow_ephemeral: true` explicitly. Empty-target observers may still use
 memory mode without the opt-out because they cannot credit anyone.
+
+Every money amount above is a plain non-negative decimal STRING, parsed
+strictly: no floats, no integers, no exponent forms (`"1e6"` is refused, not
+silently read as a million). `max_payment_usd` and
+`max_issuance_per_window_usd` must be greater than zero;
+`max_issuance_per_window_usd` may be `nil` to disable the aggregate cap;
+`small_topup_usd: "0"` disables the carve-out.
+
+## Caps and quarantine (C1)
+
+The cheapest control in the system: it turns every unbounded over-credit mode
+(a lying RPC oracle, a reorg, a decimals misconfiguration) into a bounded,
+loud one.
+
+- A settlement above `max_payment_usd` is **quarantined**.
+- A settlement that would push the trailing window's settled total past
+  `max_issuance_per_window_usd` is **quarantined**, *unless* it fits the
+  beneficiary's own first `small_topup_usd` in that window — a whale must not
+  deny everyone else's small top-ups for the rest of the window. The carve-out
+  never overrides `max_payment_usd`.
+
+A quarantined settlement is:
+
+- **recorded durably** with `status: "quarantined"` and `outbox_seq: nil`;
+- **deduped** exactly like a settled one (`payment_seen?` answers true), so a
+  re-presented log neither re-alarms nor re-notifies;
+- **never delivered as `payment_confirmed` and never visible to
+  `settlements_since`** — the sequence marks *creditable*, not *recorded*;
+- **alarmed** through `metrics_fn` as `payments_quarantined` with the
+  idempotency key, beneficiary, amount, and reason (`max_payment` |
+  `aggregate`);
+- **notified** to every target as a one-shot best-effort
+  `{"action": "payment_held", "beneficiary": ..., "amount_usd": ..., "ref":
+  ..., "reason": ...}` cast. That is the user-visible hold hook: a silent hold
+  on money the user watched leave their wallet is a support incident by design.
+  A lost cast is acceptable — the operator queue is the authoritative record.
+
+Releasing a held payment is an operator action and is **not implemented yet**
+(phase 4). The row shape already defines it: set `status` to `"settled"` and
+mint a fresh `outbox_seq` at release time, so the released row appears at the
+head of every consumer's outbox.
+
+The window total comes from the store's `issuance_totals_since/3` when a
+durable store is configured; `init/1` refuses a hub that sets
+`max_issuance_per_window_usd` over a durable store lacking that callback,
+because the cap could then only ever hold every settlement. Memory-mode hubs
+compute the window from their in-memory mirror. A store read that fails, or a
+store that cannot record a `"quarantined"` status (`{:error,
+:unsupported_status}`), HOLDS the settlement — fail closed, cursor unmoved,
+retried next tick — and emits `payments_store_version_skew`.
+
+## Credit depth vs finality (C2)
+
+Two different depths, deliberately named apart:
+
+| Leg | Config | Typical Base latency | What it is for |
+|---|---|---|---|
+| Credit | `fast_credit_depth` (per chain, defaults to `confirmations`) | seconds to a minute | the fast path a blocked user is waiting on; the caps above bound what its shallowness can cost |
+| Reconcile | `finality: :finalized` (per chain; `{:confirmations, n}` for chains without the tag) | ~10-20 minutes | the truth, queried from the chain — never a small confirmations number *pretending* to be finality |
+
+Crediting is never gated on finality: putting a quarter-hour wall in front of
+"unblock me now" would defeat the feature. Instead the `reconcile` action
+re-checks recent settled rows against the `finalized` head and reports
+`unfinalized` counts (informational — it never reverses a credit), while a
+reorged-out row shows up on the existing receipt leg as drift. A null, absent,
+or unparseable answer to the `finalized` tag is reported as
+`finality_unverifiable` and alarmed; it is never treated as finalized. The
+head is fetched at most once per chain per reconcile run.
+
+## Boot and first-tick gates
+
+- **Known test xpubs (D7).** A publicly known test xpub — the BIP32
+  `abandon abandon … about` key at `m/44'/60'/0'` — is refused at `init/1`,
+  because its private key is in every tutorial: watching it means crediting
+  deposits anyone can sweep. `allow_test_xpub: true` is the explicit opt-out
+  for a local testnet rig; a mainnet hub must never set it. The list is a
+  floor, not a guarantee — a leaked key of your own belongs in your own
+  refusal path.
+- **Namespace coherence (D2).** Every binding loaded at boot whose
+  `namespace` differs from the hub's is logged, metered
+  (`payments_namespace_mismatch`), and kept in the watched set — but its
+  settlements are **held**, never credited under the hub's namespace and never
+  silently re-namespaced. Held means held: that chain's cursor does not
+  advance past such a settlement and the alarm repeats every tick until an
+  operator repairs the binding (or points the hub at the right namespace).
+- **On-chain self-check (D4).** Before a chain is scanned for the first time,
+  the endpoint must prove it is the configured chain: `eth_chainId` equal to
+  `chain_id`, and — for a chain with a token contract — that contract's
+  `decimals()` equal to the configured `decimals`. A mismatch, an RPC error, or
+  an unparseable answer holds **that chain only** (no scanning, no settling)
+  with a `payments_chain_self_check_failed` alarm, and is retried next tick, so
+  a healed RPC recovers by itself. A pass is cached per chain. This runs at the
+  first tick, not at boot, because an endpoint that is merely down at boot must
+  not crash-loop the object.
 
 `auto_tick` and `poll_interval_ms` are accepted and stored but nothing in
 this package reads them to schedule anything — a poll round only happens
@@ -113,10 +214,12 @@ interval; this package owns the settlement/watch logic, not the clock.
   clamps to 1..200; a present non-integer or negative limit is `bad_request`.
   Re-fetches recent full-fact rows through each chain's
   independent `reconcile_rpc_url`, reporting checked rows, drift keys,
-  unverifiable rows, legacy rows, incomplete 0.2.0-era rows, and `elapsed_ms`.
-  A run makes at most `limit` sequential receipt RPCs; the default RPC seam's
-  existing 20-second curl timeout bounds endpoint delay to at most
-  `limit × 20s`. Detection alarms only; it never reverses a credit.
+  unverifiable rows, legacy rows, incomplete 0.2.0-era rows, `unfinalized`
+  rows, `finality_unverifiable` rows, and `elapsed_ms`.
+  A run makes at most `limit` sequential receipt RPCs plus one finality-head
+  call per chain; the default RPC seam's
+  existing 20-second curl timeout bounds endpoint delay accordingly.
+  Detection alarms only; it never reverses a credit.
 - `{"action": "ingest_event", ...}` — trusted only; reserved for future push
   methods, currently always refuses.
 
@@ -177,7 +280,8 @@ refuses unless the hub explicitly booted in ephemeral mode.
 | `get_address_binding/1` | fetch a binding by beneficiary |
 | `list_address_bindings/0` | boot: rebuild the watched set + next index |
 | `payment_seen?/1` | settlement dedup by idempotency key — must be durable in prod |
-| `record_payment/1` | record one settled payment; return `:ok`, `{:ok, positive_seq}`, or `{:error, term}` |
+| `record_payment/1` | record one settlement (`status` `"settled"` or `"quarantined"`); return `:ok`, `{:ok, positive_seq}` (settled rows only), or `{:error, term}` — `{:error, :unsupported_status}` for a status the schema does not know |
+| `issuance_totals_since/3` | trailing-window settled totals for C1's aggregate cap (required when that cap is set over a durable store) |
 | `get_last_scanned_block/1` | last fully-settled block for a chain |
 | `put_last_scanned_block/2` | advance a chain's scan cursor |
 | `list_payments/1` | settled payments for a beneficiary, newest first |
@@ -268,13 +372,17 @@ second endpoint, fetches `eth_getTransactionReceipt`, locates the stored log
 index, and compares raw amount, token contract, stored sender address, bound
 destination address, block number, log index, and transaction hash. Missing
 independent endpoints and RPC failures are counted as unverifiable; mismatches
-and incomplete rows are logged and metered. No result automatically changes
-credited money.
+and incomplete rows are logged and metered. Each complete row is additionally
+checked against its chain's finality head (see above). No result automatically
+changes credited money.
 
-`metrics_fn` receives `payments_settled`, `payments_hold`,
+`metrics_fn` receives `payments_settled`, `payments_quarantined`,
+`payments_hold`, `payments_namespace_mismatch`,
+`payments_chain_self_check_failed`, `payments_store_version_skew`,
 `payments_push_failed`, `payments_read_refused`,
-`payments_reconcile_drift`, `payments_reconcile_incomplete`, and
-`payments_reconcile_unverifiable`. Every invocation is isolated with
+`payments_reconcile_drift`, `payments_reconcile_incomplete`,
+`payments_reconcile_unverifiable`, `payments_reconcile_unfinalized`, and
+`payments_reconcile_finality_unverifiable`. Every invocation is isolated with
 `try/catch`; telemetry failure cannot affect settlement or another money path.
 The default implementation logs through `Logger`.
 
@@ -282,7 +390,9 @@ The default implementation logs through `Logger`.
 
 `Genswarms.Payments.Usdc` is a pull method: per `tick`, per configured
 chain, it fetches `eth_blockNumber`, computes `safe_to = latest -
-confirmations`, and pulls `eth_getLogs` for the ERC-20 `Transfer` topic
+fast_credit_depth` (the credit leg's explicitly-labelled shallow depth,
+defaulting to the chain's `confirmations`), and pulls `eth_getLogs` for the
+ERC-20 `Transfer` topic
 against the chain's `usdc_contract`, chunked over watched addresses
 (`address_chunk`) and capped in range (`max_block_range`) so a cold start
 never issues an unbounded query. Two client-side defenses run even though
@@ -335,7 +445,9 @@ spending with exact debit math, a lost-push row recovered through
 `settlements_since` (proxy answers `duplicate` when it already applied the
 push), and a retryable-NACK outage recovered by outbox application after the
 proxy's credit store heals. Still hermetic: canned JSON-RPC, loopback HTTP
-only, no Postgres.
+only, no Postgres. Its canned chain answers the D4 self-check truthfully, and
+its config sets `allow_test_xpub: true` — the harness derives from the public
+BIP32 test key, exactly the case the gate exists to catch in production.
 
 ```sh
 sh e2e/run.sh          # needs a genswarms-llm-proxy checkout:
