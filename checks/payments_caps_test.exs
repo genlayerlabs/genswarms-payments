@@ -122,6 +122,33 @@ Check.check(
   )
 )
 
+# The hold notice carries the SAME stamp as payment_confirmed. Without
+# `namespace` a consumer cannot refuse a foreign-namespace hold; without
+# `method` it cannot key the hold under the "<method>:<ref>" string the
+# eventual release credits under, and has to guess with a bare-ref fallback.
+held_payload_ok = fn notice, beneficiary, amount, reason ->
+  {target, from, payload} = notice
+
+  target == "llm_proxy" and from == :payments and
+    Map.keys(payload) |> Enum.sort() ==
+      ~w(action amount_usd at beneficiary method namespace reason ref) and
+    payload["action"] == "payment_held" and
+    payload["beneficiary"] == beneficiary and
+    payload["amount_usd"] == amount and
+    payload["method"] == "usdc_base" and
+    payload["namespace"] == "llm_quota" and
+    payload["reason"] == reason and
+    is_binary(payload["ref"]) and
+    match?({:ok, _, _}, DateTime.from_iso8601(payload["at"]))
+end
+
+Check.check(
+  f,
+  "the payment_held payload is fully stamped: method, namespace and ISO8601 at, like payment_confirmed",
+  held_payload_ok.(held_notice, "budget:a", "100.01", "max_payment") and
+    elem(held_notice, 2)["ref"] == "whale:0"
+)
+
 Check.check(
   f,
   "a quarantined settlement never delivers payment_confirmed",
@@ -193,6 +220,20 @@ Check.check(
       event == "payments_quarantined" and meta.idempotency_key == "agg:over" and
         meta.reason == "aggregate"
     end)
+)
+
+agg_held_notice =
+  Agent.get(deliveries2, & &1)
+  |> Enum.find(fn {_t, _from, payload} ->
+    payload["action"] == "payment_held" and payload["ref"] == "agg:over:0"
+  end)
+
+Check.check(
+  f,
+  "an aggregate-cap hold carries the very same full payload shape (reason is the only difference)",
+  held_payload_ok.(agg_held_notice, "budget:whale", "40", "aggregate") and
+    elem(agg_held_notice, 2)["ref"] == "agg:over:0" and
+    elem(agg_held_notice, 2)["at"] == DateTime.to_iso8601(now)
 )
 
 Check.check(

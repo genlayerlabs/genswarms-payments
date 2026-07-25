@@ -948,7 +948,11 @@ defmodule Genswarms.Payments do
   # It keeps a NULL outbox_seq (A3), so it is invisible to the outbox read and
   # to reconciliation until an operator releases it (phase 4). The
   # `payment_held` cast is the user-visible notice hook: best effort, because
-  # the operator queue — not this message — is the authoritative record.
+  # the operator queue — not this message — is the authoritative record. It
+  # carries the SAME stamp as `payment_confirmed` (method, namespace, at) plus
+  # the reason: a consumer must be able to reject a foreign-namespace hold and
+  # to key the hold under the very `"<method>:<ref>"` string the eventual
+  # release will credit under — a shorter payload forces it to guess.
   defp finish_recorded_settlement(
          %{status: "quarantined"} = row,
          s,
@@ -979,7 +983,10 @@ defmodule Genswarms.Payments do
         action: "payment_held",
         beneficiary: s.beneficiary,
         amount_usd: Decimal.to_string(s.amount_usd),
+        method: s.method,
         ref: s.ref,
+        namespace: s.namespace,
+        at: DateTime.to_iso8601(row.at),
         reason: Atom.to_string(reason)
       })
 

@@ -10,7 +10,11 @@
   being settled: durable, deduped by idempotency key, excluded from the outbox
   read and from `payment_confirmed` delivery, alarmed as
   `payments_quarantined`, and announced to targets as a one-shot best-effort
-  `payment_held` cast (the user-visible hold hook). The aggregate cap carries a
+  `payment_held` cast (the user-visible hold hook) carrying the same stamp as
+  `payment_confirmed` — `method`, `ref`, `namespace` and ISO8601 `at` — plus
+  the quarantine `reason`, so a consumer can refuse a foreign-namespace hold
+  and key it under the very `"<method>:<ref>"` string the eventual release
+  credits under. The aggregate cap carries a
   per-beneficiary `small_topup_usd` carve-out (default `"5"`) so one large
   payment cannot deny everyone else's small top-ups for the rest of the
   window; the carve-out never overrides `max_payment_usd`. Releasing a held row

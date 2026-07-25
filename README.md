@@ -115,10 +115,15 @@ A quarantined settlement is:
   idempotency key, beneficiary, amount, and reason (`max_payment` |
   `aggregate`);
 - **notified** to every target as a one-shot best-effort
-  `{"action": "payment_held", "beneficiary": ..., "amount_usd": ..., "ref":
-  ..., "reason": ...}` cast. That is the user-visible hold hook: a silent hold
-  on money the user watched leave their wallet is a support incident by design.
-  A lost cast is acceptable — the operator queue is the authoritative record.
+  `{"action": "payment_held", "beneficiary": ..., "amount_usd": ...,
+  "method": ..., "ref": ..., "namespace": ..., "at": ..., "reason": ...}`
+  cast — the same stamp `payment_confirmed` carries, plus the reason. That is
+  the user-visible hold hook: a silent hold on money the user watched leave
+  their wallet is a support incident by design. A lost cast is acceptable —
+  the operator queue is the authoritative record. The stamp is not decoration:
+  `namespace` lets a consumer refuse a hold that is not its own money, and
+  `method` lets it key the hold under the very `"<method>:<ref>"` string the
+  eventual release will credit under.
 
 Releasing a held payment is an operator action and is **not implemented yet**
 (phase 4). The row shape already defines it: set `status` to `"settled"` and
