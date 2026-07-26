@@ -62,6 +62,52 @@ the dedup read or the record write holds that settlement for the next round
 rather than risk a double-credit or silent loss. The host owns the
 schema/migrations.
 
+## Authorization lane (entry A: EIP-3009 → treasury)
+
+A sibling package (e.g. `genswarms-wallet-bridge`) can have users sign
+EIP-3009 authorizations whose USDC lands directly in a shared TREASURY
+wallet instead of a per-beneficiary deposit address. This hub owns the
+issued-authorization registry end to end and is the ONLY thing standing
+between "a signed authorization" and "a credited payment":
+
+- Configure `treasury_address` on the chain(s) that use this lane. It is
+  NOT added to `bindings`/the watched-address map — the treasury has no
+  single beneficiary, so its `Transfer`s are resolved by nonce correlation,
+  never by address lookup.
+- A trusted source calls `issue_authorization` with
+  `{nonce, order_ref, beneficiary, amount_usd, valid_before}` BEFORE the
+  authorization is ever submitted on chain. **Order matters and there is no
+  safe reverse**: issue in THIS hub first, THEN hand the nonce to whatever
+  signs/submits it (a keeper, a wallet-bridge order). Registering the order
+  with a downstream keeper BEFORE this hub has issued the nonce means a
+  Transfer can land in the treasury and get scanned before
+  `issued_authorization/1` can ever resolve it — the credit rule (below)
+  refuses anything it cannot look up, so that money is recorded
+  `unrecognised`, not credited, and needs a manual operator reissue/release
+  to fix. Issue first, always.
+- `store_mod` needs 5 more optional callbacks for this lane to do anything:
+  `record_issued_authorization/1`, `issued_authorization/1`,
+  `live_authorization_nonces/1`, `mark_authorization_consumed/1`,
+  `record_unrecognised_inflow/1`. Like every other callback group in this
+  package, a store implementing only PART of the issuance round trip
+  (`record_issued_authorization` + `issued_authorization`) or the nonce-filter
+  round trip (`live_authorization_nonces` + `mark_authorization_consumed`)
+  is refused at `init/1` — worse than implementing neither.
+- **The credit rule (spec §4.4), the one line in this whole package money
+  literally depends on**: a treasury `Transfer` settles ONLY when it
+  correlates (by `tx_hash`) to an `AuthorizationUsed` log whose nonce this
+  hub's own `issued_authorization/1` can resolve. No correlation, or a
+  nonce this hub never issued, is recorded as an unrecognised inflow
+  (`payments_unrecognised_inflow`) and never credited. Without this rule a
+  future deposit-sweep collection landing in the SAME treasury wallet would
+  read as a user payment and get credited a second time for money already
+  credited once.
+- The host implements storage only — issuance, lookup, the nonce filter,
+  and consumption marking are all `Store` callbacks with host-owned schema,
+  exactly like bindings and settlements. This object never writes an
+  issued-authorization row except through `issue_authorization`, and never
+  credits a treasury inflow except through the rule above.
+
 ## Gotchas
 
 - **"address not credited"** — check, in order: is the chain in `chains` at
@@ -109,6 +155,13 @@ schema/migrations.
   `{"ok": false, "error": "no_push_methods"}`. Adding a push method means
   implementing `Method.ingest_event/2` with its OWN signature verification —
   the core trusts whatever settlements a method hands back.
+- **`issue_authorization` without a store implementing `issued_authorization/1`
+  is memory-only and functionally inert for crediting**: `issue_authorization`
+  still answers `ok: true` (dev/memory mode, same stance as every other write
+  in this package), but nothing written that way can ever be looked back up
+  by the credit rule, so every treasury inflow correlating to it is recorded
+  `unrecognised` instead of settled. Configure a durable store for this lane
+  before relying on it for real money.
 
 ## Verification
 

@@ -2,6 +2,38 @@
 
 ## 0.2.0 — Unreleased
 
+- Added the authorization lane (entry A): a new `treasury_address` per chain
+  and the hub action `issue_authorization` (trusted-source gated, like
+  `deposit_address`) that owns the issued-authorization registry end to end.
+  A trusted source submits `{nonce, order_ref, beneficiary, amount_usd,
+  valid_before}`; the hub validates shape (32-byte hex nonce, positive
+  `@money_pattern` amount, non-empty beneficiary/order_ref), SEALS the row
+  under its own namespace regardless of what the caller sent, and persists it
+  idempotently by `order_ref` via the new `Store.record_issued_authorization/1`.
+  Five new optional `Store` callbacks: `record_issued_authorization/1`,
+  `issued_authorization/1`, `live_authorization_nonces/1` (issued ∧
+  unconsumed ∧ unexpired — bounded by construction, since every authorization
+  expires), `mark_authorization_consumed/1`, and
+  `record_unrecognised_inflow/1`. Coherence-gated at `init/1` like every
+  other multi-callback group: implementing half of either round trip
+  (issuance or the nonce filter) raises.
+  The USDC watcher's `getLogs` now runs a SECOND query per chain with a
+  `treasury_address` configured — `AuthorizationUsed(address,bytes32)`
+  events filtered to the live nonce set, correlated to the matching
+  `Transfer` by `tx_hash` — and credits a treasury inflow under settlement
+  method `"usdc_authorization"` (same idempotency key shape as every other
+  USDC settlement, `"#{chain_id}:#{tx_hash}:#{log_index}"`, amount = what
+  actually moved, which may be less than what was issued) ONLY when its
+  nonce was issued by THIS hub and is still resolvable — spec §4.4's credit
+  rule. Everything else landing in the treasury (no correlated nonce, or a
+  nonce this hub never issued — the exact shape a future deposit-sweep
+  collection into the same wallet would otherwise be double-credited under)
+  is recorded via `record_unrecognised_inflow/1` and metered
+  (`payments_unrecognised_inflow`), never held against the chain's cursor.
+  The `AuthorizationUsed` topic0 is computed at compile time from its
+  signature string (never hand-typed hex) and pinned against an
+  independently-verified frozen literal in
+  `checks/payments_keccak_test.exs`.
 - `binding_conflict` now ADOPTS the durable binding instead of refusing. When
   this beneficiary is already bound to an address this process does not have in
   memory (a peer instance wrote it, or this one booted before the write), the

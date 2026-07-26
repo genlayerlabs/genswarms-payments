@@ -24,6 +24,20 @@ Check.check(f, "keccak256(\"Transfer(address,address,uint256)\") is the ERC-20 t
   hex.(Keccak.hash_256("Transfer(address,address,uint256)")) ==
     "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
+# EIP-3009's AuthorizationUsed event signature — usdc.ex's
+# @authorization_used_topic is COMPUTED from this exact string at compile
+# time (never hand-typed hex), so the only residual bug surface is the
+# signature string itself. This check and usdc.ex's module attribute share
+# that same source, so they only both agree with the frozen literal below
+# (externally verified 2026-07-26, Task 5) if the string AND the Keccak
+# implementation are both right — a transcription slip in either place is
+# caught here, in the suite, rather than in production (where it would
+# silently stop the treasury credit-rule correlation and turn every entry-A
+# payment into an "unrecognised inflow").
+Check.check(f, "keccak256(\"AuthorizationUsed(address,bytes32)\") is the EIP-3009 topic0",
+  hex.(Keccak.hash_256("AuthorizationUsed(address,bytes32)")) ==
+    "98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5")
+
 # Pad-edge KAT: 135 bytes mod 136 (@rate) leaves gap == 1 ⇒ the single
 # 0x81-byte padding branch (pad/1's `1 -> data <> <<0x81>>` clause), which
 # none of the vectors above exercise ("" and "abc" gap != 1; 200 bytes is

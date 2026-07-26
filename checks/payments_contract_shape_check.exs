@@ -84,6 +84,14 @@ action_messages = %{
   "health" => %{"action" => "health"},
   "tick" => %{"action" => "tick"},
   "deposit_address" => %{"action" => "deposit_address", "beneficiary" => "budget:shape"},
+  "issue_authorization" => %{
+    "action" => "issue_authorization",
+    "nonce" => "0x" <> String.duplicate("ab", 32),
+    "order_ref" => "shape-order-1",
+    "beneficiary" => "budget:shape",
+    "amount_usd" => "10",
+    "valid_before" => 9_999_999_999
+  },
   "payment_status" => %{"action" => "payment_status", "beneficiary" => "budget:shape"},
   "settlements_since" => %{"action" => "settlements_since"},
   "reconcile" => %{"action" => "reconcile"},

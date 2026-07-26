@@ -19,12 +19,20 @@ expected = [
   # quarantined row back into creditable money, and the quarantined read is the
   # operator's held-money queue.
   release_quarantined_payment: 2,
-  list_quarantined_payments: 3
+  list_quarantined_payments: 3,
+  # Entry A (Task 5): the hub owns the issued-authorization registry end to
+  # end (issuance, lookup, the live-nonce filter, consumption) plus the
+  # unrecognised-inflow audit trail the §4.4 credit rule writes to.
+  record_issued_authorization: 1,
+  issued_authorization: 1,
+  live_authorization_nonces: 1,
+  mark_authorization_consumed: 1,
+  record_unrecognised_inflow: 1
 ]
 
 Check.check(
   f,
-  "Store behaviour declares all 12 callbacks",
+  "Store behaviour declares all 17 callbacks",
   Enum.all?(expected, &(&1 in callbacks))
 )
 

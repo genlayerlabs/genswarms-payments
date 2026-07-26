@@ -219,6 +219,113 @@ defmodule Genswarms.Payments.Store do
               limit :: pos_integer()
             ) :: {:ok, [map()]} | {:error, term()}
 
+  @doc """
+  Persist one issued authorization: `%{nonce_hex, order_ref, beneficiary,
+  amount_usd, namespace, valid_before, issued_at}`.
+
+  Identity is the ORDER_REF, not the nonce: the hub's `issue_authorization`
+  action is idempotent by `order_ref`, so a replay of the same issuance
+  request must return the SAME row rather than mint a second one.
+
+  - `:ok` — a fresh row was written.
+  - `{:ok, :duplicate}` — `order_ref` was already recorded; nothing new
+    happened. The hub still answers success and echoes the row's own fields
+    back to the caller, exactly as if this were the first call — that is what
+    makes issuance idempotent from the caller's point of view.
+  - `{:error, term()}` — the hub refuses the action and reports
+    `store_unavailable`; it never fabricates success it cannot prove.
+
+  The `namespace` field is SEALED by the hub before this callback is ever
+  invoked — whatever namespace the caller's message carried (if any) never
+  reaches here. A store that enforces uniqueness on `order_ref` scoped to
+  `namespace` is correct; a process-global uniqueness constraint is equally
+  fine, since one hub process serves exactly one namespace.
+  """
+  @callback record_issued_authorization(row :: map()) ::
+              :ok | {:ok, :duplicate} | {:error, term()}
+
+  @doc """
+  Look up an issued authorization by its nonce, keyed EXACTLY like the
+  `AuthorizationUsed` log's indexed `nonce` topic (lowercase hex, `"0x"` plus
+  64 hex characters) — both the USDC watcher and `issue_authorization` itself
+  normalize to that form before this callback is ever called or queried.
+
+  `nil` answers "this hub never issued this nonce" and is the single most
+  safety-critical answer this store gives: it is what makes the credit rule
+  refuse a stranger's Transfer into the treasury wallet — including a
+  same-wallet inflow from a DIFFERENT domain's own on-chain authorization
+  (e.g. a future deposit-sweep collection correlating to the same treasury
+  address) — exactly as firmly as an unbound deposit address refuses to
+  settle. There is no error-tuple return: a store that cannot answer this
+  query MUST behave as if every nonce is unrecognised. This callback would
+  rather under-credit (held as unrecognised, an operator reissues by hand)
+  than ever fabricate a beneficiary from a lookup it cannot actually perform.
+
+  The returned row carries at least `beneficiary` (and, for audit purposes,
+  the `namespace` it was originally sealed under) — the hub always stamps the
+  SETTLEMENT it credits with its OWN current namespace, never this row's, so
+  a row surviving a namespace rename is only ever an audit curiosity, never a
+  re-namespacing risk.
+  """
+  @callback issued_authorization(nonce_hex :: String.t()) :: map() | nil
+
+  @doc """
+  Every nonce this hub has issued that is still UNCONSUMED and not yet past
+  its `valid_before` (compared against `now`, a unix timestamp — the same
+  clock `DateTime.to_unix(now_fn.())` produces).
+
+  This is the `topics[2]` filter for the watcher's second `eth_getLogs` query
+  (`AuthorizationUsed`), so its SIZE is the RPC filter's size. **Bounded by
+  construction**: every issued authorization expires (the plan's window is 1
+  hour), so this set cannot grow without bound even if
+  `mark_authorization_consumed/1` failed on every single call ever made —
+  expiry alone eventually retires every nonce from this list, independent of
+  whether consumption was ever recorded.
+
+  `{:error, term()}` FAILS the whole chain's scan round for this tick, fail
+  closed exactly like `get_last_scanned_block/1` erroring (cursor unmoved,
+  retried next tick): a store that cannot say which nonces are live must
+  never let the watcher silently ask for none (that would quietly stop
+  crediting the entire authorization lane while looking healthy) nor for
+  every nonce ever issued (that would defeat the bound this callback exists
+  to provide).
+  """
+  @callback live_authorization_nonces(now :: integer()) :: [String.t()] | {:error, term()}
+
+  @doc """
+  Retire a nonce from `live_authorization_nonces/1` once the hub has observed
+  its `AuthorizationUsed` log on chain.
+
+  Called as soon as that on-chain correlation is made — INDEPENDENTLY of
+  whether the linked Transfer goes on to settle or is quarantined by this
+  hub's own caps. The nonce is consumed on-chain the moment the token
+  contract fires the event; the hub's cap policy is a separate decision made
+  afterward and must not gate this call.
+
+  A failure here is logged and NOT fail-closed: the worst case is the nonce
+  stays in the live filter and gets asked about again next tick until it
+  naturally expires (see the bound above) — the linked settlement is already
+  deduped by its own `idempotency_key`, so re-observing the same
+  `AuthorizationUsed` log on a later tick never double-credits.
+  """
+  @callback mark_authorization_consumed(nonce_hex :: String.t()) :: :ok | {:error, term()}
+
+  @doc """
+  Record a Transfer into the treasury wallet that the credit rule refused to
+  credit — either it carried no correlated `AuthorizationUsed` nonce at all,
+  or its nonce was never found by `issued_authorization/1` (a different
+  domain's on-chain authorization landed in the same wallet — the exact
+  double-credit shape spec §4.4 warns about, e.g. a future deposit-sweep
+  collection correlating to this same treasury address).
+
+  Never blocks the scan: a write failure here is logged, but the chain's
+  cursor still advances normally, because nothing in this row was ever
+  creditable to begin with — losing the audit row is a visibility gap, not a
+  money bug. The operator still sees the row's characterizing metric
+  (`payments_unrecognised_inflow`) either way.
+  """
+  @callback record_unrecognised_inflow(row :: map()) :: :ok | {:error, term()}
+
   @optional_callbacks put_address_binding: 1,
                       release_quarantined_payment: 2,
                       list_quarantined_payments: 3,
@@ -230,5 +337,10 @@ defmodule Genswarms.Payments.Store do
                       put_last_scanned_block: 2,
                       list_payments: 1,
                       list_settlements_since: 2,
-                      issuance_totals_since: 3
+                      issuance_totals_since: 3,
+                      record_issued_authorization: 1,
+                      issued_authorization: 1,
+                      live_authorization_nonces: 1,
+                      mark_authorization_consumed: 1,
+                      record_unrecognised_inflow: 1
 end
