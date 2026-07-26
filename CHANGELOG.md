@@ -2,6 +2,14 @@
 
 ## 0.2.0 — Unreleased
 
+- Documented **key custody** in the usage guide: the seed never touches the
+  host, only the xpub is configured, `allow_test_xpub` is a local-rig opt-in
+  and never production, physical seed backup, who-may-sign decided in advance,
+  and how to collect deposit-address balances by signing EIP-3009
+  authorizations offline while a gas-only relayer submits them. Also states
+  plainly what a compromised host does and does not cost you (addresses and
+  balances exposed; nothing spendable) and that this guarantee is void if an
+  xprv or seed is ever placed near the host.
 - Added the authorization lane (entry A): a new `treasury_address` per chain
   and the hub action `issue_authorization` (trusted-source gated, like
   `deposit_address`) that owns the issued-authorization registry end to end.

@@ -140,6 +140,75 @@ between "a signed authorization" and "a credited payment":
   issued-authorization row except through `issue_authorization`, and never
   credits a treasury inflow except through the rule above.
 
+## Key custody — the seed never touches the host
+
+This object is **watch-only by construction**: it holds an xpub, so it can
+derive deposit addresses and read balances, and it cannot sign anything. That
+property is the whole security model of the deposit lane, and it is worth
+exactly as much as the discipline around the seed the xpub came from.
+
+**The split.** One seed produces two things. The **private keys** sign — they
+move money. The **xpub** derives addresses and watches — it cannot. Only the
+xpub is ever configured here. Everything below exists to keep it that way.
+
+**Before mainnet — a checklist, in order:**
+
+1. **Generate the seed offline**: a hardware wallet, or a machine with no
+   network. Not on the host, not on a laptop that will later hold the host's
+   credentials.
+2. **The seed never touches the host.** Not in the object config, not in an
+   environment variable, not in a file on the box, not typed into a terminal
+   session on it. If it has been on the host once, treat it as compromised and
+   start again — this is cheap before deposits exist and impossible after.
+3. **Export only the xpub** and pass it as `xpub`. That is the sole key
+   material this object should ever see.
+4. **`allow_test_xpub` must be absent in production.** The denylist exists
+   because the well-known test seeds' key material is derivable by anyone, and
+   is matched on the decoded key, not the string — a re-encoded serialization
+   of the same key is still refused. The flag is an opt-in for local rigs and
+   nothing else.
+5. **Back the seed up physically**, in two or more separate locations. Losing
+   it makes every deposit ever made to a derived address permanently
+   unrecoverable. There is no recovery path on a public chain, and this object
+   cannot help — it never had the key.
+6. **Decide who may sign, before you need to.** A single holder with a single
+   device is a single point of failure in both directions: they can move
+   everything alone, and if they lose the device (or are unavailable) nobody
+   can move anything. Multisig or split custody is the ordinary answer for
+   funds that belong to an organisation rather than a person.
+
+**Collecting deposits without bringing the seed online.** Derived deposit
+addresses accumulate tokens and hold no native gas, so a naive sweep would
+require funding each one. The workable shape keeps the seed offline
+throughout:
+
+- the host measures which addresses hold a balance (`sweep_report` reports;
+  it never moves funds — see the D4 note below);
+- the seed holder signs an EIP-3009 `transferWithAuthorization` per address,
+  **offline**, moving the balance to the treasury;
+- a relayer submits those signatures and pays the gas. The relayer is a
+  separate key that holds only gas: it cannot alter the destination (it is
+  inside the signed payload) and cannot touch user funds.
+
+Automating that sweep is a deliberate decision, not a default — it is the one
+component that needs signing authority, and it is the only place where a
+mistake spends money rather than mis-accounting it. Measure first; automate
+when the stranded volume justifies the added surface.
+
+**What a compromised host costs you, stated plainly.** With only the xpub
+present, an attacker who owns the box learns every derived address and every
+balance — a real privacy loss, permanent and unfixable by rotation, since the
+chain code inside an xpub enumerates the whole tree. What they **cannot** do
+is spend a single unit. That guarantee holds only while no xprv and no seed
+has ever been near the host; it is void the moment one is.
+
+**A note on which lane you run.** Deposits routed through the authorization
+lane (entry A) land in the treasury directly and leave nothing to sweep. The
+deposit-address lane exists for payers who can only send to an address (an
+exchange withdrawal, typically) and cannot sign — those balances are what the
+procedure above collects. The more traffic entry A carries, the rarer the
+offline-signing ritual becomes.
+
 ## Gotchas
 
 - **"address not credited"** — check, in order: is the chain in `chains` at
