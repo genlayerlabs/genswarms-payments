@@ -10,7 +10,7 @@ defmodule Genswarms.Payments.Store do
   explicit `allow_ephemeral: true` boot opt-out.
 
   The authorization lane has its OWN instance of that same gate: a chain with
-  `treasury_address` configured requires a store exporting all five
+  `treasury_address` configured requires a store exporting all six
   authorization callbacks below, behind the same explicit opt-out. A hub that
   answers `issue_authorization` with `ok: true` and cannot register the nonce
   acknowledges money it can never credit — every treasury Transfer it later
@@ -365,11 +365,45 @@ defmodule Genswarms.Payments.Store do
 
   A failure here is logged and NOT fail-closed: the worst case is the nonce
   stays in the live filter and gets asked about again next tick until it
-  naturally expires (see the bound above) — the linked settlement is already
-  deduped by its own `idempotency_key`, so re-observing the same
-  `AuthorizationUsed` log on a later tick never double-credits.
+  naturally expires (see the bound above). Note what this failure does NOT
+  rely on for safety: `idempotency_key` dedup only prevents *re-observing the
+  same* `AuthorizationUsed` log twice (same `tx_hash`) — it does nothing for a
+  genuine SECOND on-chain use of this nonce arriving in a DIFFERENT
+  transaction, which is exactly the shape a failed call here leaves open. The
+  actual guard against that is `authorization_settled?/1` below: the credit
+  rule refuses any nonce that already has a SETTLED settlement on record,
+  independent of whether this callback ever succeeded.
   """
   @callback mark_authorization_consumed(nonce_hex :: String.t()) :: :ok | {:error, term()}
+
+  @doc """
+  Has a settlement with status `"settled"` already been recorded for this
+  nonce?
+
+  This is the guard that makes one-credit-per-nonce a HUB-STATE fact rather
+  than a borrowed assumption about the token contract. `mark_authorization_consumed/1`
+  is best-effort (see its doc above): if it fails on a settled row, the nonce
+  stays in `live_authorization_nonces/1` and a genuinely later
+  `AuthorizationUsed` reusing the same nonce — a different `tx_hash`, so a
+  different `idempotency_key`, so untouched by ordinary settlement dedup —
+  would otherwise correlate and credit a second time. `issued_authorization/1`
+  is not gated on consumption either, so without this callback the second
+  Transfer would resolve the SAME issued row and credit again.
+
+  Answer `true` ONLY for a durably `"settled"` row. A `"quarantined"` row
+  never credited in the first place (see `settle/2`'s doc — quarantine is
+  "durable and resolved, but never credited"), so it must NOT count here: the
+  whole point is to refuse a SECOND credit, not to refuse crediting something
+  that was never credited once. A row later released from quarantine goes
+  through the ordinary settlement path (and its own `idempotency_key` dedup),
+  independent of this callback.
+
+  `{:error, term()}` FAILS the settlement closed exactly like
+  `issued_authorization/1` raising: the hub cannot tell "never settled" from
+  "store fault" and holds rather than guessing either way.
+  """
+  @callback authorization_settled?(nonce_hex :: String.t()) ::
+              {:ok, boolean()} | {:error, term()}
 
   @doc """
   Record a Transfer into the treasury wallet that the credit rule refused to
@@ -391,6 +425,14 @@ defmodule Genswarms.Payments.Store do
   - `issued_row_unusable` — the nonce resolved, but the stored row could not
     supply a usable `beneficiary` or `amount_usd`. A store defect, held rather
     than credited to `nil` or to an unbounded amount.
+  - `authorization_already_settled` — the nonce resolved to a real issued row,
+    but `authorization_settled?/1` says a `"settled"` settlement already
+    exists for it. A genuinely SECOND on-chain use of the same nonce (see that
+    callback's doc): a different `tx_hash` means a different `idempotency_key`,
+    so ordinary settlement dedup does not catch it — this is the only wall
+    that does. THIS ROW IS AN OPERATOR SIGNAL: it means either
+    `mark_authorization_consumed/1` failed earlier, or something replayed a
+    spent nonce.
 
   Never blocks the scan: a write failure here is logged, but the chain's
   cursor still advances normally, because nothing in this row was ever
@@ -416,5 +458,6 @@ defmodule Genswarms.Payments.Store do
                       issued_authorization: 1,
                       live_authorization_nonces: 1,
                       mark_authorization_consumed: 1,
+                      authorization_settled?: 1,
                       record_unrecognised_inflow: 1
 end

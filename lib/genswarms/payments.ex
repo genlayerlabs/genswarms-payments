@@ -408,16 +408,22 @@ defmodule Genswarms.Payments do
     end
   end
 
-  # The authorization lane's five callbacks, as ONE unit. Unlike
+  # The authorization lane's six callbacks, as ONE unit. Unlike
   # validate_store_coherence!/1 (which asks "is this store internally
   # consistent?"), this gate asks "can this hub actually do what it is
   # configured to do?" — the same question validate_durable_settlement_store!/3
   # asks about the settlement ledger, and it has the same answer shape.
+  # (N1) `authorization_settled?/1` belongs in this group for the same reason
+  # the other five do: a store that can register and look up a nonce but
+  # cannot answer "was this nonce already settled?" leaves the one-credit-
+  # per-nonce guarantee resting on `mark_authorization_consumed/1` never
+  # failing, which it is explicitly documented NOT to guarantee.
   @authorization_callbacks [
     {:record_issued_authorization, 1},
     {:issued_authorization, 1},
     {:live_authorization_nonces, 1},
     {:mark_authorization_consumed, 1},
+    {:authorization_settled?, 1},
     {:record_unrecognised_inflow, 1}
   ]
 
@@ -455,7 +461,7 @@ defmodule Genswarms.Payments do
       names = Enum.map_join(missing, ", ", fn {fun, arity} -> "#{fun}/#{arity}" end)
 
       raise ArgumentError,
-            "payments: a chain configures treasury_address, which turns ON the authorization lane, but the store does not export #{names} — every treasury Transfer would land unrecognised (issue_authorization itself still refuses per-action regardless); configure a store implementing all five authorization callbacks, or set allow_ephemeral: true explicitly"
+            "payments: a chain configures treasury_address, which turns ON the authorization lane, but the store does not export #{names} — every treasury Transfer would land unrecognised (issue_authorization itself still refuses per-action regardless); configure a store implementing all six authorization callbacks, or set allow_ephemeral: true explicitly"
     end
 
     :ok
@@ -918,11 +924,12 @@ defmodule Genswarms.Payments do
 
   defp dispatch_settlement(s, state), do: settle_one(s, state)
 
-  # (F2) A store FAULT on the issuance lookup is not the same fact as "this
-  # hub never issued it" — the latter is safely `:ignore` (recorded
-  # unrecognised, cursor free to advance past routine noise); the former must
-  # not be recorded as anything, because the nonce this store cannot currently
-  # answer for might turn out to be exactly the one that matches. HELD exactly
+  # (F2, N1) A store FAULT on either the issuance lookup OR the nonce-settled
+  # lookup is not the same fact as "this hub never issued it" / "never settled
+  # it" — both are safely `:ignore` (recorded unrecognised, cursor free to
+  # advance past routine noise); a FAULT must not be recorded as anything,
+  # because the nonce this store cannot currently answer for might turn out to
+  # be exactly the one that matches, or might already be settled. HELD exactly
   # like a dedup-read blip in settle_one/2: `state` is returned untouched, so
   # the key is never added to `seen_keys` (apply_chain_result/2's `held?`
   # check keeps the WHOLE chain's cursor put), nothing is written to the
@@ -931,7 +938,7 @@ defmodule Genswarms.Payments do
   # lossless once the store recovers.
   defp hold_authorization_lookup(%{idempotency_key: key}, state, reason) do
     Logger.error(
-      "payments: issued_authorization lookup unavailable for #{key} (#{reason_text(reason)}) — FAIL CLOSED, holding rather than recording it unrecognised"
+      "payments: authorization lookup unavailable for #{key} (#{reason_text(reason)}) — FAIL CLOSED, holding rather than recording it unrecognised"
     )
 
     emit_metric(state, "payments_hold", %{
@@ -984,7 +991,26 @@ defmodule Genswarms.Payments do
           {:hold, :authorization_lookup_unavailable}
 
         [{nonce_hex, issued}] ->
-          authorized_credit(nonce_hex, issued)
+          # (N1) The nonce resolved to a row this hub issued — but that alone
+          # is not proof this credit hasn't already happened. Consumption
+          # marking is best-effort (Store.mark_authorization_consumed/1's
+          # doc): if it failed on an EARLIER settled Transfer, this same nonce
+          # is still live, and a genuinely later on-chain use of it (a
+          # DIFFERENT tx_hash, hence a different idempotency_key — ordinary
+          # settlement dedup never sees it) would resolve this SAME issued row
+          # and credit a second time. `authorization_settled?/1` is the
+          # nonce-level guard that closes that gap independent of whether
+          # consumption was ever marked.
+          case nonce_settled_lookup(nonce_hex, state) do
+            {:ok, true} ->
+              {:ignore, :authorization_already_settled}
+
+            {:ok, false} ->
+              authorized_credit(nonce_hex, issued)
+
+            :unavailable ->
+              {:hold, :authorization_settlement_lookup_unavailable}
+          end
 
         [] ->
           {:ignore, :not_issued}
@@ -1148,13 +1174,49 @@ defmodule Genswarms.Payments do
     end
   end
 
+  # (N1) NOT-EXPORTED answers `{:ok, false}` — same stance as
+  # `issued_authorization_lookup/2`'s nil default: a store that never learned
+  # this callback cannot assert "already settled" any more than an unexported
+  # `issued_authorization/1` could assert "issued". EXPORTED-BUT-RAISED holds
+  # rather than guessing either way (mirrors that same function's
+  # `:unavailable`): crediting on an unanswerable "was this already settled?"
+  # risks the exact double-credit this callback exists to prevent, and
+  # refusing it outright risks under-crediting a nonce that was never settled
+  # at all.
+  defp nonce_settled_lookup(nonce_hex, state) do
+    mod = state.store_mod
+
+    if exported?(mod, :authorization_settled?, 1) do
+      try do
+        case apply(mod, :authorization_settled?, [nonce_hex]) do
+          {:ok, bool} when is_boolean(bool) -> {:ok, bool}
+          {:error, _why} -> :unavailable
+          _other -> :unavailable
+        end
+      catch
+        kind, reason ->
+          Logger.error(
+            "payments: authorization_settled? #{kind}-ed for #{nonce_hex} (#{inspect(reason)}) — cannot tell 'never settled' from 'store fault'; holding rather than crediting or discarding"
+          )
+
+          :unavailable
+      end
+    else
+      {:ok, false}
+    end
+  end
+
   # Retires the nonce from the watcher's live filter once the linked
   # settlement is durably resolved — independent of whether the caps settled
   # or quarantined it (see Store.mark_authorization_consumed/1's doc; the
   # nonce is spent ON CHAIN either way, and this hub's cap policy is a
-  # separate decision made afterwards). Best-effort: a failure here cannot
-  # double-credit (the settlement dedups on its own idempotency_key
-  # regardless), so it is logged rather than held.
+  # separate decision made afterwards). Best-effort: a failure here does NOT
+  # by itself double-credit — the STANDING guard against that is
+  # `authorization_settled?/1` (checked on every future correlation to this
+  # nonce, in `authorization_disposition/2`), not this call succeeding. Logged
+  # rather than held, because holding an already-durably-resolved settlement
+  # on this call's failure would gain nothing: the money is already
+  # accounted for either way.
   defp mark_nonce_consumed(nonce_hex, state) do
     case store_write(state.store_mod, :mark_authorization_consumed, [nonce_hex]) do
       :ok ->
@@ -1162,7 +1224,7 @@ defmodule Genswarms.Payments do
 
       {:error, why} ->
         Logger.error(
-          "payments: mark_authorization_consumed failed for #{nonce_hex} (#{inspect(why)}) — nonce stays in the live filter until it expires; no double-credit risk"
+          "payments: mark_authorization_consumed failed for #{nonce_hex} (#{inspect(why)}) — nonce stays in the live filter until it expires; a later genuine reuse of it is now caught by authorization_settled?/1, not by this marker"
         )
     end
   end

@@ -24,9 +24,12 @@ defmodule AuthStore do
       issued_by_ref: %{},
       issued_by_nonce: %{},
       consumed: MapSet.new(),
+      settled_nonces: MapSet.new(),
       unrecognised: [],
       fail_record: false,
-      fail_lookup: false
+      fail_lookup: false,
+      fail_consume: false,
+      fail_settled_lookup: false
     })
   end
 
@@ -54,6 +57,15 @@ defmodule AuthStore do
     else
       put(:seen, MapSet.put(d().seen, row.idempotency_key))
       put(:rows, [row | d().rows])
+
+      # N1: track SETTLED nonces independently of `consumed` — this is what
+      # lets the fake reproduce mark_authorization_consumed failing on a
+      # settled row (nonce stays live+unconsumed) while still knowing the
+      # nonce was, in fact, already credited once.
+      if row.status == "settled" and is_binary(Map.get(row, :nonce_hex)) do
+        put(:settled_nonces, MapSet.put(d().settled_nonces, row.nonce_hex))
+      end
+
       :ok
     end
   end
@@ -106,12 +118,37 @@ defmodule AuthStore do
     |> Enum.map(fn {nonce, _row} -> nonce end)
   end
 
+  # N1: switchable so the documented best-effort/logged failure path can be
+  # driven through a real poll/1 round instead of being reasoned about.
+  def fail_consume(flag), do: put(:fail_consume, flag)
+
   def mark_authorization_consumed(nonce_hex) do
-    put(:consumed, MapSet.put(d().consumed, nonce_hex))
-    :ok
+    if d().fail_consume do
+      {:error, :db_down}
+    else
+      put(:consumed, MapSet.put(d().consumed, nonce_hex))
+      :ok
+    end
   end
 
   def consumed?(nonce_hex), do: MapSet.member?(d().consumed, nonce_hex)
+
+  # N1: has a SETTLED settlement already been recorded for this nonce? This
+  # is the nonce-level guard the credit rule checks BEFORE crediting — the
+  # only wall standing between a genuinely later on-chain reuse of the same
+  # nonce (different tx_hash, so a different idempotency_key that ordinary
+  # settlement dedup never catches) and a second credit.
+  def fail_settled_lookup(flag), do: put(:fail_settled_lookup, flag)
+
+  def authorization_settled?(nonce_hex) do
+    if d().fail_settled_lookup do
+      raise "settled lookup is down"
+    else
+      {:ok, MapSet.member?(d().settled_nonces, nonce_hex)}
+    end
+  end
+
+  def settled?(nonce_hex), do: MapSet.member?(d().settled_nonces, nonce_hex)
 
   def record_unrecognised_inflow(row) do
     put(:unrecognised, [row | d().unrecognised])
@@ -1464,5 +1501,148 @@ Check.check(
   "M1. nothing was written for the refused attempt (a repeat with the SAME order_ref is refused identically, not treated as a duplicate)",
   Jason.decode!(json_m1_again) == reply_m1
 )
+
+# ─────────────────────────────────────────────────────────────────────────
+# Fix wave — N1 (re-review): the one-credit-per-nonce guarantee must be a
+# HUB-STATE fact, not something borrowed from mark_authorization_consumed/1
+# never failing. `idempotency_key` dedup only ever catches re-observing the
+# SAME on-chain log twice; it does nothing for a genuinely SECOND on-chain
+# use of the same nonce arriving in a DIFFERENT transaction (a different
+# tx_hash ⇒ a different idempotency_key). `authorization_settled?/1` is the
+# nonce-level guard that closes that gap independent of whether consumption
+# was ever marked.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── N1: double-use of a settled nonce is refused, not double-credited ────
+AuthStore.reset()
+n1_state = Payments.init!(scan_config)
+nonce_n1 = "0x" <> String.duplicate("99", 32)
+n1_state = issue_for.(n1_state, nonce_n1, "order-n1", "user:n1", "30", now_unix + 3600)
+
+# mark_authorization_consumed's documented best-effort path: it fails on the
+# very Transfer that settles, so the nonce stays live and unconsumed even
+# though it was, in fact, already credited once.
+AuthStore.fail_consume(true)
+
+n1_state =
+  %{
+    n1_state
+    | rpc_fn:
+        mk_rpc.(
+          [mk_transfer_log.(treasury, alice, 10, "0xTXN1", 0, 30_000_000)],
+          [mk_auth_log.(alice, nonce_n1, 10, "0xTXN1", 1)],
+          100
+        )
+  }
+  |> Payments.poll()
+
+Check.check(
+  f,
+  "N1. the first Transfer settles despite the consume-marking failure",
+  length(AuthStore.rows()) == 1
+)
+
+Check.check(
+  f,
+  "N1. the consume failure leaves the nonce LIVE and unconsumed (the documented best-effort path)",
+  not AuthStore.consumed?(nonce_n1) and nonce_n1 in AuthStore.live_authorization_nonces(now_unix)
+)
+
+# A SECOND, genuinely different on-chain use of the SAME nonce, in a
+# DIFFERENT transaction. Its idempotency_key ("8453:0xTXN2:0") is unrelated
+# to the first settlement's ("8453:0xTXN1:0"), so ordinary settlement dedup
+# does not see it, and issued_authorization/1 still returns the row — only
+# the nonce-level SETTLED check can refuse this.
+n1_state =
+  %{
+    n1_state
+    | rpc_fn:
+        mk_rpc.(
+          [mk_transfer_log.(treasury, alice, 210, "0xTXN2", 0, 30_000_000)],
+          [mk_auth_log.(alice, nonce_n1, 210, "0xTXN2", 1)],
+          300
+        )
+  }
+  |> Payments.poll()
+
+Check.check(
+  f,
+  "N1. the second Transfer on the SAME nonce (different tx_hash) is NOT credited",
+  row_for.("8453:0xTXN2:0") == nil
+)
+
+Check.check(
+  f,
+  "N1. it is recorded unrecognised with reason authorization_already_settled",
+  Enum.any?(
+    AuthStore.unrecognised(),
+    &(&1.tx_hash == "0xTXN2" and &1.reason == "authorization_already_settled")
+  )
+)
+
+Check.check(
+  f,
+  "N1. total credited across BOTH Transfers is the FIRST amount only (30, not 60)",
+  AuthStore.rows()
+  |> Enum.reduce(Decimal.new(0), &Decimal.add(&2, &1.amount_usd))
+  |> Decimal.equal?(Decimal.new("30"))
+)
+
+AuthStore.fail_consume(false)
+_ = n1_state
+
+# ── N1 store-fault: authorization_settled? raising HOLDS, never guesses ───
+#
+# Neither "already settled" nor "never settled" is a safe answer to
+# fabricate when the store cannot actually say — the former risks refusing a
+# nonce that was never credited, the latter risks the exact double-credit
+# this callback exists to prevent.
+AuthStore.reset()
+n1f_state = Payments.init!(scan_config)
+nonce_n1f = "0x" <> String.duplicate("88", 32)
+n1f_state = issue_for.(n1f_state, nonce_n1f, "order-n1f", "user:n1f", "20", now_unix + 3600)
+
+n1f_logs = {
+  [mk_transfer_log.(treasury, alice, 10, "0xTXN1F", 0, 20_000_000)],
+  [mk_auth_log.(alice, nonce_n1f, 10, "0xTXN1F", 1)]
+}
+
+AuthStore.fail_settled_lookup(true)
+
+n1f_state =
+  %{n1f_state | rpc_fn: mk_rpc.(elem(n1f_logs, 0), elem(n1f_logs, 1), 100)}
+  |> Payments.poll()
+
+Check.check(
+  f,
+  "N1. a RAISING authorization_settled? HOLDS (nothing settled, nothing buried)",
+  AuthStore.rows() == [] and AuthStore.unrecognised() == []
+)
+
+Check.check(f, "N1. the chain's cursor did not advance past it", AuthStore.cursor("base") == nil)
+
+Check.check(
+  f,
+  "N1. the nonce stays live so the retry can still correlate",
+  not AuthStore.consumed?(nonce_n1f) and
+    nonce_n1f in AuthStore.live_authorization_nonces(now_unix)
+)
+
+AuthStore.fail_settled_lookup(false)
+
+n1f_state =
+  %{n1f_state | rpc_fn: mk_rpc.(elem(n1f_logs, 0), elem(n1f_logs, 1), 100)}
+  |> Payments.poll()
+
+n1f_row = row_for.("8453:0xTXN1F:0")
+
+Check.check(
+  f,
+  "N1. once the store recovers, the SAME money credits on the next round",
+  n1f_row != nil and n1f_row.beneficiary == "user:n1f" and
+    Decimal.equal?(n1f_row.amount_usd, Decimal.new("20"))
+)
+
+_ = n1f_state
 
 Check.finish(f)

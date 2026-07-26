@@ -27,12 +27,15 @@ expected = [
   issued_authorization: 1,
   live_authorization_nonces: 1,
   mark_authorization_consumed: 1,
+  # N1 (re-review fix wave): one-credit-per-nonce as a hub-state fact, not an
+  # assumption borrowed from mark_authorization_consumed/1 never failing.
+  authorization_settled?: 1,
   record_unrecognised_inflow: 1
 ]
 
 Check.check(
   f,
-  "Store behaviour declares all 17 callbacks",
+  "Store behaviour declares all 18 callbacks",
   Enum.all?(expected, &(&1 in callbacks))
 )
 
