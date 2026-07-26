@@ -85,23 +85,46 @@ between "a signed authorization" and "a credited payment":
   refuses anything it cannot look up, so that money is recorded
   `unrecognised`, not credited, and needs a manual operator reissue/release
   to fix. Issue first, always.
-- `store_mod` needs 5 more optional callbacks for this lane to do anything:
-  `record_issued_authorization/1`, `issued_authorization/1`,
-  `live_authorization_nonces/1`, `mark_authorization_consumed/1`,
-  `record_unrecognised_inflow/1`. Like every other callback group in this
-  package, a store implementing only PART of the issuance round trip
-  (`record_issued_authorization` + `issued_authorization`) or the nonce-filter
-  round trip (`live_authorization_nonces` + `mark_authorization_consumed`)
-  is refused at `init/1` — worse than implementing neither.
+- `store_mod` needs 5 more optional callbacks, and with a `treasury_address`
+  configured they are REQUIRED to boot: `record_issued_authorization/1`,
+  `issued_authorization/1`, `live_authorization_nonces/1`,
+  `mark_authorization_consumed/1`, `record_unrecognised_inflow/1`. A store
+  missing any of them raises at `init/1` unless you pass the explicit
+  `allow_ephemeral: true` opt-out — same stance, and the same opt-out, as the
+  durable-settlement-ledger gate, and for the same reason: a hub that answers
+  `issue_authorization` with `ok: true` but cannot register the nonce
+  acknowledges money it can never credit (the user signs, the money moves,
+  and every payment lands `unrecognised`). Partial coverage of either round
+  trip is refused too, like every other callback group in this package.
+- `record_issued_authorization/1`'s duplicate answer must carry the row:
+  `{:ok, :duplicate, stored_row}`. The hub echoes THAT row back, so a caller
+  that timed out and retried the same `order_ref` with a freshly minted nonce
+  gets the nonce actually on record, not its own. A bare `{:ok, :duplicate}`
+  is treated as a store defect and the action is refused (`store_unavailable`)
+  — the hub has no `order_ref` lookup to read the row back with.
+- `valid_before` is bounded by the hub: absent, non-integer, already past, or
+  further out than `max_authorization_window_seconds` (default 3600) is
+  refused. That bound is what keeps `live_authorization_nonces/1` — and
+  therefore the second `getLogs` filter — bounded by construction. Your
+  store's implementation MUST drop expired nonces for the other half of it.
 - **The credit rule (spec §4.4), the one line in this whole package money
-  literally depends on**: a treasury `Transfer` settles ONLY when it
-  correlates (by `tx_hash`) to an `AuthorizationUsed` log whose nonce this
-  hub's own `issued_authorization/1` can resolve. No correlation, or a
-  nonce this hub never issued, is recorded as an unrecognised inflow
-  (`payments_unrecognised_inflow`) and never credited. Without this rule a
-  future deposit-sweep collection landing in the SAME treasury wallet would
-  read as a user payment and get credited a second time for money already
-  credited once.
+  literally depends on**: a treasury `Transfer` settles ONLY when, in the SAME
+  transaction, there is EXACTLY ONE `AuthorizationUsed` log whose `authorizer`
+  is that Transfer's `from` AND whose nonce this hub's own
+  `issued_authorization/1` can resolve. The beneficiary comes from the ISSUED
+  ROW (keyed by nonce) and the credited amount is capped at that row's
+  `amount_usd`. Anything else — no correlation, a nonce this hub never issued,
+  an authorizer that is not the sender, or an ambiguous match — is recorded as
+  an unrecognised inflow (`payments_unrecognised_inflow`, with a `reason`) and
+  never credited. Correlating on `tx_hash` alone is NOT sufficient and is a
+  credit-theft vector: anyone may submit an EIP-3009 authorization, so a
+  batched transaction can carry several, and their order in the log list is
+  attacker-controlled. Without this rule a future deposit-sweep collection
+  landing in the SAME treasury wallet would also read as a user payment and
+  get credited a second time for money already credited once.
+- The `treasury_address` must NEVER appear in `bindings`. The hub refuses to
+  boot if a loaded binding's address equals it: a watched binding resolves one
+  beneficiary for the whole wallet and skips the credit rule entirely.
 - The host implements storage only — issuance, lookup, the nonce filter,
   and consumption marking are all `Store` callbacks with host-owned schema,
   exactly like bindings and settlements. This object never writes an
@@ -155,13 +178,24 @@ between "a signed authorization" and "a credited payment":
   `{"ok": false, "error": "no_push_methods"}`. Adding a push method means
   implementing `Method.ingest_event/2` with its OWN signature verification —
   the core trusts whatever settlements a method hands back.
-- **`issue_authorization` without a store implementing `issued_authorization/1`
-  is memory-only and functionally inert for crediting**: `issue_authorization`
-  still answers `ok: true` (dev/memory mode, same stance as every other write
-  in this package), but nothing written that way can ever be looked back up
-  by the credit rule, so every treasury inflow correlating to it is recorded
-  `unrecognised` instead of settled. Configure a durable store for this lane
-  before relying on it for real money.
+- **`issue_authorization` without a store to register the nonce is REFUSED,
+  not acked.** A hub whose store cannot record the issuance answers
+  `{"ok": false, "error": "store_unavailable"}`, and a chain with a
+  `treasury_address` whose store is missing any of the five authorization
+  callbacks does not boot at all. Both were previously `ok: true` + silence,
+  which is the worst possible shape: the user signs, the money moves on
+  chain, and every payment lands `unrecognised`. If you genuinely want the
+  memory-mode behaviour for a dev swarm, pass `allow_ephemeral: true` —
+  explicitly, exactly like the settlement ledger's opt-out.
+- **`payments_unrecognised_inflow` with `reason: "ambiguous_correlation"` is
+  not routine noise** — it means real money landed in the treasury that the
+  hub refused to attribute because the transaction was undecidable (two
+  authorizations for the same sender, or two treasury Transfers from one
+  sender). Nothing was credited and nothing was lost; an operator decides.
+  Likewise `payments_authorization_overpay`: a `Transfer` moved more than its
+  own authorization allows, which should be impossible — the hub credited only
+  the authorized amount and the gap is a real signal about the correlation or
+  the token contract.
 
 ## Verification
 

@@ -62,12 +62,21 @@ defmodule Genswarms.Payments do
   `issue_authorization` action) and, eventually, other lanes (a future
   deposit-sweep collection) can BOTH pay into. The hub owns the issued-
   authorization registry end to end (issuance, lookup, consumption) via five
-  `Store` callbacks, and credits a treasury `Transfer` ONLY when it carries a
-  nonce this hub issued and can still resolve — see `authorization_disposition/2`
-  for the credit rule spec §4.4 requires: without it, a deposit-sweep
-  collection landing in the same wallet would read as a user payment and be
-  credited twice. Anything else lands as an unrecognised inflow: recorded,
-  metered, never credited, never held against the chain's cursor.
+  `Store` callbacks (REQUIRED to boot once a `treasury_address` is set — an
+  authorization lane that cannot register a nonce acknowledges money it can
+  never credit), and credits a treasury `Transfer` ONLY when EXACTLY ONE
+  `AuthorizationUsed` event in the SAME transaction has that Transfer's
+  `from` as its `authorizer` AND a nonce this hub issued and can still
+  resolve — see `authorization_disposition/2` for the credit rule spec §4.4
+  requires: without it, a deposit-sweep collection landing in the same wallet
+  would read as a user payment and be credited twice, and a batched
+  transaction (anyone may submit an EIP-3009 authorization) could steer one
+  user's credit to another. The beneficiary comes from the ISSUED ROW and the
+  credit is capped at the amount that row authorized. Anything else — no
+  correlation, a foreign nonce, an authorizer that is not the sender, or an
+  ambiguous match — lands as an unrecognised inflow: recorded with its
+  refusal reason, metered, never credited, never held against the chain's
+  cursor.
   """
 
   require Logger
@@ -151,7 +160,9 @@ defmodule Genswarms.Payments do
     validate_unique_chain_field!(chains, :chain_id)
 
     targets = Map.get(config, :targets, []) |> Enum.map(&to_string/1)
+    allow_ephemeral? = Map.get(config, :allow_ephemeral) == true
     validate_durable_settlement_store!(store_mod, targets, Map.get(config, :allow_ephemeral))
+    validate_authorization_store!(store_mod, chains, allow_ephemeral?)
 
     namespace = Map.get(config, :namespace, "default") |> to_string()
     metrics_fn = Map.get(config, :metrics_fn, &default_metrics_fn/2)
@@ -177,8 +188,13 @@ defmodule Genswarms.Payments do
     trusted = MapSet.new(Map.get(config, :trusted_sources, []) |> Enum.map(&to_string/1))
     operator_sources = validate_operator_sources!(config, trusted)
 
+    max_authorization_window_seconds =
+      positive_integer_config!(config, :max_authorization_window_seconds, 3600)
+
     {bindings, degraded_boot?, foreign_namespace_bindings} =
       init_bindings(store_mod, namespace, metrics_fn)
+
+    validate_treasury_not_bound!(chains, bindings)
 
     next_index =
       bindings |> Map.values() |> Enum.map(& &1.index) |> Enum.max(fn -> -1 end) |> Kernel.+(1)
@@ -214,6 +230,8 @@ defmodule Genswarms.Payments do
       max_issuance_per_window_usd: max_issuance_per_window_usd,
       small_topup_usd: small_topup_usd,
       issuance_window_hours: issuance_window_hours,
+      max_authorization_window_seconds: max_authorization_window_seconds,
+      allow_ephemeral: allow_ephemeral?,
       # (R4-P4-I6) Wall-clock budget for one sweep_report, in ms. Configurable
       # because the right number is the host's RPC latency times a handful of
       # addresses, not a package constant — but it is bounded either way.
@@ -388,6 +406,73 @@ defmodule Genswarms.Payments do
         raise ArgumentError,
               "payments: store #{inspect(mod)} implements only part of the callback group [#{names}] — implement all of them or none (partial coverage silently causes address reuse or double-credit)"
     end
+  end
+
+  # The authorization lane's five callbacks, as ONE unit. Unlike
+  # validate_store_coherence!/1 (which asks "is this store internally
+  # consistent?"), this gate asks "can this hub actually do what it is
+  # configured to do?" — the same question validate_durable_settlement_store!/3
+  # asks about the settlement ledger, and it has the same answer shape.
+  @authorization_callbacks [
+    {:record_issued_authorization, 1},
+    {:issued_authorization, 1},
+    {:live_authorization_nonces, 1},
+    {:mark_authorization_consumed, 1},
+    {:record_unrecognised_inflow, 1}
+  ]
+
+  # A chain with `treasury_address` set IS the authorization lane switched on:
+  # the watcher adds the treasury to its Transfer filter and runs the §4.4
+  # credit rule on everything that lands there. Without a durable registry
+  # behind it, that rule can only ever answer "not ours" — so the hub would
+  # acknowledge `issue_authorization` with ok:true, the user would sign, money
+  # would move on chain, and EVERY payment would be buried as an unrecognised
+  # inflow. That is the same class rev-4 already refuses to boot for the
+  # settlement ledger ("acked money that cannot be credited"), so it gets the
+  # same treatment and the same explicit `allow_ephemeral: true` opt-out.
+  defp validate_authorization_store!(store_mod, chains, allow_ephemeral?) do
+    lane_on? = Enum.any?(chains, &(not is_nil(Map.get(&1, :treasury_address))))
+
+    missing =
+      Enum.reject(@authorization_callbacks, fn {fun, arity} ->
+        exported?(store_mod, fun, arity)
+      end)
+
+    if lane_on? and missing != [] and not allow_ephemeral? do
+      names = Enum.map_join(missing, ", ", fn {fun, arity} -> "#{fun}/#{arity}" end)
+
+      raise ArgumentError,
+            "payments: a chain configures treasury_address, which turns ON the authorization lane, but the store does not export #{names} — such a hub answers issue_authorization with ok:true and can never credit the resulting payment (every treasury Transfer lands unrecognised); configure a store implementing all five authorization callbacks, or set allow_ephemeral: true explicitly"
+    end
+
+    :ok
+  end
+
+  # (I3) A binding whose address IS the treasury address bypasses the credit
+  # rule completely: the watcher would resolve that ONE beneficiary for every
+  # user's authorization Transfer and settle it as an ordinary deposit, with no
+  # nonce involved at all. The hub — not the host — owns this registry
+  # precisely so a mis-written row cannot mint a wrong credit, so a collision
+  # is a refusal to boot, not a warning. (Usdc.transfer_settlement/6 also
+  # resolves the treasury branch FIRST, for a collision written after boot.)
+  defp validate_treasury_not_bound!(chains, bindings) do
+    treasuries =
+      chains
+      |> Enum.flat_map(&List.wrap(Map.get(&1, :treasury_address)))
+      |> MapSet.new(&String.downcase(to_string(&1)))
+
+    unless MapSet.size(treasuries) == 0 do
+      Enum.each(bindings, fn {beneficiary, binding} ->
+        address = to_string(Map.get(binding, :address, ""))
+
+        if MapSet.member?(treasuries, String.downcase(address)) do
+          raise ArgumentError,
+                "payments: beneficiary #{inspect(beneficiary)} is bound to #{inspect(address)}, which is a configured treasury_address — a watched binding resolves BEFORE the treasury credit rule, so every user's authorization payment would be credited to this one beneficiary; repair the binding before booting"
+        end
+      end)
+    end
+
+    :ok
   end
 
   defp validate_durable_settlement_store!(_store_mod, [], _allow_ephemeral), do: :ok
@@ -735,6 +820,11 @@ defmodule Genswarms.Payments do
             handle_action(action, msg, state, from)
         end
 
+      # (M5) KEEP THIS GUARD ON ONE LINE. checks/payments_contract_shape_check.exs
+      # derives the set of accepted actions with a regex that requires the
+      # whole `action in ~w` list unbroken on ONE line; wrapping it silently
+      # empties that derived set. The pin fails loudly, so this is a footgun and
+      # not a hole — but the comment is cheaper than rediscovering it.
       {:ok, %{"action" => action} = msg}
       when action in ~w(deposit_address payment_status ingest_event settlements_since reconcile issue_authorization) ->
         if trusted?(from, state) do
@@ -796,14 +886,16 @@ defmodule Genswarms.Payments do
       {:skipped, state}
     else
       case authorization_disposition(s, state) do
-        {:settle, beneficiary} ->
+        {:settle, nonce_hex, beneficiary, authorized_usd} ->
           s
           |> Map.put(:beneficiary, beneficiary)
           |> Map.put(:namespace, state.namespace)
+          |> cap_credit_at_authorized(authorized_usd, state)
           |> settle_one(state)
+          |> consume_when_resolved(nonce_hex)
 
-        :ignore ->
-          ignore_inflow(s, state)
+        {:ignore, reason} ->
+          ignore_inflow(s, state, reason)
       end
     end
   end
@@ -819,24 +911,143 @@ defmodule Genswarms.Payments do
   # AuthorizationUsed log at all" and "a nonce that correlates to a DIFFERENT
   # domain's authorization" identically — `issued_authorization/1` only ever
   # answers for nonces THIS hub minted via `issue_authorization`.
-  # A SINGLE case, deliberately: "no correlated nonce at all" (nil) and "a
-  # nonce that correlates to something we never issued" (a lookup miss) both
-  # fall through to the SAME `_not_found` clause below, because both are the
-  # same fact from this hub's point of view — "not ours" — and must refuse
-  # identically. Splitting them into two separate refusal branches would let
-  # a future edit fix one path's mutation and miss the other's.
+  # A SINGLE refusal clause, deliberately: "no correlated nonce at all", "a
+  # nonce that correlates to something we never issued" and "a nonce whose
+  # authorizer was not this Transfer's sender" ALL produce an empty match list
+  # and fall through the SAME `[] ->` clause below, because they are the same
+  # fact from this hub's point of view — "not ours" — and must refuse
+  # identically. Splitting them into separate refusal branches would let a
+  # future edit fix one path's mutation and miss the other's.
+  #
+  # AMBIGUITY FAILS CLOSED, it never guesses. Two issued authorizations whose
+  # authorizer both equal this Transfer's `from`, or two treasury Transfers in
+  # one tx sharing a `from` (`:authorization_conflict`, set by
+  # Usdc.mark_correlation_conflicts/1), leave the correlation genuinely
+  # undecidable — and log order inside a batched tx is attacker-controlled, so
+  # "pick the first" is a money bug wearing a heuristic. Refused as
+  # unrecognised: an operator can repair an under-credit; nobody can un-pay a
+  # wrong beneficiary.
   defp authorization_disposition(inflow, state) do
-    nonce_hex = row_get(inflow, :nonce_hex)
+    if row_get(inflow, :authorization_conflict) == true do
+      {:ignore, :ambiguous_correlation}
+    else
+      case issued_authorization_matches(inflow, state) do
+        [{nonce_hex, issued}] ->
+          authorized_credit(nonce_hex, issued)
 
-    case issued_authorization_lookup(nonce_hex, state) do
-      issued when is_map(issued) ->
-        mark_nonce_consumed(nonce_hex, state)
-        {:settle, row_get(issued, :beneficiary)}
+        [] ->
+          {:ignore, :not_issued}
 
-      _not_found ->
-        :ignore
+        _ambiguous ->
+          {:ignore, :ambiguous_correlation}
+      end
     end
   end
+
+  # Every nonce this Transfer could belong to (see Usdc.treasury_inflow/4:
+  # AuthorizationUsed events in the SAME tx whose `authorizer` is this
+  # Transfer's `from`), narrowed to the ones THIS hub actually issued and can
+  # still resolve. `issued_authorization/1` answering nil is what refuses a
+  # stranger's Transfer, including another domain's own on-chain authorization
+  # landing in the same wallet.
+  #
+  # `nonce_candidates` is what the in-tree watcher supplies; the `nonce_hex`
+  # fallback keeps the public `settle/2` usable by a host pushing a
+  # single-correlation row of its own (it gets the registry check, but the
+  # authorizer check is the watcher's to make — it needs the tx's other logs).
+  defp issued_authorization_matches(inflow, state) do
+    inflow
+    |> authorization_candidates()
+    |> Enum.map(&{&1, issued_authorization_lookup(&1, state)})
+    |> Enum.filter(fn {_nonce_hex, issued} -> is_map(issued) end)
+  end
+
+  defp authorization_candidates(inflow) do
+    case row_get(inflow, :nonce_candidates) do
+      candidates when is_list(candidates) -> Enum.uniq(candidates)
+      _absent -> inflow |> row_get(:nonce_hex) |> List.wrap()
+    end
+  end
+
+  # The beneficiary comes from the ISSUED ROW, keyed by nonce — never from log
+  # position, never from the Transfer's own `from`. A row that cannot supply a
+  # usable beneficiary or a usable authorized amount fails closed like every
+  # other store defect in this module: crediting `nil`, or crediting an
+  # unbounded amount because the cap could not be read, are both worse than an
+  # unrecognised inflow an operator reissues by hand.
+  defp authorized_credit(nonce_hex, issued) do
+    beneficiary = row_get(issued, :beneficiary)
+
+    case {is_binary(beneficiary) and beneficiary != "", issued_amount_usd(issued)} do
+      {true, {:ok, authorized}} -> {:settle, nonce_hex, beneficiary, authorized}
+      _unusable -> {:ignore, :issued_row_unusable}
+    end
+  end
+
+  defp issued_amount_usd(issued) do
+    case row_get(issued, :amount_usd) do
+      %Decimal{} = amount ->
+        if Decimal.compare(amount, Decimal.new(0)) == :gt, do: {:ok, amount}, else: :error
+
+      amount when is_binary(amount) ->
+        if Regex.match?(@money_pattern, amount),
+          do: issued_amount_usd(%{amount_usd: Decimal.new(amount)}),
+          else: :error
+
+      _invalid ->
+        :error
+    end
+  end
+
+  # (I2) A correct `receiveWithAuthorization` moves EXACTLY the signed value,
+  # so `moved > authorized` is not a generosity to pass on — it is proof that
+  # either the correlation or the token contract is not what this hub assumes.
+  # Credit the authorized amount (never more than the user signed for) and make
+  # the anomaly loud: it is also the cheapest independent detector for a
+  # mis-correlation that slipped every check above.
+  defp cap_credit_at_authorized(row, authorized, state) do
+    moved = row_get(row, :amount_usd)
+
+    if match?(%Decimal{}, moved) and Decimal.compare(moved, authorized) == :gt do
+      key = row_get(row, :idempotency_key)
+
+      Logger.error(
+        "payments: treasury inflow #{key} moved #{money_text(moved)} against an authorization for #{money_text(authorized)} — crediting the AUTHORIZED amount; a Transfer exceeding its own authorization means the correlation or the token contract is not what this hub assumes"
+      )
+
+      emit_metric(state, "payments_authorization_overpay", %{
+        idempotency_key: key,
+        moved_usd: money_text(moved),
+        authorized_usd: money_text(authorized)
+      })
+
+      row
+      |> Map.put(:amount_usd, authorized)
+      |> Map.put(:moved_amount_usd, moved)
+      |> Map.put(:credit_capped, true)
+    else
+      row
+    end
+  end
+
+  # (C1) Consumption is marked ONLY once the settlement is durably resolved —
+  # `:settled` or `:quarantined`, both of which are recorded rows the dedup
+  # will recognise forever. A HELD settlement (store blip on the dedup read,
+  # the record, or the cap evaluation) must leave the nonce LIVE: the whole
+  # fail-closed design assumes the chain's cursor stays put and the Transfer is
+  # re-presented next tick, but re-presentation is only lossless if the
+  # AuthorizationUsed leg is still fetched — and that leg is filtered on
+  # `live_authorization_nonces`. Retiring the nonce first turned every held
+  # authorization settlement into a permanent under-credit: the retry arrived
+  # with no correlation at all and was buried as unrecognised while the cursor
+  # advanced past it.
+  defp consume_when_resolved({outcome, state} = result, nonce_hex)
+       when outcome in [:settled, :quarantined] do
+    mark_nonce_consumed(nonce_hex, state)
+    result
+  end
+
+  defp consume_when_resolved(result, _nonce_hex), do: result
 
   defp issued_authorization_lookup(nil, _state), do: nil
 
@@ -848,11 +1059,13 @@ defmodule Genswarms.Payments do
     end
   end
 
-  # Retires the nonce from the watcher's live filter as soon as the on-chain
-  # correlation is made — independent of whatever this settlement's caps
-  # decide next (see Store.mark_authorization_consumed/1's doc). Best-effort:
-  # a failure here cannot double-credit (the linked settlement dedups on its
-  # own idempotency_key regardless), so it is logged rather than held.
+  # Retires the nonce from the watcher's live filter once the linked
+  # settlement is durably resolved — independent of whether the caps settled
+  # or quarantined it (see Store.mark_authorization_consumed/1's doc; the
+  # nonce is spent ON CHAIN either way, and this hub's cap policy is a
+  # separate decision made afterwards). Best-effort: a failure here cannot
+  # double-credit (the settlement dedups on its own idempotency_key
+  # regardless), so it is logged rather than held.
   defp mark_nonce_consumed(nonce_hex, state) do
     case store_write(state.store_mod, :mark_authorization_consumed, [nonce_hex]) do
       :ok ->
@@ -871,8 +1084,10 @@ defmodule Genswarms.Payments do
   # WHOLE chain hostage to routine treasury noise (a deposit-sweep collection,
   # a stray transfer) would also block every genuine deposit-address payment
   # scanned in the same round.
-  defp ignore_inflow(%{idempotency_key: key} = s, state) do
-    case store_write(state.store_mod, :record_unrecognised_inflow, [unrecognised_row(s, state)]) do
+  defp ignore_inflow(%{idempotency_key: key} = s, state, reason) do
+    row = Map.put(unrecognised_row(s, state), :reason, reason_text(reason))
+
+    case store_write(state.store_mod, :record_unrecognised_inflow, [row]) do
       :ok ->
         :ok
 
@@ -885,7 +1100,11 @@ defmodule Genswarms.Payments do
     emit_metric(state, "payments_unrecognised_inflow", %{
       chain: to_string(row_get(s, :chain)),
       idempotency_key: key,
-      amount_usd: Decimal.to_string(row_get(s, :amount_usd)),
+      reason: reason_text(reason),
+      # M2: `settle/2` is public and push modalities are the declared future —
+      # a non-Decimal amount on a "usdc_authorization" row must not RAISE out
+      # of settle/2 here while every other method holds it as :invalid_amount.
+      amount_usd: money_text(row_get(s, :amount_usd)),
       nonce_hex: row_get(s, :nonce_hex)
     })
 
@@ -906,6 +1125,10 @@ defmodule Genswarms.Payments do
       token_contract: row_get(s, :token_contract),
       from_address: row_get(s, :from_address),
       nonce_hex: row_get(s, :nonce_hex),
+      # The full candidate set, not only the single-candidate mirror: for the
+      # ambiguous refusals it is the ONLY record of what the hub declined to
+      # guess between, and that is exactly the row an operator reads back.
+      nonce_candidates: authorization_candidates(s),
       namespace: state.namespace,
       at: state.now_fn.()
     }
@@ -1677,7 +1900,12 @@ defmodule Genswarms.Payments do
          {:ok, beneficiary} <-
            validate_present_string(Map.get(msg, "beneficiary"), :bad_beneficiary),
          {:ok, amount_usd} <- validate_positive_money(Map.get(msg, "amount_usd")),
-         {:ok, valid_before} <- validate_valid_before(Map.get(msg, "valid_before")) do
+         {:ok, valid_before} <-
+           validate_valid_before(
+             Map.get(msg, "valid_before"),
+             DateTime.to_unix(state.now_fn.()),
+             state.max_authorization_window_seconds
+           ) do
       issue_authorization(nonce_hex, order_ref, beneficiary, amount_usd, valid_before, state)
     else
       {:error, reason} ->
@@ -1996,8 +2224,25 @@ defmodule Genswarms.Payments do
 
   # Unix seconds, matching EIP-3009's `validBefore` and the same clock
   # `live_authorization_nonces/1` is queried against (`DateTime.to_unix/1`).
-  defp validate_valid_before(value) when is_integer(value) and value > 0, do: {:ok, value}
-  defp validate_valid_before(_invalid), do: {:error, :bad_valid_before}
+  #
+  # (I4) The window is BOUNDED HERE, at the one place a nonce ever enters the
+  # registry — the property the whole live-nonce-filter design rests on
+  # ("bounded by construction: every issued authorization expires") was
+  # previously delegated entirely to the caller, which accepted a `valid_before`
+  # a century out (a nonce that never leaves the getLogs filter) and one
+  # already in the past (acked ok:true, dead on arrival — the money lands
+  # unrecognised because the nonce is never live at scan time). Both are
+  # refused; `max_authorization_window_seconds` (default 1h, the plan's window)
+  # is the bound.
+  defp validate_valid_before(value, now_unix, max_window) when is_integer(value) do
+    cond do
+      value <= now_unix -> {:error, :expired_valid_before}
+      value - now_unix > max_window -> {:error, :valid_before_too_far}
+      true -> {:ok, value}
+    end
+  end
+
+  defp validate_valid_before(_invalid, _now_unix, _max_window), do: {:error, :bad_valid_before}
 
   defp issue_authorization(nonce_hex, order_ref, beneficiary, amount_usd, valid_before, state) do
     row = %{
@@ -2013,18 +2258,19 @@ defmodule Genswarms.Payments do
       issued_at: state.now_fn.()
     }
 
-    case record_issued_authorization_write(state.store_mod, row) do
-      ok when ok in [:ok, :memory, {:ok, :duplicate}] ->
-        render_reply(state, "issue_authorization", %{
-          action: "issue_authorization",
-          ok: true,
-          nonce: nonce_hex,
-          order_ref: order_ref,
-          beneficiary: beneficiary,
-          amount_usd: Decimal.to_string(amount_usd),
-          namespace: state.namespace,
-          valid_before: valid_before
-        })
+    case record_issued_authorization_write(state, row) do
+      written when written in [:ok, :memory] ->
+        issuance_reply(state, row)
+
+      # (C3) A replay answers with the STORED row, never with the request that
+      # lost the race. Echoing the request's own fields made issuance
+      # NON-idempotent in the one way that matters: a caller that timed out on
+      # the first reply and retried the order with a freshly minted nonce (the
+      # normal thing a retrying caller does) got ok:true naming THAT nonce —
+      # which was never registered, is never in the getLogs filter, and buries
+      # the user's payment as unrecognised.
+      {:ok, :duplicate, stored} ->
+        duplicate_issuance_reply(state, order_ref, stored)
 
       {:error, why} ->
         Logger.error(
@@ -2043,22 +2289,120 @@ defmodule Genswarms.Payments do
     end
   end
 
-  defp record_issued_authorization_write(nil, _row), do: :memory
+  defp issuance_reply(state, row) do
+    render_reply(state, "issue_authorization", %{
+      action: "issue_authorization",
+      ok: true,
+      nonce: row_get(row, :nonce_hex),
+      order_ref: row_get(row, :order_ref),
+      beneficiary: row_get(row, :beneficiary),
+      amount_usd: money_text(row_get(row, :amount_usd)),
+      namespace: state.namespace,
+      valid_before: row_get(row, :valid_before)
+    })
+  end
 
-  defp record_issued_authorization_write(mod, row) do
-    if exported?(mod, :record_issued_authorization, 1) do
-      try do
-        case apply(mod, :record_issued_authorization, [row]) do
-          :ok -> :ok
-          {:ok, :duplicate} -> {:ok, :duplicate}
-          {:error, why} -> {:error, why}
-          other -> {:error, {:bad_return, other}}
+  # The stored row is validated before it is echoed: an ok:true naming a nonce
+  # this hub cannot prove is registered is precisely the failure C3 describes,
+  # and a store that cannot hand back the row it deduped against cannot make
+  # that proof. REFUSE rather than echo unverified fields — the caller retries
+  # or the operator looks, and no user is handed a nonce that will never
+  # correlate.
+  defp duplicate_issuance_reply(state, order_ref, stored) do
+    case stored_issuance_row(stored, state) do
+      {:ok, row} ->
+        issuance_reply(state, row)
+
+      {:error, why} ->
+        Logger.error(
+          "payments: record_issued_authorization answered :duplicate for order_ref #{inspect(order_ref)} with an unusable row (#{reason_text(why)}: #{safe_inspect(stored)}) — refusing rather than echoing the request's own unregistered nonce back as if it were on record"
+        )
+
+        emit_metric(state, "payments_hold", %{
+          stage: "issue_authorization",
+          order_ref: order_ref,
+          reason: reason_text(why)
+        })
+
+        {:reply,
+         Jason.encode!(%{action: "issue_authorization", ok: false, error: "store_unavailable"}),
+         state}
+    end
+  end
+
+  defp stored_issuance_row(stored, state) when is_map(stored) do
+    nonce_hex = row_get(stored, :nonce_hex)
+    order_ref = row_get(stored, :order_ref)
+    beneficiary = row_get(stored, :beneficiary)
+    valid_before = row_get(stored, :valid_before)
+    namespace = row_get(stored, :namespace)
+
+    cond do
+      not (is_binary(nonce_hex) and Regex.match?(@nonce_pattern, nonce_hex)) ->
+        {:error, :duplicate_row_bad_nonce}
+
+      not (is_binary(order_ref) and order_ref != "") ->
+        {:error, :duplicate_row_bad_order_ref}
+
+      not (is_binary(beneficiary) and beneficiary != "") ->
+        {:error, :duplicate_row_bad_beneficiary}
+
+      not is_integer(valid_before) ->
+        {:error, :duplicate_row_bad_valid_before}
+
+      not is_nil(namespace) and to_string(namespace) != state.namespace ->
+        {:error, :duplicate_row_foreign_namespace}
+
+      true ->
+        case issued_amount_usd(stored) do
+          {:ok, amount} ->
+            {:ok,
+             %{
+               nonce_hex: String.downcase(nonce_hex),
+               order_ref: order_ref,
+               beneficiary: beneficiary,
+               amount_usd: amount,
+               valid_before: valid_before
+             }}
+
+          :error ->
+            {:error, :duplicate_row_bad_amount}
         end
-      catch
-        kind, reason -> {:error, {kind, reason}}
-      end
-    else
-      :memory
+    end
+  end
+
+  defp stored_issuance_row(_stored, _state), do: {:error, :duplicate_row_missing}
+
+  # (I1, runtime half) A store that cannot register the nonce cannot back an
+  # ok:true. Memory mode stays reachable behind the SAME explicit
+  # `allow_ephemeral: true` opt-out the settlement ledger uses — never by
+  # default, because the default silently acknowledged money it could never
+  # credit.
+  defp record_issued_authorization_write(state, row) do
+    mod = state.store_mod
+
+    cond do
+      exported?(mod, :record_issued_authorization, 1) ->
+        try do
+          case apply(mod, :record_issued_authorization, [row]) do
+            :ok -> :ok
+            {:ok, :duplicate, stored} -> {:ok, :duplicate, stored}
+            # The row-less duplicate shape cannot be honored: this hub has no
+            # order_ref lookup, so it literally cannot read back what it
+            # deduped against. Treated as a store defect, not as success.
+            {:ok, :duplicate} -> {:error, :duplicate_row_missing}
+            {:error, why} -> {:error, why}
+            other -> {:error, {:bad_return, other}}
+          end
+        catch
+          kind, reason -> {:error, {kind, reason}}
+        end
+
+      state.allow_ephemeral ->
+        :memory
+
+      true ->
+        {:error, :no_authorization_store}
     end
   end
 

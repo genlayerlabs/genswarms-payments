@@ -122,7 +122,7 @@ defmodule Genswarms.Payments.Usdc do
     chunk_size = Map.get(chain, :address_chunk, 200)
 
     with {:ok, transfer_logs} <- fetch_transfer_logs(chain, core, watched, from, to, chunk_size),
-         {:ok, nonce_by_tx} <- fetch_nonce_correlations(chain, core, from, to, chunk_size) do
+         {:ok, auths_by_tx} <- fetch_nonce_correlations(chain, core, from, to, chunk_size) do
       # Defense in depth: don't trust the RPC provider to have honored the
       # toBlock bound — a log at or beyond the reorg-risk edge must wait
       # for a later, deeper round even if it comes back in this response.
@@ -141,7 +141,8 @@ defmodule Genswarms.Payments.Usdc do
         |> Enum.reject(&(&1["removed"] == true))
         |> Enum.filter(&(hex_int(&1["blockNumber"]) <= to))
         |> Enum.filter(&same_contract?(&1, chain))
-        |> Enum.flat_map(&to_settlement(&1, chain, watched, nonce_by_tx))
+        |> Enum.flat_map(&to_settlement(&1, chain, watched, auths_by_tx))
+        |> mark_correlation_conflicts()
 
       {:ok, settlements, to}
     else
@@ -151,7 +152,7 @@ defmodule Genswarms.Payments.Usdc do
 
   # ── entry A leg 1: Transfer logs, watched deposit addresses PLUS the
   # treasury address (if configured) in the SAME filter — the treasury has no
-  # single beneficiary (see transfer_settlement/5) so it is deliberately never
+  # single beneficiary (see transfer_settlement/6) so it is deliberately never
   # added to `watched`, only to this getLogs address list.
   defp fetch_transfer_logs(chain, core, watched, from, to, chunk_size) do
     case transfer_filter_addresses(chain, watched) do
@@ -207,6 +208,15 @@ defmodule Genswarms.Payments.Usdc do
     end
   end
 
+  # Normalized exactly like the topic the correlation later matches on
+  # (`pad_topic_bytes32/1` downcases its query side too), so the membership
+  # re-check below is a genuine string equality and not a case trap.
+  defp live_nonce_set(nonces) do
+    nonces
+    |> Enum.filter(&is_binary/1)
+    |> MapSet.new(&String.downcase/1)
+  end
+
   # Same 200-per-chunk mechanism as the Transfer query, over the LIVE NONCE
   # SET rather than addresses — bounded by construction (every authorization
   # expires), never by user or transaction count.
@@ -229,41 +239,72 @@ defmodule Genswarms.Payments.Usdc do
       end)
 
     case result do
-      {:ok, logs} -> {:ok, nonce_map_from_logs(logs, chain, to)}
+      {:ok, logs} -> {:ok, authorizations_by_tx(logs, chain, to, live_nonce_set(nonces))}
       {:error, why} -> {:error, why}
     end
   end
 
-  # tx_hash => nonce_hex, built from the SAME reorg/contract defenses the
-  # Transfer leg applies (removed / toBlock / same_contract?) before the
-  # correlation in transfer_settlement/5 ever consults it.
-  defp nonce_map_from_logs(logs, chain, to) do
+  # tx_hash => [%{nonce_hex, authorizer}], built from the SAME reorg/contract
+  # defenses the Transfer leg applies (removed / toBlock / same_contract?)
+  # before the correlation in treasury_inflow/4 ever consults it.
+  #
+  # A LIST, not a single nonce, and it keeps the `authorizer` — one tx can
+  # legitimately carry many AuthorizationUsed events (a batched multicall, and
+  # EIP-3009 authorizations are submittable by ANYONE, so their order inside a
+  # tx is attacker-controlled). Keying `tx_hash => nonce` and last-write-wins
+  # attached one arbitrary nonce to every treasury Transfer in the tx: an
+  # attacker who spent $1 alongside a victim's $100 payment could steer the
+  # victim's credit to themselves. Correlation is `authorizer == Transfer.from`
+  # (that is exactly what EIP-3009's `receiveWithAuthorization` guarantees),
+  # never log position.
+  #
+  # The `live` re-check is the same stance already applied to topic0 and to
+  # `address`: the getLogs call asked only for nonces this hub issued and still
+  # considers live, but a provider that ignores `topics[2]` must not be able to
+  # inject a correlation for a nonce we never asked about.
+  defp authorizations_by_tx(logs, chain, to, live) do
     logs
     |> Enum.reject(&(&1["removed"] == true))
     |> Enum.filter(&(hex_int(&1["blockNumber"]) <= to))
     |> Enum.filter(&same_contract?(&1, chain))
     |> Enum.reduce(%{}, fn log, acc ->
-      case authorization_used_nonce(log) do
-        {:ok, tx_hash, nonce_hex} -> Map.put(acc, tx_hash, nonce_hex)
-        :skip -> acc
+      case authorization_used(log) do
+        {:ok, tx_hash, authorizer, nonce_hex} ->
+          if MapSet.member?(live, nonce_hex) do
+            add_authorization(acc, tx_hash, %{nonce_hex: nonce_hex, authorizer: authorizer})
+          else
+            acc
+          end
+
+        :skip ->
+          acc
       end
     end)
   end
 
+  # Deduplicated on the nonce: a provider echoing the same log twice must not
+  # manufacture the "two authorizations for one Transfer" ambiguity that the
+  # hub deliberately refuses to guess through.
+  defp add_authorization(acc, tx_hash, entry) do
+    Map.update(acc, tx_hash, [entry], fn list ->
+      if Enum.any?(list, &(&1.nonce_hex == entry.nonce_hex)), do: list, else: [entry | list]
+    end)
+  end
+
   # AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce) — the
-  # nonce is topics[2]. Same fail-closed shape check as to_settlement/4: a
-  # topic0 mismatch is normal defense-in-depth skip (this getLogs call is
-  # already filtered to @authorization_used_topic, but never trust the
-  # provider echoed only what was asked for), while a genuinely malformed
-  # 3-topic shape raises — rescued by safe_scan_chain/3, chain held, cursor
-  # unmoved — rather than silently losing a correlation for a payment that
-  # may be real.
-  defp authorization_used_nonce(log) do
+  # authorizer is topics[1] and the nonce is topics[2]. Same fail-closed shape
+  # check as to_settlement/4: a topic0 mismatch is a normal defense-in-depth
+  # skip (this getLogs call is already filtered to @authorization_used_topic,
+  # but never trust the provider echoed only what was asked for), while a
+  # genuinely malformed 3-topic shape raises — rescued by safe_scan_chain/3,
+  # chain held, cursor unmoved — rather than silently losing a correlation for
+  # a payment that may be real.
+  defp authorization_used(log) do
     case log["topics"] do
       [topic0, authorizer_topic, nonce_topic]
       when is_binary(topic0) and is_binary(authorizer_topic) and is_binary(nonce_topic) ->
         if String.downcase(topic0) == @authorization_used_topic do
-          {:ok, tx_hash!(log), String.downcase(nonce_topic)}
+          {:ok, tx_hash!(log), topic_address(authorizer_topic), String.downcase(nonce_topic)}
         else
           :skip
         end
@@ -277,7 +318,7 @@ defmodule Genswarms.Payments.Usdc do
     String.downcase(log["address"] || "") == String.downcase(chain.usdc_contract)
   end
 
-  defp to_settlement(log, chain, watched, nonce_by_tx) do
+  defp to_settlement(log, chain, watched, auths_by_tx) do
     case log["topics"] do
       # Topic0 matching is case-INSENSITIVE, like same_contract?/2 and
       # topic_address/1 — the module already decided hex case can vary, and
@@ -286,7 +327,7 @@ defmodule Genswarms.Payments.Usdc do
       [topic0, from_topic, to_topic]
       when is_binary(topic0) and is_binary(from_topic) and is_binary(to_topic) ->
         if String.downcase(topic0) == @transfer_topic do
-          transfer_settlement(log, chain, watched, from_topic, to_topic, nonce_by_tx)
+          transfer_settlement(log, chain, watched, from_topic, to_topic, auths_by_tx)
         else
           # Defense in depth (Task 5 plan step 3): an AuthorizationUsed log
           # has three topics too, but its topic0 is @authorization_used_topic,
@@ -307,19 +348,32 @@ defmodule Genswarms.Payments.Usdc do
     end
   end
 
-  defp transfer_settlement(log, chain, watched, from_topic, to_topic, nonce_by_tx) do
+  # The TREASURY branch is resolved FIRST, before the watched-address lookup.
+  # `init/1` already refuses to boot when a binding's address equals a chain's
+  # treasury_address, so this ordering is belt-and-braces for a collision that
+  # appears after boot (a peer hub writing a binding, an operator repairing a
+  # row by hand): resolving `watched` first would hand the treasury a single
+  # beneficiary and skip the §4.4 credit rule entirely, crediting every user's
+  # authorization payment to whoever happened to own that binding.
+  defp transfer_settlement(log, chain, watched, from_topic, to_topic, auths_by_tx) do
     to_addr = topic_address(to_topic)
 
-    case Map.fetch(watched, to_addr) do
-      {:ok, %{beneficiary: beneficiary, namespace: namespace}} ->
-        build_settlement(log, chain, from_topic, %{
-          beneficiary: beneficiary,
-          namespace: namespace,
-          method: "usdc_#{chain.name}"
-        })
+    cond do
+      to_addr == treasury_address(chain) ->
+        treasury_inflow(log, chain, from_topic, auths_by_tx)
 
-      :error ->
-        treasury_inflow(log, chain, from_topic, to_addr, nonce_by_tx)
+      true ->
+        case Map.fetch(watched, to_addr) do
+          {:ok, %{beneficiary: beneficiary, namespace: namespace}} ->
+            build_settlement(log, chain, from_topic, %{
+              beneficiary: beneficiary,
+              namespace: namespace,
+              method: "usdc_#{chain.name}"
+            })
+
+          :error ->
+            []
+        end
     end
   end
 
@@ -329,22 +383,57 @@ defmodule Genswarms.Payments.Usdc do
   # namespace stay unresolved (nil) and `method` is tagged distinctly
   # (`"usdc_authorization"`) so the hub's settle path knows to run the §4.4
   # credit rule — nonce correlation, not a watched-address lookup — before
-  # this can ever become creditable. `nonce_hex` is nil when this tx's
-  # AuthorizationUsed log wasn't found (no correlation at all, e.g. a plain
-  # unsolicited transfer into the treasury).
-  defp treasury_inflow(log, chain, from_topic, to_addr, nonce_by_tx) do
-    if to_addr == treasury_address(chain) do
-      nonce_hex = Map.get(nonce_by_tx, tx_hash!(log))
+  # this can ever become creditable.
+  #
+  # `nonce_candidates` are the nonces this Transfer could possibly belong to:
+  # AuthorizationUsed events in the SAME tx whose `authorizer` IS this
+  # Transfer's `from`. EIP-3009's `receiveWithAuthorization(from, to, value,
+  # ...)` moves value FROM the authorizer, so authorizer≠from is proof the two
+  # logs are unrelated no matter how adjacent they sit. Usually the list is
+  # empty (a plain unsolicited transfer into the treasury) or has exactly one
+  # entry; the hub refuses to guess for anything else. `nonce_hex` mirrors the
+  # single-candidate case only, and exists for the audit/metric surface.
+  defp treasury_inflow(log, chain, from_topic, auths_by_tx) do
+    from_addr = topic_address(from_topic)
 
-      build_settlement(log, chain, from_topic, %{
-        beneficiary: nil,
-        namespace: nil,
-        method: "usdc_authorization",
-        nonce_hex: nonce_hex
-      })
-    else
-      []
-    end
+    candidates =
+      auths_by_tx
+      |> Map.get(tx_hash!(log), [])
+      |> Enum.filter(&(&1.authorizer == from_addr))
+      |> Enum.map(& &1.nonce_hex)
+
+    build_settlement(log, chain, from_topic, %{
+      beneficiary: nil,
+      namespace: nil,
+      method: "usdc_authorization",
+      nonce_candidates: candidates,
+      nonce_hex: single_candidate(candidates)
+    })
+  end
+
+  defp single_candidate([nonce]), do: nonce
+  defp single_candidate(_), do: nil
+
+  # The one ambiguity `authorizer == from` cannot resolve by itself: TWO
+  # treasury Transfers in one tx sharing the same `from`. Each would match the
+  # same single authorization, and crediting both would pay one authorization
+  # twice. There is no non-guessing way to say which Transfer the
+  # authorization belongs to (log ordering is attacker-controlled), so BOTH
+  # are flagged and the hub holds them as unrecognised — under-credit an
+  # operator can repair, never a double-credit.
+  defp mark_correlation_conflicts(settlements) do
+    counts =
+      settlements
+      |> Enum.filter(&(Map.get(&1, :method) == "usdc_authorization"))
+      |> Enum.frequencies_by(&{Map.get(&1, :tx_hash), Map.get(&1, :from_address)})
+
+    Enum.map(settlements, fn s ->
+      if Map.get(counts, {Map.get(s, :tx_hash), Map.get(s, :from_address)}, 0) > 1 do
+        Map.put(s, :authorization_conflict, true)
+      else
+        s
+      end
+    end)
   end
 
   defp build_settlement(log, chain, from_topic, extra) do

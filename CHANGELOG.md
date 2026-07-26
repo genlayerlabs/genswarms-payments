@@ -20,7 +20,11 @@
   The USDC watcher's `getLogs` now runs a SECOND query per chain with a
   `treasury_address` configured — `AuthorizationUsed(address,bytes32)`
   events filtered to the live nonce set, correlated to the matching
-  `Transfer` by `tx_hash` — and credits a treasury inflow under settlement
+  `Transfer` by `{tx_hash, authorizer}` (the event's indexed `authorizer`
+  MUST equal the `Transfer`'s `from`, which is exactly what EIP-3009's
+  `receiveWithAuthorization` guarantees; a transaction can carry many
+  authorizations and anyone may submit them, so log position decides
+  nothing) — and credits a treasury inflow under settlement
   method `"usdc_authorization"` (same idempotency key shape as every other
   USDC settlement, `"#{chain_id}:#{tx_hash}:#{log_index}"`, amount = what
   actually moved, which may be less than what was issued) ONLY when its
@@ -34,6 +38,48 @@
   signature string (never hand-typed hex) and pinned against an
   independently-verified frozen literal in
   `checks/payments_keccak_test.exs`.
+  Money-safety properties of this lane, each with its own regression test:
+  - **Ambiguity fails closed, it never guesses.** A `Transfer` that cannot be
+    matched to EXACTLY ONE issued authorization in its own transaction (zero
+    matches; two issued authorizations whose `authorizer` is this Transfer's
+    sender; two treasury Transfers in the transaction sharing a sender) is
+    recorded unrecognised with a `reason`, never credited.
+  - **Consumption is marked only AFTER the settlement is durably recorded.**
+    A held settlement (store blip on the dedup read, the record, or the cap
+    evaluation) leaves the nonce in `live_authorization_nonces/1`, so the
+    re-presented `Transfer` still correlates on the next scan. Retiring it
+    first turned every held authorization settlement into a permanent
+    under-credit.
+  - **The credited amount is capped by what was authorized**
+    (`min(moved, issued)`). A `receiveWithAuthorization` moves exactly the
+    signed value, so `moved > issued` is evidence of mis-correlation: the row
+    carries `moved_amount_usd` + `credit_capped` and emits
+    `payments_authorization_overpay`.
+  - **`issue_authorization` is idempotent by the STORED row.** A duplicate
+    `order_ref` answers with the row on record, so a caller that retried with
+    a freshly minted nonce is never handed an ok:true naming a nonce nobody
+    registered. `Store.record_issued_authorization/1`'s duplicate shape is
+    now `{:ok, :duplicate, row}`; a row-less `{:ok, :duplicate}` is a store
+    defect and the action is refused.
+  - **The window is bounded at issue time.** A `valid_before` that is absent,
+    non-integer, already past, or further out than the new
+    `max_authorization_window_seconds` (default 3600) is refused — this is
+    what makes the live-nonce `getLogs` filter bounded by construction rather
+    than by caller goodwill.
+  - **An inert authorization lane refuses to boot.** A chain configuring
+    `treasury_address` requires a store exporting all five authorization
+    callbacks, behind the same explicit `allow_ephemeral: true` opt-out the
+    settlement ledger uses — a hub that answers `issue_authorization` with
+    ok:true and can never credit the resulting payment is refused at `init/1`,
+    not discovered in production.
+  - **The treasury address can never be a watched binding.** A binding whose
+    address equals a chain's `treasury_address` refuses boot (a watched
+    binding would resolve one beneficiary for every user's payment and skip
+    the credit rule entirely), and the watcher resolves the treasury branch
+    BEFORE the watched map for any collision written after boot.
+  - The live-nonce filter is re-checked against the returned logs, so a
+    provider that ignores `topics[2]` cannot inject a correlation for a nonce
+    this hub did not ask about (e.g. an already-consumed one).
 - `binding_conflict` now ADOPTS the durable binding instead of refusing. When
   this beneficiary is already bound to an address this process does not have in
   memory (a peer instance wrote it, or this one booted before the write), the

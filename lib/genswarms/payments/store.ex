@@ -9,6 +9,13 @@ defmodule Genswarms.Payments.Store do
   all uses the memory fallback; with non-empty targets, that requires the
   explicit `allow_ephemeral: true` boot opt-out.
 
+  The authorization lane has its OWN instance of that same gate: a chain with
+  `treasury_address` configured requires a store exporting all five
+  authorization callbacks below, behind the same explicit opt-out. A hub that
+  answers `issue_authorization` with `ok: true` and cannot register the nonce
+  acknowledges money it can never credit — every treasury Transfer it later
+  sees lands as an unrecognised inflow.
+
   The fail-closed rule keys off whether the callback is *exported*, not
   whether `store_mod` is nil: a coherence-legal store that implements the
   bindings group but not the settlement group (`payment_seen?/1`,
@@ -228,10 +235,20 @@ defmodule Genswarms.Payments.Store do
   request must return the SAME row rather than mint a second one.
 
   - `:ok` — a fresh row was written.
-  - `{:ok, :duplicate}` — `order_ref` was already recorded; nothing new
-    happened. The hub still answers success and echoes the row's own fields
-    back to the caller, exactly as if this were the first call — that is what
-    makes issuance idempotent from the caller's point of view.
+  - `{:ok, :duplicate, stored_row}` — `order_ref` was already recorded;
+    nothing new happened, and `stored_row` is THE ROW ON RECORD (at least
+    `nonce_hex`, `order_ref`, `beneficiary`, `amount_usd`, `valid_before`,
+    `namespace`). The hub answers success by echoing THAT row, never the
+    request that lost the race — which is what makes issuance idempotent from
+    the caller's point of view. Returning the stored row is MANDATORY, not a
+    convenience: a caller that timed out on the first reply retries the order
+    with a freshly minted nonce, and echoing the request would ack a nonce
+    that was never registered, is never in the `AuthorizationUsed` getLogs
+    filter, and buries the user's payment as an unrecognised inflow. A bare
+    `{:ok, :duplicate}` is therefore treated as a STORE DEFECT (the hub has no
+    order_ref lookup to read the row back with, so it cannot repair it): the
+    action is refused with `store_unavailable` rather than answered with
+    fields nobody can prove are on record.
   - `{:error, term()}` — the hub refuses the action and reports
     `store_unavailable`; it never fabricates success it cannot prove.
 
@@ -242,7 +259,7 @@ defmodule Genswarms.Payments.Store do
   fine, since one hub process serves exactly one namespace.
   """
   @callback record_issued_authorization(row :: map()) ::
-              :ok | {:ok, :duplicate} | {:error, term()}
+              :ok | {:ok, :duplicate, map()} | {:error, term()}
 
   @doc """
   Look up an issued authorization by its nonce, keyed EXACTLY like the
@@ -261,11 +278,24 @@ defmodule Genswarms.Payments.Store do
   rather under-credit (held as unrecognised, an operator reissues by hand)
   than ever fabricate a beneficiary from a lookup it cannot actually perform.
 
-  The returned row carries at least `beneficiary` (and, for audit purposes,
-  the `namespace` it was originally sealed under) — the hub always stamps the
-  SETTLEMENT it credits with its OWN current namespace, never this row's, so
-  a row surviving a namespace rename is only ever an audit curiosity, never a
-  re-namespacing risk.
+  The returned row carries at least `beneficiary` and `amount_usd` (and, for
+  audit purposes, the `namespace` it was originally sealed under) — the hub
+  always stamps the SETTLEMENT it credits with its OWN current namespace,
+  never this row's, so a row surviving a namespace rename is only ever an
+  audit curiosity, never a re-namespacing risk.
+
+  Both fields are LOAD-BEARING and both fail closed when unusable (a missing
+  or empty `beneficiary`, a non-positive or unparsable `amount_usd`): the
+  inflow is held as unrecognised rather than credited.
+
+  - `beneficiary` is the ONLY source of who gets paid. It is never taken from
+    the Transfer's `from`, never from log position within the transaction.
+  - `amount_usd` is the CEILING on what may be credited. A correct
+    `receiveWithAuthorization` moves exactly the signed value, so a Transfer
+    that moved MORE than this row authorizes is evidence of a mis-correlation,
+    not a windfall: the hub credits this amount, records the moved amount
+    alongside it (`moved_amount_usd`, `credit_capped`), and emits
+    `payments_authorization_overpay`.
   """
   @callback issued_authorization(nonce_hex :: String.t()) :: map() | nil
 
@@ -274,10 +304,17 @@ defmodule Genswarms.Payments.Store do
   its `valid_before` (compared against `now`, a unix timestamp — the same
   clock `DateTime.to_unix(now_fn.())` produces).
 
+  Excluding the expired ones is NOT optional bookkeeping — it is half of the
+  bound below, and a store that returns them anyway grows this filter without
+  limit.
+
   This is the `topics[2]` filter for the watcher's second `eth_getLogs` query
   (`AuthorizationUsed`), so its SIZE is the RPC filter's size. **Bounded by
-  construction**: every issued authorization expires (the plan's window is 1
-  hour), so this set cannot grow without bound even if
+  construction**, and the construction is enforced at BOTH ends: the hub
+  refuses at `issue_authorization` any `valid_before` that is already past or
+  further out than `max_authorization_window_seconds` (default 3600, the
+  plan's 1-hour window), and this callback drops every nonce whose window has
+  closed. So the set cannot grow without bound even if
   `mark_authorization_consumed/1` failed on every single call ever made —
   expiry alone eventually retires every nonce from this list, independent of
   whether consumption was ever recorded.
@@ -294,13 +331,23 @@ defmodule Genswarms.Payments.Store do
 
   @doc """
   Retire a nonce from `live_authorization_nonces/1` once the hub has observed
-  its `AuthorizationUsed` log on chain.
+  its `AuthorizationUsed` log on chain AND durably resolved the linked
+  Transfer.
 
-  Called as soon as that on-chain correlation is made — INDEPENDENTLY of
-  whether the linked Transfer goes on to settle or is quarantined by this
-  hub's own caps. The nonce is consumed on-chain the moment the token
-  contract fires the event; the hub's cap policy is a separate decision made
-  afterward and must not gate this call.
+  Called INDEPENDENTLY of whether that Transfer settled or was quarantined by
+  this hub's own caps — the nonce is consumed on-chain the moment the token
+  contract fires the event, and the hub's cap policy is a separate decision
+  made afterwards that must not gate this call. Both outcomes are recorded
+  rows the dedup recognises forever, so neither can be re-presented.
+
+  It is NOT called when the settlement is HELD (a store blip on the dedup
+  read, the record, or the cap evaluation). A hold means the chain's cursor
+  stays put and the Transfer is re-presented on a later tick — but
+  re-presentation is only lossless while this nonce is still in the filter
+  above, because that is the only query that recovers the correlation.
+  Retiring it first turns every held authorization settlement into a
+  permanent UNDER-credit: the retry arrives with no nonce at all and is buried
+  as an unrecognised inflow while the cursor advances past it.
 
   A failure here is logged and NOT fail-closed: the worst case is the nonce
   stays in the live filter and gets asked about again next tick until it
@@ -312,11 +359,24 @@ defmodule Genswarms.Payments.Store do
 
   @doc """
   Record a Transfer into the treasury wallet that the credit rule refused to
-  credit — either it carried no correlated `AuthorizationUsed` nonce at all,
-  or its nonce was never found by `issued_authorization/1` (a different
-  domain's on-chain authorization landed in the same wallet — the exact
-  double-credit shape spec §4.4 warns about, e.g. a future deposit-sweep
-  collection correlating to this same treasury address).
+  credit. The row carries a `reason` naming which refusal it was, plus the
+  `nonce_candidates` the hub was choosing between:
+
+  - `not_issued` — no `AuthorizationUsed` in the same transaction had this
+    Transfer's sender as its `authorizer`, or the one that did carries a nonce
+    `issued_authorization/1` never heard of (a different domain's on-chain
+    authorization landing in the same wallet — the exact double-credit shape
+    spec §4.4 warns about, e.g. a future deposit-sweep collection correlating
+    to this same treasury address).
+  - `ambiguous_correlation` — the correlation was genuinely undecidable: two
+    issued authorizations in the transaction share this Transfer's sender as
+    authorizer, or two treasury Transfers in it share a sender. Log order
+    inside a batched transaction is attacker-controlled (anyone may submit an
+    EIP-3009 authorization), so the hub refuses to guess. THIS ROW IS AN
+    OPERATOR SIGNAL, not routine noise.
+  - `issued_row_unusable` — the nonce resolved, but the stored row could not
+    supply a usable `beneficiary` or `amount_usd`. A store defect, held rather
+    than credited to `nil` or to an unbounded amount.
 
   Never blocks the scan: a write failure here is logged, but the chain's
   cursor still advances normally, because nothing in this row was ever
