@@ -91,11 +91,20 @@ between "a signed authorization" and "a credited payment":
   `mark_authorization_consumed/1`, `record_unrecognised_inflow/1`. A store
   missing any of them raises at `init/1` unless you pass the explicit
   `allow_ephemeral: true` opt-out — same stance, and the same opt-out, as the
-  durable-settlement-ledger gate, and for the same reason: a hub that answers
-  `issue_authorization` with `ok: true` but cannot register the nonce
-  acknowledges money it can never credit (the user signs, the money moves,
-  and every payment lands `unrecognised`). Partial coverage of either round
-  trip is refused too, like every other callback group in this package.
+  durable-settlement-ledger gate. That opt-out only decides whether the
+  PROCESS boots, though: `issue_authorization` itself always refuses
+  per-action (`no_authorization_store`) when `record_issued_authorization/1`
+  isn't exported, with no ephemeral escape and no dependency on whether any
+  chain even configures `treasury_address` — a hub that answered `ok: true`
+  but could never register the nonce acknowledged money it can never credit
+  (the user signs, the money moves, and every payment lands `unrecognised`).
+  Partial coverage of either round trip is refused too, like every other
+  callback group in this package.
+- A store fault ON the lookup (`issued_authorization/1` raising or exiting,
+  as opposed to answering `nil`) is not treated as "never issued": the
+  Transfer is HELD — not credited, not recorded unrecognised, cursor not
+  advanced, nonce left live — so a transient store outage cannot bury a real
+  payment forever. It re-presents and settles once the store recovers.
 - `record_issued_authorization/1`'s duplicate answer must carry the row:
   `{:ok, :duplicate, stored_row}`. The hub echoes THAT row back, so a caller
   that timed out and retried the same `order_ref` with a freshly minted nonce
@@ -178,15 +187,24 @@ between "a signed authorization" and "a credited payment":
   `{"ok": false, "error": "no_push_methods"}`. Adding a push method means
   implementing `Method.ingest_event/2` with its OWN signature verification —
   the core trusts whatever settlements a method hands back.
-- **`issue_authorization` without a store to register the nonce is REFUSED,
-  not acked.** A hub whose store cannot record the issuance answers
-  `{"ok": false, "error": "store_unavailable"}`, and a chain with a
-  `treasury_address` whose store is missing any of the five authorization
-  callbacks does not boot at all. Both were previously `ok: true` + silence,
-  which is the worst possible shape: the user signs, the money moves on
-  chain, and every payment lands `unrecognised`. If you genuinely want the
-  memory-mode behaviour for a dev swarm, pass `allow_ephemeral: true` —
-  explicitly, exactly like the settlement ledger's opt-out.
+- **`issue_authorization` without `record_issued_authorization/1` is REFUSED,
+  not acked — unconditionally, regardless of chain config or
+  `allow_ephemeral`.** A store not exporting that callback answers
+  `{"ok": false, "error": "no_authorization_store"}`; a store that exports it
+  but errors on the write answers `{"ok": false, "error":
+  "store_unavailable"}`; and a chain with a `treasury_address` whose store is
+  missing any of the five authorization callbacks does not boot at all unless
+  `allow_ephemeral: true` is set. There is **no memory-mode fallback for this
+  one action**, even with `allow_ephemeral: true` — that flag only lets the
+  PROCESS boot with an inert authorization lane (so a hub whose other lanes
+  work fine doesn't crash-loop over one missing registry); it was never meant
+  to let `issue_authorization` lie about success, because unlike the
+  settlement ledger's own ephemeral fallback (loses durability, not
+  correctness), a "memory success" here is a nonce this hub could never look
+  up again even one poll later on the same node. Previously a treasury-less
+  hub (`chains` with no `treasury_address` — the boot gate never even looks)
+  under `allow_ephemeral: true` answered `ok: true` and silently minted an
+  uncreditable nonce; fixed (M1).
 - **`payments_unrecognised_inflow` with `reason: "ambiguous_correlation"` is
   not routine noise** — it means real money landed in the treasury that the
   hub refused to attribute because the transaction was undecidable (two

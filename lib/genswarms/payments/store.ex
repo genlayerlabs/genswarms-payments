@@ -273,10 +273,24 @@ defmodule Genswarms.Payments.Store do
   same-wallet inflow from a DIFFERENT domain's own on-chain authorization
   (e.g. a future deposit-sweep collection correlating to the same treasury
   address) — exactly as firmly as an unbound deposit address refuses to
-  settle. There is no error-tuple return: a store that cannot answer this
-  query MUST behave as if every nonce is unrecognised. This callback would
-  rather under-credit (held as unrecognised, an operator reissues by hand)
-  than ever fabricate a beneficiary from a lookup it cannot actually perform.
+  settle.
+
+  There is no error-TUPLE return, but a store MAY signal that it cannot
+  currently answer at all by raising or exiting — the hub catches that and
+  HOLDS the settlement (nonce stays live, cursor stays put, the store is
+  asked again next tick) rather than treating the fault as "unrecognised".
+  Earlier revisions of this doc required "behave as if every nonce is
+  unrecognised" on any failure, on the theory that under-crediting is always
+  the safer direction; that was itself a bug (F2): it made a transient store
+  fault indistinguishable from a genuinely foreign nonce, so a real payment
+  this hub had a row for got buried as unrecognised and its cursor advanced
+  past it — a fabricated non-beneficiary, and a permanent one, since
+  `mark_authorization_consumed/1` never even ran to keep the nonce alive for
+  a retry. Holding fabricates no beneficiary either and loses nothing: the
+  nonce is still live (see C1), so recovery costs nothing but a later tick.
+  NOT-EXPORTED is unaffected by any of this — it is the ordinary
+  memory-fallback path (`nil`, same as a store that has never heard of the
+  nonce), not a fault.
 
   The returned row carries at least `beneficiary` and `amount_usd` (and, for
   audit purposes, the `namespace` it was originally sealed under) — the hub

@@ -25,7 +25,8 @@ defmodule AuthStore do
       issued_by_nonce: %{},
       consumed: MapSet.new(),
       unrecognised: [],
-      fail_record: false
+      fail_record: false,
+      fail_lookup: false
     })
   end
 
@@ -82,7 +83,18 @@ defmodule AuthStore do
     end
   end
 
-  def issued_authorization(nonce_hex), do: Map.get(d().issued_by_nonce, nonce_hex)
+  # A lookup blip is switchable too (F2), same reason as fail_record: driven
+  # through a real poll/1 round rather than reasoned about via a separate fake
+  # module.
+  def fail_lookup(flag), do: put(:fail_lookup, flag)
+
+  def issued_authorization(nonce_hex) do
+    if d().fail_lookup do
+      raise "issuance lookup is down"
+    else
+      Map.get(d().issued_by_nonce, nonce_hex)
+    end
+  end
 
   # ── entry A: nonce-filter round trip ──
   # issued ∧ unconsumed ∧ unexpired — the reference implementation of the
@@ -1313,5 +1325,144 @@ Check.check(
 )
 
 _ = i3_state
+
+# ─────────────────────────────────────────────────────────────────────────
+# A second review pass surfaced two more real defects, neither covered by
+# the fix wave above.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── F2: a store FAULT on the issuance lookup must HOLD, not fail open ─────
+#
+# `issued_authorization_lookup/2` used to hand `nil` to `store_result/4` as
+# BOTH the "not exported" default AND the catch-all for a raise/exit from an
+# exported callback — so a store that RAISES on `issued_authorization/1`
+# looked identical to "this hub never issued this nonce": the Transfer was
+# recorded unrecognised and the chain's cursor advanced past a payment the
+# hub actually has a row for. Fail CLOSED instead, mirroring the settlement
+# ledger's own dedup-read stance (payment_seen_lookup/2, C1's
+# record_payment blip): hold the settlement, leave the nonce live, let the
+# next tick ask the store again.
+AuthStore.reset()
+f2_state = Payments.init!(scan_config)
+nonce_f2 = "0x" <> String.duplicate("7a", 32)
+f2_state = issue_for.(f2_state, nonce_f2, "order-f2", "user:f2", "30", now_unix + 3600)
+
+f2_logs = {
+  [mk_transfer_log.(treasury, alice, 10, "0xTXF2", 0, 30_000_000)],
+  [mk_auth_log.(alice, nonce_f2, 10, "0xTXF2", 1)]
+}
+
+AuthStore.fail_lookup(true)
+
+f2_state =
+  %{f2_state | rpc_fn: mk_rpc.(elem(f2_logs, 0), elem(f2_logs, 1), 100)}
+  |> Payments.poll()
+
+Check.check(
+  f,
+  "F2. a store that RAISES on the lookup HOLDS the inflow (nothing settled)",
+  AuthStore.rows() == []
+)
+
+Check.check(
+  f,
+  "F2. and does NOT record it as unrecognised — unknown is not 'not ours'",
+  AuthStore.unrecognised() == []
+)
+
+Check.check(f, "F2. the chain's cursor did not advance past it", AuthStore.cursor("base") == nil)
+
+Check.check(
+  f,
+  "F2. the nonce stays live so the retry can still correlate",
+  not AuthStore.consumed?(nonce_f2) and nonce_f2 in AuthStore.live_authorization_nonces(now_unix)
+)
+
+AuthStore.fail_lookup(false)
+
+f2_state =
+  %{f2_state | rpc_fn: mk_rpc.(elem(f2_logs, 0), elem(f2_logs, 1), 100)}
+  |> Payments.poll()
+
+f2_row = row_for.("8453:0xTXF2:0")
+
+Check.check(
+  f,
+  "F2. once the store recovers, the SAME money credits on the next round",
+  f2_row != nil and f2_row.beneficiary == "user:f2" and
+    Decimal.equal?(f2_row.amount_usd, Decimal.new("30"))
+)
+
+Check.check(f, "F2. and only now is the nonce consumed", AuthStore.consumed?(nonce_f2))
+
+_ = f2_state
+
+# ── M1: a store with no registry callback is refused, in ANY chain config ─
+#
+# The I1 boot gate (`validate_authorization_store!/3`) only fires when SOME
+# chain configures `treasury_address` — a hub with no treasury chain at all
+# sails past it with no registry whatsoever, and previously that meant
+# `issue_authorization` could still answer ok:true via the `allow_ephemeral`
+# memory fallback: a nonce nothing could ever look up, acked anyway. Fixed:
+# `issue_authorization` refuses `no_authorization_store` per-action whenever
+# `record_issued_authorization/1` isn't exported, with NO ephemeral escape —
+# mirrors `release_payment`'s `no_release_store`, which never had one either.
+storeless_no_treasury_config = %{
+  xpub: xpub,
+  allow_test_xpub: true,
+  trusted_sources: ["ingress"],
+  targets: [],
+  namespace: "hub_ns",
+  auto_tick: false,
+  chains: [],
+  # The exact gap: allow_ephemeral was set for entirely unrelated reasons (a
+  # dev swarm with no durable settlement store either) and, pre-fix, that
+  # SAME flag silently let this lane through too.
+  allow_ephemeral: true
+}
+
+storeless_state = Payments.init!(storeless_no_treasury_config)
+
+{:reply, json_m1, _state} =
+  Payments.handle_message(
+    "ingress",
+    Jason.encode!(%{
+      "action" => "issue_authorization",
+      "nonce" => "0x" <> String.duplicate("6f", 32),
+      "order_ref" => "order-m1",
+      "beneficiary" => "user:m1",
+      "amount_usd" => "20",
+      "valid_before" => now_unix + 3600
+    }),
+    storeless_state
+  )
+
+reply_m1 = Jason.decode!(json_m1)
+
+Check.check(
+  f,
+  "M1. no chain has a treasury AND allow_ephemeral is set — issuance is still refused, not acked",
+  reply_m1["ok"] == false and reply_m1["error"] == "no_authorization_store"
+)
+
+{:reply, json_m1_again, _state} =
+  Payments.handle_message(
+    "ingress",
+    Jason.encode!(%{
+      "action" => "issue_authorization",
+      "nonce" => "0x" <> String.duplicate("8b", 32),
+      "order_ref" => "order-m1",
+      "beneficiary" => "user:m1",
+      "amount_usd" => "20",
+      "valid_before" => now_unix + 3600
+    }),
+    storeless_state
+  )
+
+Check.check(
+  f,
+  "M1. nothing was written for the refused attempt (a repeat with the SAME order_ref is refused identically, not treated as a duplicate)",
+  Jason.decode!(json_m1_again) == reply_m1
+)
 
 Check.finish(f)
