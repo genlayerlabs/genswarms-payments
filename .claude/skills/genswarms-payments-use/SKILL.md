@@ -284,7 +284,56 @@ offline-signing ritual becomes.
   the authorized amount and the gap is a real signal about the correlation or
   the token contract.
 
+## Adopting in a second host
+
+The whole authorization lane (issue → watch → credit → tell the user →
+dashboard) is host-portable: the package owns the logic, the host owns its
+tables, its transport, and its voice. The first host (wingston) proved every
+step live on Base Sepolia 2026-07; adopting is a recipe with an automatic
+judge at each step — never archaeology of the first host's code:
+
+1. **Schema.** Copy `priv/reference_schema.sql` into your migration system
+   (five tables; the money-bearing column notes are inline). Rename nothing
+   you don't have to.
+
+2. **Store adapter.** Implement the `Genswarms.Payments.Store` callbacks
+   over those tables. The optional groups matter as groups: the six
+   authorization callbacks for the lane, `authorization_by_order_ref/1` +
+   `authorization_by_settlement/2` for the chat presenter, the two
+   `list_*` reads for the dashboard page.
+
+3. **Prove it.** `Genswarms.Payments.StoreConformance.run!(YourStore)`
+   against a throwaway database, inside your own gates. Green with no skips
+   in the sections you adopted = your adapter honors the semantics the hub
+   and presenter rely on. Do NOT trust a hand-rolled fake instead: both
+   real defects this lane ever shipped were store doubles that answered
+   what the test hoped for.
+
+4. **Wire the presenter.** `Genswarms.Payments.TopupAck.result_fn/1` as the
+   keeper's `result_fn` and `.credit_notice_fn/1` as the proxy's credit
+   seam — three injected functions (`:store`, `:conversation_fn`,
+   `:deliver_fn`), zero logic. Default English copy included;
+   `:text_fn`/`:credit_text_fn` override the voice. To get card-editing
+   (one card progressing instead of stacked messages, retiring the payment
+   link on signature), record `card_chat_id`/`card_message_id` from your
+   delivery effect when the top-up card lands.
+
+5. **Register the page.** One probed line in your dashboard source:
+   `Genswarms.Payments.Dashboard.dashboard_extension(store_mod: YourStore)`
+   (guard with `function_exported?`, rescue to `%{}` — the page must never
+   break the feed).
+
+Keeper results vocabulary (wallet-bridge ≥ 0.8.0): `{:refused, reason}` is
+the simulation gate declining pre-broadcast (zero gas; `reason` is the
+contract's decoded revert string) and `{:failed, :reverted}` is an on-chain
+revert after a real broadcast. The default copy distinguishes them; if you
+write your own, do not collapse them — the first host shipped that collapse
+and told a user with insufficient USDC that their payment "didn't go
+through on the chain".
+
 ## Verification
 
 `./checks/run.sh` — every `checks/payments_*.exs` (no Postgres, no network;
 injected seams: fake store, injected `rpc_fn`/`now_fn`/`deliver_fn`).
+Adopting hosts additionally run `StoreConformance.run!/1` against their real
+store (see above) — the first host wires it into its throwaway-PG gate.
