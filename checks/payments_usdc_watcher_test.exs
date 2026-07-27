@@ -37,11 +37,12 @@ value_hex = "0x" <> String.pad_leading("4c4b40", 64, "0")
 
 state0 =
   Payments.init!(%{
-    name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt", trusted_sources: ["ingress"],
+    name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true, trusted_sources: ["ingress"],
     targets: ["llm_proxy"], namespace: "llm_quota", store_mod: ScanStore,
     auto_tick: false, now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
     deliver_fn: fn _, _, _ -> :ok end,
-    chains: [%{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+    chains: [%{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
                confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000,
                address_chunk: 2}],
     rpc_fn: nil
@@ -54,11 +55,12 @@ state0 =
 addr = Jason.decode!(j)["address"]
 
 canned = fn logs, latest ->
-  fn _chain, method, params ->
+  fn chain, method, params ->
     Agent.update(rpc_log, &[{method, params} | &1])
     case method do
       "eth_blockNumber" -> {:ok, "0x" <> Integer.to_string(latest, 16)}
       "eth_getLogs" -> {:ok, logs}
+      m -> Check.self_check_rpc(chain, m)
     end
   end
 end
@@ -87,7 +89,31 @@ row = hd(ScanStore.rows())
 Check.check(f, "amount converted at 6 decimals", Decimal.equal?(row.amount_usd, Decimal.new("5")))
 Check.check(f, "beneficiary resolved from binding", row.beneficiary == "budget:abc")
 Check.check(f, "method is usdc_<chain>", row.method == "usdc_base")
-Check.check(f, "idempotency key is chain:tx:logIndex", row.idempotency_key == "base:0xT1:0")
+Check.check(f, "idempotency key is chain_id:tx:logIndex", row.idempotency_key == "8453:0xT1:0")
+
+# The receiving address is a chain fact like from_address (2026-07-27, found
+# live): without it, a deposit view can only attribute receipts by
+# BENEFICIARY, and a re-bound beneficiary (address migration) inherits the
+# old address's history — the Deposits page showed 1.00 "uncollected" at an
+# address that held 0 on chain. Lowercase, exactly as topic_address emits.
+Check.check(f, "settlement records WHICH address received it (to_address)",
+  Map.get(row, :to_address) == String.downcase(addr))
+facts = Map.take(row, [:raw_amount, :decimals, :token_contract, :chain, :chain_id,
+  :block_number, :log_index, :tx_hash, :from_address])
+Check.check(f, "durable row carries every chain fact used to compute money",
+  facts == %{
+    raw_amount: 5_000_000,
+    decimals: 6,
+    token_contract: "0xCONTRACT",
+    chain: "base",
+    chain_id: 8453,
+    block_number: 150,
+    log_index: 0,
+    tx_hash: "0xT1",
+    from_address: "0x" <> String.duplicate("a", 40)
+  })
+Check.check(f, "in-memory mirror preserves the same chain facts",
+  Map.take(hd(state.settlement_mirror), Map.keys(facts)) == facts)
 Check.check(f, "cursor advanced to safe_to (190), NOT latest",
   ScanStore.cursor("base") == 190)
 
@@ -95,9 +121,48 @@ Check.check(f, "cursor advanced to safe_to (190), NOT latest",
 state = %{state | rpc_fn: canned.(logs, 300)}
 state = Payments.poll(state)
 Check.check(f, "previously-unconfirmed log settles after confirmations",
-  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xT3:0")))
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xT3:0")))
 Check.check(f, "no duplicate of the first payment",
-  Enum.count(ScanStore.rows(), &(&1.idempotency_key == "base:0xT1:0")) == 1)
+  Enum.count(ScanStore.rows(), &(&1.idempotency_key == "8453:0xT1:0")) == 1)
+
+# ── C2: the CREDIT leg's depth is fast_credit_depth, explicitly labelled.
+# It is NOT finality (which the reconcile action queries from the chain's
+# `finalized` tag); it is the shallow, fast path a user waits on, bounded by
+# C1's caps. It defaults to `confirmations` so existing configs keep their
+# depth, and overrides it when set.
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+
+state_fast =
+  Payments.init!(%{
+    name: :payments,
+    xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
+    trusted_sources: ["ingress"],
+    targets: ["llm_proxy"],
+    namespace: "llm_quota",
+    store_mod: ScanStore,
+    auto_tick: false,
+    now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
+    deliver_fn: fn _, _, _ -> :ok end,
+    chains: [%{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
+               confirmations: 10, fast_credit_depth: 40, decimals: 6, start_block: 100,
+               max_block_range: 1000, address_chunk: 2}],
+    rpc_fn: nil
+  })
+
+_state_fast = Payments.poll(%{state_fast | rpc_fn: canned.([mk_log.(addr, 150, "0xFAST", 0)], 200)})
+
+Check.check(f, "the credit leg scans to latest - fast_credit_depth (160), not - confirmations",
+  ScanStore.cursor("base") == 160 and
+    Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xFAST:0")))
+
+ScanStore.reset()
+ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
+_state_default_depth = Payments.poll(%{state0 | rpc_fn: canned.([], 200)})
+
+Check.check(f, "fast_credit_depth defaults to the chain's confirmations (unchanged behaviour)",
+  ScanStore.cursor("base") == 190)
 
 # getLogs range + address filter shape
 calls = Agent.get(rpc_log, &Enum.reverse(&1))
@@ -118,7 +183,7 @@ state_evil = %{state0 | rpc_fn: canned.([fake_log, legit_log], 200)}
 _state_evil = Payments.poll(state_evil)
 
 Check.check(f, "log from an unexpected contract address is rejected while a legit log in the same batch settles",
-  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xLEGIT:0")) and
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xLEGIT:0")) and
     not Enum.any?(ScanStore.rows(), &(&1.ref == "0xFAKE:0")))
 
 # RPC failure ⇒ cursor does not advance
@@ -134,11 +199,12 @@ ScanStore.reset()
 ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
 
 state_chunk = Payments.init!(%{
-  name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt", trusted_sources: ["ingress"],
+  name: :payments, xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+  allow_test_xpub: true, trusted_sources: ["ingress"],
   targets: ["llm_proxy"], namespace: "llm_quota", store_mod: ScanStore,
   auto_tick: false, now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
   deliver_fn: fn _, _, _ -> :ok end,
-  chains: [%{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+  chains: [%{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
              confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000,
              address_chunk: 2}],
   rpc_fn: nil
@@ -156,11 +222,12 @@ _addr_ghi = Jason.decode!(jg)["address"]
 
 {:ok, rpc_log2} = Agent.start_link(fn -> [] end)
 canned_empty = fn latest ->
-  fn _chain, method, _params ->
+  fn chain, method, _params ->
     Agent.update(rpc_log2, &[method | &1])
     case method do
       "eth_blockNumber" -> {:ok, "0x" <> Integer.to_string(latest, 16)}
       "eth_getLogs" -> {:ok, []}
+      m -> Check.self_check_rpc(chain, m)
     end
   end
 end
@@ -180,10 +247,11 @@ Check.check(f, "address_chunk splits 3 bound addresses into 2 eth_getLogs calls"
 ScanStore.reset()
 ScanStore.seed_binding(%{beneficiary: "budget:abc", index: 0, address: addr, namespace: "llm_quota"})
 
-null_block_rpc = fn _chain, method, _params ->
+null_block_rpc = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, nil}
     "eth_getLogs" -> {:ok, []}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -209,6 +277,7 @@ state_two_chain =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -217,9 +286,9 @@ state_two_chain =
     now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "bad_chain", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+      %{name: "bad_chain", chain_id: 1, rpc_url: "injected", usdc_contract: "0xCONTRACT",
         confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000},
-      %{name: "good_chain", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+      %{name: "good_chain", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
         confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000}
     ],
     rpc_fn: nil
@@ -238,6 +307,7 @@ mixed_rpc = fn chain, method, _params ->
     {"bad_chain", "eth_getLogs"} -> {:ok, []}
     {"good_chain", "eth_blockNumber"} -> {:ok, "0xc8"}
     {"good_chain", "eth_getLogs"} -> {:ok, [good_log]}
+    {_name, m} -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -245,7 +315,7 @@ state_two_chain = %{state_two_chain | rpc_fn: mixed_rpc}
 _state_two_chain = Payments.poll(state_two_chain)
 
 Check.check(f, "a chain with a bad RPC shape is skipped while the other chain still settles",
-  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "good_chain:0xGOOD:0")) and
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xGOOD:0")) and
     ScanStore.cursor("bad_chain") == nil)
 
 # ── 2b: pin the cursor fail-closed invariant (coverage-only — the adversarial
@@ -291,6 +361,7 @@ state_ci =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -299,7 +370,7 @@ state_ci =
     now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "cursorinv", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+      %{name: "cursorinv", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
         confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
     ],
     rpc_fn: nil
@@ -312,10 +383,11 @@ addr_ci = Jason.decode!(jci)["address"]
 
 log_ci = mk_log.(addr_ci, 5, "0xCI1", 0)
 
-rpc_ci = fn _chain, method, _params ->
+rpc_ci = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [log_ci]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -340,6 +412,7 @@ state_dedup =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -348,7 +421,7 @@ state_dedup =
     now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "dedupchain", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+      %{name: "dedupchain", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
         confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
     ],
     rpc_fn: nil
@@ -360,12 +433,13 @@ state_dedup =
 addr_dedup = Jason.decode!(jd)["address"]
 
 log_dedup = mk_log.(addr_dedup, 5, "0xDEDUP", 0)
-CursorInvariantStore.seed_seen("dedupchain:0xDEDUP:0")
+CursorInvariantStore.seed_seen("8453:0xDEDUP:0")
 
-rpc_dedup = fn _chain, method, _params ->
+rpc_dedup = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [log_dedup]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -413,6 +487,7 @@ state_raising0 =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -421,7 +496,7 @@ state_raising0 =
     now_fn: fn -> ~U[2026-07-22 12:00:00Z] end,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT",
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT",
         confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000,
         address_chunk: 2}
     ],
@@ -439,11 +514,12 @@ log_raising = mk_log.(addr_raising, 150, "0xRAISING", 0)
 
 {:ok, rpc_log_raising} = Agent.start_link(fn -> [] end)
 
-rpc_raising = fn _chain, method, _params ->
+rpc_raising = fn chain, method, _params ->
   Agent.update(rpc_log_raising, &[method | &1])
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [log_raising]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -483,11 +559,11 @@ state_dust = %{
 _state_dust = Payments.poll(state_dust)
 
 Check.check(f, "2e: a zero-value Transfer log never settles (no ledger row)",
-  not Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xDUST:0")))
+  not Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xDUST:0")))
 Check.check(f, "2e: a zero-value Transfer log never delivers payment_confirmed",
   Agent.get(delivered_dust, & &1) == [{"llm_proxy", :payments}])
 Check.check(f, "2e: the legit non-zero log in the same batch still settles",
-  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xPAID:0")))
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xPAID:0")))
 Check.check(f, "2e: the cursor still advances normally past the skipped dust log",
   ScanStore.cursor("base") == 190)
 
@@ -520,12 +596,12 @@ Check.check(f, "R3-I1: cursor NOT advanced past the hash-less log",
   ScanStore.cursor("base") == nil)
 
 # a later well-formed log at the same (block, logIndex) coordinates still
-# settles under its correct chain:tx:logIndex key — nothing was poisoned
+# settles under its correct chain_id:tx:logIndex key — nothing was poisoned
 state_healed = %{state0 | rpc_fn: canned.([mk_log.(addr, 150, "0xHEALED", 0)], 200)}
 _state_healed = Payments.poll(state_healed)
 
 Check.check(f, "R3-I1: a later well-formed log settles under its correct key",
-  Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["base:0xHEALED:0"] and
+  Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["8453:0xHEALED:0"] and
     ScanStore.cursor("base") == 190)
 
 # ── R3-M1: hex comparisons are case-INSENSITIVE. A nonstandard node emitting
@@ -554,7 +630,7 @@ state_upper = %{state0 | rpc_fn: canned.([upper_log], 200)}
 _state_upper = Payments.poll(state_upper)
 
 Check.check(f, "R3-M1: an uppercase-hex log (topic0/topics/address/data) settles normally",
-  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xUPPER:0")) and
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xUPPER:0")) and
     ScanStore.cursor("base") == 190)
 
 # ── R3-M2: `removed: true` reorg markers never settle and never deliver —
@@ -577,11 +653,11 @@ state_removed = %{
 _state_removed = Payments.poll(state_removed)
 
 Check.check(f, "R3-M2: a removed:true reorg marker never settles (no ledger row)",
-  not Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xREMOVED:0")))
+  not Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xREMOVED:0")))
 Check.check(f, "R3-M2: a removed:true reorg marker never delivers payment_confirmed",
   not Enum.any?(Agent.get(delivered_removed, & &1), fn {_t, c} -> String.contains?(c, "0xREMOVED") end))
 Check.check(f, "R3-M2: the sibling normal log in the same batch still settles and the cursor advances",
-  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "base:0xSIBLING:0")) and
+  Enum.any?(ScanStore.rows(), &(&1.idempotency_key == "8453:0xSIBLING:0")) and
     ScanStore.cursor("base") == 190)
 
 # ── R3-R1: malformed topics fail CLOSED like a missing transactionHash. The
@@ -612,7 +688,7 @@ Check.check(f, "R3-R1: cursor NOT advanced past the nil-topic log",
 # a later well-formed log at the same coordinates still settles — held, not lost
 _ = Payments.poll(%{state0 | rpc_fn: canned.([mk_log.(addr, 150, "0xTOPICOK", 0)], 200)})
 Check.check(f, "R3-R1: a later well-formed log settles and the cursor advances",
-  Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["base:0xTOPICOK:0"] and
+  Enum.map(ScanStore.rows(), & &1.idempotency_key) == ["8453:0xTOPICOK:0"] and
     ScanStore.cursor("base") == 190)
 
 Check.finish(f)

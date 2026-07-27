@@ -5,8 +5,10 @@
 #
 #   - the hub's deliver_fn invokes the REAL Proxy.handle_message/3 on the live
 #     proxy state (exactly what a host's ObjectServer.deliver_message does),
-#     returning :ok only when the proxy's reply is ok:true — the D2
-#     serial-per-ref delivery/retry contract, end to end;
+#     returning :ok only when the proxy's reply is ok:true — the one-shot
+#     latency path, end to end;
+#   - failed pushes recover through the hub's stateless settlements_since
+#     seam and the same REAL validating proxy ingress;
 #   - the proxy runs its REAL Bandit listener and a REAL local fake upstream
 #     with known token costs, so budget math is exact;
 #   - the proxy's topup_hint_fun asks the LIVE hub for the deposit address
@@ -98,7 +100,8 @@ end
 # errors while everything else stays healthy.
 defmodule E2E.ProxyStore do
   def start_link,
-    do: Agent.start_link(fn -> %{budget: %{}, ledger: [], credit_down: false} end, name: __MODULE__)
+    do:
+      Agent.start_link(fn -> %{budget: %{}, ledger: [], credit_down: false} end, name: __MODULE__)
 
   def credit_down!(flag), do: Agent.update(__MODULE__, &%{&1 | credit_down: flag})
 
@@ -176,7 +179,11 @@ end
 # override for the re-present-same-range leg of the idempotency scenario.
 defmodule E2E.HubStore do
   def reset,
-    do: :persistent_term.put({__MODULE__, :d}, %{seen: MapSet.new(), rows: [], cursor: %{}, bindings: []})
+    do:
+      :persistent_term.put(
+        {__MODULE__, :d},
+        %{seen: MapSet.new(), rows: [], cursor: %{}, bindings: [], next_seq: 1}
+      )
 
   defp d, do: :persistent_term.get({__MODULE__, :d})
   defp put(k, v), do: :persistent_term.put({__MODULE__, :d}, Map.put(d(), k, v))
@@ -186,12 +193,30 @@ defmodule E2E.HubStore do
   def payment_seen?(k), do: {:ok, MapSet.member?(d().seen, k)}
 
   def record_payment(row) do
+    seq = d().next_seq
+    row = %{row | outbox_seq: seq}
     put(:seen, MapSet.put(d().seen, row.idempotency_key))
     put(:rows, [row | d().rows])
-    :ok
+    put(:next_seq, seq + 1)
+    {:ok, seq}
   end
 
   def rows, do: Enum.reverse(d().rows)
+
+  def list_settlements_since(after_seq, limit) do
+    rows = rows()
+
+    {:ok,
+     %{
+       settlements:
+         rows
+         |> Enum.filter(&(&1.outbox_seq > after_seq))
+         |> Enum.sort_by(& &1.outbox_seq)
+         |> Enum.take(limit),
+       max_seq: Enum.reduce(rows, 0, &max(&1.outbox_seq, &2))
+     }}
+  end
+
   def get_last_scanned_block(chain), do: {:ok, Map.get(d().cursor, chain)}
   def put_last_scanned_block(chain, n), do: put(:cursor, Map.put(d().cursor, chain, n))
   def cursor(chain), do: Map.get(d().cursor, chain)
@@ -222,6 +247,13 @@ defmodule E2E.Chain do
   end
 
   def rpc(_chain, "eth_blockNumber", _params), do: {:ok, hex(d().latest)}
+
+  # D4: the hub proves the endpoint really is the configured chain before it
+  # scans anything — a fake chain answers truthfully here.
+  def rpc(chain, "eth_chainId", _params), do: {:ok, hex(chain.chain_id)}
+
+  def rpc(chain, "eth_call", [%{"data" => "0x313ce567"}, "latest"]),
+    do: {:ok, "0x" <> String.pad_leading(Integer.to_string(Map.get(chain, :decimals, 6), 16), 64, "0")}
 
   def rpc(_chain, "eth_getLogs", [params]) do
     from = hex_int(params["fromBlock"])
@@ -274,7 +306,6 @@ defmodule E2E.Hub do
   end
 
   def tick, do: call("cron", %{action: "tick"})
-  def undelivered, do: Agent.get(__MODULE__, & &1.undelivered)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -282,6 +313,7 @@ end
 # ═══════════════════════════════════════════════════════════════════════════
 
 addr0 = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94"
+
 xpub =
   "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt"
 
@@ -296,7 +328,12 @@ E2E.Chain.reset()
 E2E.Flags.reset()
 
 {:ok, _fake_upstream} =
-  Bandit.start_link(plug: E2E.FakeUpstream, scheme: :http, ip: {127, 0, 0, 1}, port: upstream_port)
+  Bandit.start_link(
+    plug: E2E.FakeUpstream,
+    scheme: :http,
+    ip: {127, 0, 0, 1},
+    port: upstream_port
+  )
 
 # Proxy: tiny daily limit that exactly two $0.625 chat calls exhaust; credits
 # wired to the hub's object name + namespace; topup_hint_fun asks the LIVE hub
@@ -327,8 +364,11 @@ E2E.Flags.reset()
     end
   })
 
-Check.check(f, "proxy boots with credits_enabled (payments_source configured)",
-  proxy.credits_enabled == true)
+Check.check(
+  f,
+  "proxy boots with credits_enabled (payments_source configured)",
+  proxy.credits_enabled == true
+)
 
 {:ok, token} =
   Proxy.register_session(proxy.state_pid, %{
@@ -345,11 +385,13 @@ beneficiary = session.budget_identity
 # proxy ingress on the live state, and counts as delivered ONLY when the
 # proxy's reply is ok:true — exactly the host's mapping. E2E.Flags.drop_ack?
 # simulates the delivered-but-ack-lost window (the proxy processed the
-# message; the hub never learned) that at-least-once delivery must survive.
+# message; the hub never learned) that outbox recovery must survive.
 deliver_fn = fn target, from, content ->
   case target do
     "llm_proxy" ->
-      E2E.DeliveryLog.record({:delivery, %{target: target, from: from, content: Jason.decode!(content)}})
+      E2E.DeliveryLog.record(
+        {:delivery, %{target: target, from: from, content: Jason.decode!(content)}}
+      )
 
       case Proxy.handle_message(from, content, proxy) do
         {:reply, json, _st} ->
@@ -376,6 +418,7 @@ hub_state =
     name: :payments,
     swarm_name: "e2e",
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress", "cron"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -385,8 +428,16 @@ hub_state =
     deliver_fn: deliver_fn,
     rpc_fn: &E2E.Chain.rpc/3,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT",
-        confirmations: 10, decimals: 6, start_block: 100, max_block_range: 1000}
+      %{
+        name: "base",
+        chain_id: 8453,
+        rpc_url: "injected",
+        usdc_contract: "0xCONTRACT",
+        confirmations: 10,
+        decimals: 6,
+        start_block: 100,
+        max_block_range: 1000
+      }
     ]
   })
 
@@ -408,6 +459,34 @@ chat = fn ->
 end
 
 balance = fn -> Proxy.credit_balance(proxy.state_pid, E2E.ProxyStore, beneficiary) end
+
+poll_outbox = fn after_seq ->
+  {:ok, %{settlements: rows, next_seq: next_seq, max_seq: max_seq}} =
+    Payments.settlements_since(
+      %{store_mod: E2E.HubStore, namespace: "llm_quota"},
+      after_seq,
+      100
+    )
+
+  replies =
+    Enum.map(rows, fn row ->
+      content =
+        Jason.encode!(%{
+          action: "payment_confirmed",
+          beneficiary: row.beneficiary,
+          amount_usd: Decimal.to_string(row.amount_usd),
+          method: row.method,
+          ref: row.ref,
+          namespace: row.namespace,
+          at: DateTime.to_iso8601(row.at)
+        })
+
+      {:reply, json, _} = Proxy.handle_message("payments", content, proxy)
+      Jason.decode!(json)
+    end)
+
+  %{rows: rows, replies: replies, next_seq: next_seq, max_seq: max_seq}
+end
 
 quota_status = fn ->
   {:reply, json, _} =
@@ -433,8 +512,12 @@ end
 dep1 = E2E.Hub.call("ingress", %{action: "deposit_address", beneficiary: beneficiary})
 dep2 = E2E.Hub.call("ingress", %{action: "deposit_address", beneficiary: beneficiary})
 
-Check.check(f, "deposit_address for the proxy's budget identity is ADDR0",
-  dep1["ok"] == true and dep1["address"] == addr0 and dep1["namespace"] == "llm_quota")
+Check.check(
+  f,
+  "deposit_address for the proxy's budget identity is ADDR0",
+  dep1["ok"] == true and dep1["address"] == addr0 and dep1["namespace"] == "llm_quota"
+)
+
 Check.check(f, "deposit address is stable on re-request", dep2["address"] == addr0)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -445,23 +528,32 @@ Check.check(f, "deposit address is stable on re-request", dep2["address"] == add
 {s1, r1} = chat.()
 {s2, r2} = chat.()
 
-Check.check(f, "two real chat calls at $0.625 each pass through the $1.25 budget",
+Check.check(
+  f,
+  "two real chat calls at $0.625 each pass through the $1.25 budget",
   s1 == 200 and s2 == 200 and
     get_in(r1, ["choices", Access.at(0), "message", "content"]) == "pong-e2e" and
-    get_in(r2, ["choices", Access.at(0), "message", "content"]) == "pong-e2e")
+    get_in(r2, ["choices", Access.at(0), "message", "content"]) == "pong-e2e"
+)
 
 {s3, r3} = chat.()
 
-Check.check(f, "third call is budget-blocked (spent == limit, zero credit)",
+Check.check(
+  f,
+  "third call is budget-blocked (spent == limit, zero credit)",
   s3 == 200 and r3["model"] == "llm-proxy-budget" and
-    get_in(r3, ["x_router", "budget_exhausted"]) == true)
+    get_in(r3, ["x_router", "budget_exhausted"]) == true
+)
 
 notices = Genswarms.Objects.ObjectServer.notices()
 
-Check.check(f, "block notice carries the hub-provided top-up hint with ADDR0",
+Check.check(
+  f,
+  "block notice carries the hub-provided top-up hint with ADDR0",
   match?([_ | _], notices) and
     String.contains?(List.last(notices), "daily LLM limit") and
-    String.contains?(List.last(notices), "💳 Top up: send USDC (base) to #{addr0}"))
+    String.contains?(List.last(notices), "💳 Top up: send USDC (base) to #{addr0}")
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Pay: a confirmed 2.5 USDC Transfer to ADDR0; tick the hub; the proxy's
@@ -472,32 +564,57 @@ E2E.Chain.pay!(addr0, 150, "0xT1", 0, 2_500_000)
 E2E.Chain.latest!(200)
 E2E.Hub.tick()
 
-Check.check(f, "hub settled the payment durably (ledger row, method usdc_base, ref 0xT1:0)",
-  Enum.map(E2E.HubStore.rows(), & &1.idempotency_key) == ["base:0xT1:0"])
+Check.check(
+  f,
+  "hub settled the payment durably (ledger row, method usdc_base, ref 0xT1:0)",
+  Enum.map(E2E.HubStore.rows(), & &1.idempotency_key) == ["8453:0xT1:0"]
+)
 
 [first_delivery | _] = E2E.DeliveryLog.deliveries()
 
-Check.check(f, "delivery happened over the live seam, stamped payment_confirmed from :payments",
+Check.check(
+  f,
+  "delivery happened over the live seam, stamped payment_confirmed from :payments",
   first_delivery.from == :payments and
     first_delivery.content["action"] == "payment_confirmed" and
     first_delivery.content["beneficiary"] == beneficiary and
-    first_delivery.content["namespace"] == "llm_quota")
+    first_delivery.content["namespace"] == "llm_quota"
+)
 
 wire_amount = first_delivery.content["amount_usd"]
 
-Check.check(f, "wire amount_usd is the plain decimal STRING \"2.5\" (strings-only contract)",
-  wire_amount == "2.5" and is_binary(wire_amount) and Regex.match?(~r/^\d+(\.\d+)?$/, wire_amount))
+Check.check(
+  f,
+  "wire amount_usd is the plain decimal STRING \"2.5\" (strings-only contract)",
+  wire_amount == "2.5" and is_binary(wire_amount) and Regex.match?(~r/^\d+(\.\d+)?$/, wire_amount)
+)
 
 [first_reply | _] = E2E.DeliveryLog.replies()
 
-Check.check(f, "proxy acked the credit: ok:true, credited 2.50, balance 2.50",
+Check.check(
+  f,
+  "proxy acked the credit: ok:true, credited 2.50, balance 2.50",
   first_reply["ok"] == true and first_reply["credited_usd"] == "2.50" and
-    first_reply["balance_usd"] == "2.50")
+    first_reply["balance_usd"] == "2.50"
+)
 
-Check.check(f, "proxy durable credit balance is exactly 2.5", Decimal.equal?(balance.(), Decimal.new("2.5")))
-Check.check(f, "quota_status shows credit balance \"2.50\"",
-  get_in(quota_status.(), ["credit", "balance_usd"]) == "2.50")
-Check.check(f, "hub has nothing queued undelivered", E2E.Hub.undelivered() == %{})
+Check.check(
+  f,
+  "proxy durable credit balance is exactly 2.5",
+  Decimal.equal?(balance.(), Decimal.new("2.5"))
+)
+
+Check.check(
+  f,
+  "quota_status shows credit balance \"2.50\"",
+  get_in(quota_status.(), ["credit", "balance_usd"]) == "2.50"
+)
+
+Check.check(
+  f,
+  "hub state has no in-memory undelivered retry queue",
+  not Agent.get(E2E.Hub, &Map.has_key?(&1, :undelivered))
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Spend credit: the next real HTTP call succeeds; the whole $0.625 cost is
@@ -506,27 +623,39 @@ Check.check(f, "hub has nothing queued undelivered", E2E.Hub.undelivered() == %{
 
 {s4, r4} = chat.()
 
-Check.check(f, "with credit, the blocked identity's next real call reaches the upstream",
+Check.check(
+  f,
+  "with credit, the blocked identity's next real call reaches the upstream",
   s4 == 200 and get_in(r4, ["choices", Access.at(0), "message", "content"]) == "pong-e2e" and
-    r4["model"] != "llm-proxy-budget")
+    r4["model"] != "llm-proxy-budget"
+)
 
-Check.check(f, "balance debited by the upstream's exact cost (2.5 - 0.625 = 1.875)",
-  Decimal.equal?(balance.(), Decimal.new("1.875")))
+Check.check(
+  f,
+  "balance debited by the upstream's exact cost (2.5 - 0.625 = 1.875)",
+  Decimal.equal?(balance.(), Decimal.new("1.875"))
+)
 
-Check.check(f, "the debit is a durable ledger entry (kind debit, -0.625, debit:<request_id> key)",
+Check.check(
+  f,
+  "the debit is a durable ledger entry (kind debit, -0.625, debit:<request_id> key)",
   Enum.any?(E2E.ProxyStore.credit_entries(), fn e ->
     e.kind == "debit" and Decimal.equal?(e.amount_usd, Decimal.new("-0.625")) and
       String.starts_with?(e.idempotency_key, "debit:")
-  end))
+  end)
+)
 
-Check.check(f, "quota_status stays consistent (balance \"1.88\" at 2dp, spend past limit)",
-  get_in(quota_status.(), ["credit", "balance_usd"]) == "1.88")
+Check.check(
+  f,
+  "quota_status stays consistent (balance \"1.88\" at 2dp, spend past limit)",
+  get_in(quota_status.(), ["credit", "balance_usd"]) == "1.88"
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. Idempotency across the seam, both directions:
-#    (a) delivered-but-ack-lost: the proxy credits, the hub never learns and
-#        redelivers the SAME confirmation -> proxy answers duplicate:true,
-#        balance unchanged, exactly one ledger entry;
+#    (a) delivered-but-ack-lost: the proxy credits, the one-shot push fails,
+#        then settlements_since returns the SAME row -> the consumer applies
+#        it through proxy validation and receives duplicate:true;
 #    (b) hub-side re-present: cursor rolled back re-scans the same log range
 #        -> the hub's durable dedup settles nothing, delivers nothing.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -536,33 +665,55 @@ E2E.Chain.latest!(300)
 E2E.Flags.drop_ack!(true)
 E2E.Hub.tick()
 
-Check.check(f, "6a: ack lost — proxy already credited (+1.00) but hub queued the delivery for retry",
+Check.check(
+  f,
+  "6a: ack lost — proxy already credited (+1.00), with no hub retry queue",
   Decimal.equal?(balance.(), Decimal.new("2.875")) and
-    Map.has_key?(E2E.Hub.undelivered(), "base:0xT2:0"))
+    not Agent.get(E2E.Hub, &Map.has_key?(&1, :undelivered))
+)
 
 E2E.Flags.drop_ack!(false)
 replies_before = length(E2E.DeliveryLog.replies())
-E2E.Hub.tick()
+outbox_6a = poll_outbox.(1)
 
-Check.check(f, "6a: redelivery of the SAME confirmation is answered duplicate:true",
-  match?(%{"ok" => true, "duplicate" => true}, List.last(E2E.DeliveryLog.replies())) and
-    length(E2E.DeliveryLog.replies()) == replies_before + 1)
+Check.check(
+  f,
+  "6a: settlements_since returns the push-lost row",
+  Enum.map(outbox_6a.rows, & &1.idempotency_key) == ["8453:0xT2:0"] and
+    outbox_6a.next_seq == 2 and outbox_6a.max_seq == 2
+)
 
-Check.check(f, "6a: balance unchanged and undelivered queue cleared",
-  Decimal.equal?(balance.(), Decimal.new("2.875")) and E2E.Hub.undelivered() == %{})
+Check.check(
+  f,
+  "6a: consumer applies the SAME row and proxy answers duplicate:true",
+  outbox_6a.replies == [%{"ok" => true, "duplicate" => true}] and
+    length(E2E.DeliveryLog.replies()) == replies_before
+)
 
-Check.check(f, "6a: exactly ONE durable credit entry for usdc_base:0xT2:0",
-  Enum.count(E2E.ProxyStore.credit_entries(), &(&1.idempotency_key == "usdc_base:0xT2:0")) == 1)
+Check.check(
+  f,
+  "6a: balance remains unchanged after outbox duplicate application",
+  Decimal.equal?(balance.(), Decimal.new("2.875"))
+)
+
+Check.check(
+  f,
+  "6a: exactly ONE durable credit entry for usdc_base:0xT2:0",
+  Enum.count(E2E.ProxyStore.credit_entries(), &(&1.idempotency_key == "usdc_base:0xT2:0")) == 1
+)
 
 deliveries_before = length(E2E.DeliveryLog.deliveries())
 E2E.HubStore.set_cursor("base", 100)
 E2E.Hub.tick()
 
-Check.check(f, "6b: re-scanning the same log range settles nothing new and delivers nothing (hub dedup)",
+Check.check(
+  f,
+  "6b: re-scanning the same log range settles nothing new and delivers nothing (hub dedup)",
   length(E2E.DeliveryLog.deliveries()) == deliveries_before and
     length(E2E.HubStore.rows()) == 2 and
     Decimal.equal?(balance.(), Decimal.new("2.875")) and
-    E2E.HubStore.cursor("base") == 290)
+    E2E.HubStore.cursor("base") == 290
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. Drain to block: spend until credits go <= 0 -> blocked again, hint again.
@@ -570,27 +721,39 @@ Check.check(f, "6b: re-scanning the same log range settles nothing new and deliv
 
 drained = for _ <- 1..5, do: chat.()
 
-Check.check(f, "five more $0.625 calls all succeed while balance stays > 0",
-  Enum.all?(drained, fn {s, r} -> s == 200 and r["model"] != "llm-proxy-budget" end))
+Check.check(
+  f,
+  "five more $0.625 calls all succeed while balance stays > 0",
+  Enum.all?(drained, fn {s, r} -> s == 200 and r["model"] != "llm-proxy-budget" end)
+)
 
-Check.check(f, "balance is now negative (0.375 - 0.625 = -0.25): overdraft on the last straddle",
-  Decimal.equal?(balance.(), Decimal.new("-0.25")))
+Check.check(
+  f,
+  "balance is now negative (0.375 - 0.625 = -0.25): overdraft on the last straddle",
+  Decimal.equal?(balance.(), Decimal.new("-0.25"))
+)
 
 {s_blocked, r_blocked} = chat.()
 notices2 = Genswarms.Objects.ObjectServer.notices()
 
-Check.check(f, "credits <= 0 -> blocked again",
+Check.check(
+  f,
+  "credits <= 0 -> blocked again",
   s_blocked == 200 and r_blocked["model"] == "llm-proxy-budget" and
-    get_in(r_blocked, ["x_router", "budget_exhausted"]) == true)
+    get_in(r_blocked, ["x_router", "budget_exhausted"]) == true
+)
 
-Check.check(f, "the fresh block notice carries the top-up hint again",
-  length(notices2) == 2 and String.contains?(List.last(notices2), addr0))
+Check.check(
+  f,
+  "the fresh block notice carries the top-up hint again",
+  length(notices2) == 2 and String.contains?(List.last(notices2), addr0)
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 8. Outage retry across the seam (D2): the proxy's credit store is down when
-#    a NEW payment's delivery arrives -> proxy NACKs retryable -> the hub
-#    keeps it undelivered and redelivers next tick after the store heals ->
-#    credited exactly once.
+# 8. Outage recovery across the outbox: the proxy's credit store is down when
+#    a NEW one-shot push arrives -> proxy NACKs retryable -> the hub retains no
+#    retry queue. After the store heals, settlements_since returns the row and
+#    the consumer applies it exactly once.
 # ═══════════════════════════════════════════════════════════════════════════
 
 E2E.ProxyStore.credit_down!(true)
@@ -600,31 +763,48 @@ E2E.Hub.tick()
 
 outage_reply = List.last(E2E.DeliveryLog.replies())
 
-Check.check(f, "store down: proxy answers ok:false retryable (fail closed, key released)",
+Check.check(
+  f,
+  "store down: proxy answers ok:false retryable (fail closed, key released)",
   outage_reply["ok"] == false and outage_reply["retryable"] == true and
-    outage_reply["error"] == "store_unavailable")
+    outage_reply["error"] == "store_unavailable"
+)
 
-Check.check(f, "hub recorded the settlement but holds the delivery undelivered",
-  Enum.any?(E2E.HubStore.rows(), &(&1.idempotency_key == "base:0xT4:0")) and
-    Map.has_key?(E2E.Hub.undelivered(), "base:0xT4:0") and
-    Decimal.equal?(balance.(), Decimal.new("-0.25")))
+Check.check(
+  f,
+  "hub recorded the settlement in the outbox without a retry queue",
+  Enum.any?(E2E.HubStore.rows(), &(&1.idempotency_key == "8453:0xT4:0")) and
+    not Agent.get(E2E.Hub, &Map.has_key?(&1, :undelivered)) and
+    Decimal.equal?(balance.(), Decimal.new("-0.25"))
+)
 
 E2E.ProxyStore.credit_down!(false)
-E2E.Hub.tick()
+outbox_8 = poll_outbox.(2)
 
-Check.check(f, "after the store heals, the hub's retry credits EXACTLY once (-0.25 + 3.00 = 2.75)",
+Check.check(
+  f,
+  "after store recovery, outbox application credits EXACTLY once (-0.25 + 3.00 = 2.75)",
   Decimal.equal?(balance.(), Decimal.new("2.75")) and
-    E2E.Hub.undelivered() == %{} and
-    Enum.count(E2E.ProxyStore.credit_entries(), &(&1.idempotency_key == "usdc_base:0xT4:0")) == 1)
+    Enum.map(outbox_8.rows, & &1.idempotency_key) == ["8453:0xT4:0"] and
+    outbox_8.next_seq == 3 and outbox_8.max_seq == 3 and
+    Enum.all?(outbox_8.replies, &(&1["ok"] == true)) and
+    Enum.count(E2E.ProxyStore.credit_entries(), &(&1.idempotency_key == "usdc_base:0xT4:0")) == 1
+)
 
 {s5, r5} = chat.()
 
-Check.check(f, "the healed, re-credited identity spends again (2.75 - 0.625 = 2.125)",
+Check.check(
+  f,
+  "the healed, re-credited identity spends again (2.75 - 0.625 = 2.125)",
   s5 == 200 and get_in(r5, ["choices", Access.at(0), "message", "content"]) == "pong-e2e" and
-    Decimal.equal?(balance.(), Decimal.new("2.125")))
+    Decimal.equal?(balance.(), Decimal.new("2.125"))
+)
 
-Check.check(f, "quota_status renders the final balance \"2.13\" (2dp)",
-  get_in(quota_status.(), ["credit", "balance_usd"]) == "2.13")
+Check.check(
+  f,
+  "quota_status renders the final balance \"2.13\" (2dp)",
+  get_in(quota_status.(), ["credit", "balance_usd"]) == "2.13"
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 9. Cross-contract sanity: every hub-emitted confirmation's method has no
@@ -637,15 +817,21 @@ confirmations =
   |> Enum.map(& &1.content)
   |> Enum.filter(&(&1["action"] == "payment_confirmed"))
 
-Check.check(f, "every emitted method is colon-free \"usdc_base\"; every ref is tx:logIndex",
+Check.check(
+  f,
+  "every emitted method is colon-free \"usdc_base\"; every ref is tx:logIndex",
   confirmations != [] and
     Enum.all?(confirmations, fn c ->
       c["method"] == "usdc_base" and not String.contains?(c["method"], ":") and
         Regex.match?(~r/^0x[^:]+:\d+$/, c["ref"])
-    end))
+    end)
+)
 
-Check.check(f, "no confirmation was ever rejected as malformed (colon-refs accepted by the proxy)",
-  not Enum.any?(E2E.DeliveryLog.replies(), &(&1["error"] == "bad_payment_confirmed")))
+Check.check(
+  f,
+  "no confirmation was ever rejected as malformed (colon-refs accepted by the proxy)",
+  not Enum.any?(E2E.DeliveryLog.replies(), &(&1["error"] == "bad_payment_confirmed"))
+)
 
 Proxy.terminate(:normal, proxy)
 Check.finish(f)

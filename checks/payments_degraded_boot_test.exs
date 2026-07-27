@@ -65,6 +65,7 @@ state =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     namespace: "llm_quota",
@@ -73,7 +74,7 @@ state =
     deliver_fn: fn _, _, _ -> :ok end,
     rpc_fn: settling_rpc,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -103,6 +104,41 @@ health = Jason.decode!(health_json)
 
 Check.check(f, "health reports degraded_boot true", health["degraded_boot"] == true)
 
+# ── R4-P4-I1: the degraded payment_status refusal is TAGGED and ECHOED.
+# It was the one operator reply carrying neither, so on the wire it was
+# indistinguishable from the untagged `deposit_address` refusal a host routes
+# to an END USER: an unrelated user got "I can't mint your deposit address",
+# their real answer was then uncorrelated and dropped, and the operator who
+# asked got silence — in the exact state where an operator most needs an
+# answer. The `action` tag is what makes the two reply families separable.
+{:reply, status_json, _state} =
+  Payments.handle_message(
+    "ingress",
+    Jason.encode!(%{action: "payment_status", beneficiary: "llmb_alice"}),
+    state
+  )
+
+status = Jason.decode!(status_json)
+
+Check.check(
+  f,
+  "the degraded payment_status refusal is action-tagged (never mistakable for a /topup answer)",
+  status["action"] == "payment_status" and status["ok"] == false and
+    status["error"] == "degraded_boot"
+)
+
+Check.check(
+  f,
+  "and it echoes the beneficiary, so the caller correlates exactly instead of guessing",
+  status["beneficiary"] == "llmb_alice"
+)
+
+Check.check(
+  f,
+  "the /topup-facing deposit_address refusal stays UNTAGGED (the two families remain distinct)",
+  not Map.has_key?(dep, "action")
+)
+
 # ── A1 counterpart: a healthy store (list_address_bindings succeeds) boots
 # normally — degraded_boot false, poll/deposit_address both work.
 defmodule HealthyStore do
@@ -130,6 +166,7 @@ healthy_state =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
     store_mod: HealthyStore,
@@ -156,6 +193,7 @@ Check.check(f, "store exporting only put_address_binding (no list_address_bindin
     (try do
        Payments.init!(%{
          xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+         allow_test_xpub: true,
          store_mod: OnlyPutAddressStore
        })
        {:ok, :did_not_raise}
@@ -174,6 +212,7 @@ Check.check(f, "store exporting only payment_seen? (no record_payment) raises at
     (try do
        Payments.init!(%{
          xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+         allow_test_xpub: true,
          store_mod: OnlySeenStore
        })
        {:ok, :did_not_raise}
@@ -185,6 +224,7 @@ Check.check(f, "store exporting only payment_seen? (no record_payment) raises at
 Check.check(f, "store with both groups fully covered boots without raising",
   match?(%{}, Payments.init!(%{
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     store_mod: HealthyStore
   })))
 
@@ -194,12 +234,13 @@ Check.check(f, "store with both groups fully covered boots without raising",
 {:ok, rpc_log} = Agent.start_link(fn -> [] end)
 
 canned = fn logs, latest ->
-  fn _chain, method, params ->
+  fn chain, method, params ->
     Agent.update(rpc_log, &[{method, params} | &1])
 
     case method do
       "eth_blockNumber" -> {:ok, "0x" <> Integer.to_string(latest, 16)}
       "eth_getLogs" -> {:ok, logs}
+      m -> Check.self_check_rpc(chain, m)
     end
   end
 end
@@ -208,14 +249,16 @@ mirror_state =
   Payments.init!(%{
     name: :payments,
     xpub: "xpub6DCoCpSuQZB2jawqnGMEPS63ePKWkwWPH4TU45Q7LPXWuNd8TMtVxRrgjtEshuqpK3mdhaWHPFsBngh5GFZaM6si3yZdUsT8ddYM3PwnATt",
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["llm_proxy"],
+    allow_ephemeral: true,
     namespace: "llm_quota",
     store_mod: nil,
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0, max_block_range: 1000}
     ],
     rpc_fn: nil
   })

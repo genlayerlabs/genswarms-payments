@@ -29,6 +29,7 @@ end
 state_degraded =
   Payments.init!(%{
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
     store_mod: DegradedStatusStore,
@@ -59,6 +60,7 @@ end
 
 healthy_status_config = %{
   xpub: xpub,
+  allow_test_xpub: true,
   trusted_sources: ["ingress"],
   targets: ["t"],
   auto_tick: false,
@@ -126,8 +128,10 @@ Check.check(f, "list_payments exiting ⇒ ok:false, error:store_unavailable (no 
 state_mem =
   Payments.init!(%{
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
+    allow_ephemeral: true,
     store_mod: nil,
     auto_tick: false
   })

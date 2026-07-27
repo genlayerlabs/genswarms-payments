@@ -7,6 +7,9 @@
     "lib/genswarms/payments/method.ex",
     "lib/genswarms/payments/rpc.ex",
     "lib/genswarms/payments/usdc.ex",
+    "lib/genswarms/payments/topup_ack.ex",
+    "lib/genswarms/payments/store_conformance.ex",
+    "lib/genswarms/payments/dashboard.ex",
     "lib/genswarms/payments.ex"
   ]
 }

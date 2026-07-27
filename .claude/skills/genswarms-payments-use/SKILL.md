@@ -62,6 +62,153 @@ the dedup read or the record write holds that settlement for the next round
 rather than risk a double-credit or silent loss. The host owns the
 schema/migrations.
 
+## Authorization lane (entry A: EIP-3009 → treasury)
+
+A sibling package (e.g. `genswarms-wallet-bridge`) can have users sign
+EIP-3009 authorizations whose USDC lands directly in a shared TREASURY
+wallet instead of a per-beneficiary deposit address. This hub owns the
+issued-authorization registry end to end and is the ONLY thing standing
+between "a signed authorization" and "a credited payment":
+
+- Configure `treasury_address` on the chain(s) that use this lane. It is
+  NOT added to `bindings`/the watched-address map — the treasury has no
+  single beneficiary, so its `Transfer`s are resolved by nonce correlation,
+  never by address lookup.
+- A trusted source calls `issue_authorization` with
+  `{nonce, order_ref, beneficiary, amount_usd, valid_before}` BEFORE the
+  authorization is ever submitted on chain. **Order matters and there is no
+  safe reverse**: issue in THIS hub first, THEN hand the nonce to whatever
+  signs/submits it (a keeper, a wallet-bridge order). Registering the order
+  with a downstream keeper BEFORE this hub has issued the nonce means a
+  Transfer can land in the treasury and get scanned before
+  `issued_authorization/1` can ever resolve it — the credit rule (below)
+  refuses anything it cannot look up, so that money is recorded
+  `unrecognised`, not credited, and needs a manual operator reissue/release
+  to fix. Issue first, always.
+- `store_mod` needs 5 more optional callbacks, and with a `treasury_address`
+  configured they are REQUIRED to boot: `record_issued_authorization/1`,
+  `issued_authorization/1`, `live_authorization_nonces/1`,
+  `mark_authorization_consumed/1`, `record_unrecognised_inflow/1`. A store
+  missing any of them raises at `init/1` unless you pass the explicit
+  `allow_ephemeral: true` opt-out — same stance, and the same opt-out, as the
+  durable-settlement-ledger gate. That opt-out only decides whether the
+  PROCESS boots, though: `issue_authorization` itself always refuses
+  per-action (`no_authorization_store`) when `record_issued_authorization/1`
+  isn't exported, with no ephemeral escape and no dependency on whether any
+  chain even configures `treasury_address` — a hub that answered `ok: true`
+  but could never register the nonce acknowledged money it can never credit
+  (the user signs, the money moves, and every payment lands `unrecognised`).
+  Partial coverage of either round trip is refused too, like every other
+  callback group in this package.
+- A store fault ON the lookup (`issued_authorization/1` raising or exiting,
+  as opposed to answering `nil`) is not treated as "never issued": the
+  Transfer is HELD — not credited, not recorded unrecognised, cursor not
+  advanced, nonce left live — so a transient store outage cannot bury a real
+  payment forever. It re-presents and settles once the store recovers.
+- `record_issued_authorization/1`'s duplicate answer must carry the row:
+  `{:ok, :duplicate, stored_row}`. The hub echoes THAT row back, so a caller
+  that timed out and retried the same `order_ref` with a freshly minted nonce
+  gets the nonce actually on record, not its own. A bare `{:ok, :duplicate}`
+  is treated as a store defect and the action is refused (`store_unavailable`)
+  — the hub has no `order_ref` lookup to read the row back with.
+- `valid_before` is bounded by the hub: absent, non-integer, already past, or
+  further out than `max_authorization_window_seconds` (default 3600) is
+  refused. That bound is what keeps `live_authorization_nonces/1` — and
+  therefore the second `getLogs` filter — bounded by construction. Your
+  store's implementation MUST drop expired nonces for the other half of it.
+- **The credit rule (spec §4.4), the one line in this whole package money
+  literally depends on**: a treasury `Transfer` settles ONLY when, in the SAME
+  transaction, there is EXACTLY ONE `AuthorizationUsed` log whose `authorizer`
+  is that Transfer's `from` AND whose nonce this hub's own
+  `issued_authorization/1` can resolve. The beneficiary comes from the ISSUED
+  ROW (keyed by nonce) and the credited amount is capped at that row's
+  `amount_usd`. Anything else — no correlation, a nonce this hub never issued,
+  an authorizer that is not the sender, or an ambiguous match — is recorded as
+  an unrecognised inflow (`payments_unrecognised_inflow`, with a `reason`) and
+  never credited. Correlating on `tx_hash` alone is NOT sufficient and is a
+  credit-theft vector: anyone may submit an EIP-3009 authorization, so a
+  batched transaction can carry several, and their order in the log list is
+  attacker-controlled. Without this rule a future deposit-sweep collection
+  landing in the SAME treasury wallet would also read as a user payment and
+  get credited a second time for money already credited once.
+- The `treasury_address` must NEVER appear in `bindings`. The hub refuses to
+  boot if a loaded binding's address equals it: a watched binding resolves one
+  beneficiary for the whole wallet and skips the credit rule entirely.
+- The host implements storage only — issuance, lookup, the nonce filter,
+  and consumption marking are all `Store` callbacks with host-owned schema,
+  exactly like bindings and settlements. This object never writes an
+  issued-authorization row except through `issue_authorization`, and never
+  credits a treasury inflow except through the rule above.
+
+## Key custody — the seed never touches the host
+
+This object is **watch-only by construction**: it holds an xpub, so it can
+derive deposit addresses and read balances, and it cannot sign anything. That
+property is the whole security model of the deposit lane, and it is worth
+exactly as much as the discipline around the seed the xpub came from.
+
+**The split.** One seed produces two things. The **private keys** sign — they
+move money. The **xpub** derives addresses and watches — it cannot. Only the
+xpub is ever configured here. Everything below exists to keep it that way.
+
+**Before mainnet — a checklist, in order:**
+
+1. **Generate the seed offline**: a hardware wallet, or a machine with no
+   network. Not on the host, not on a laptop that will later hold the host's
+   credentials.
+2. **The seed never touches the host.** Not in the object config, not in an
+   environment variable, not in a file on the box, not typed into a terminal
+   session on it. If it has been on the host once, treat it as compromised and
+   start again — this is cheap before deposits exist and impossible after.
+3. **Export only the xpub** and pass it as `xpub`. That is the sole key
+   material this object should ever see.
+4. **`allow_test_xpub` must be absent in production.** The denylist exists
+   because the well-known test seeds' key material is derivable by anyone, and
+   is matched on the decoded key, not the string — a re-encoded serialization
+   of the same key is still refused. The flag is an opt-in for local rigs and
+   nothing else.
+5. **Back the seed up physically**, in two or more separate locations. Losing
+   it makes every deposit ever made to a derived address permanently
+   unrecoverable. There is no recovery path on a public chain, and this object
+   cannot help — it never had the key.
+6. **Decide who may sign, before you need to.** A single holder with a single
+   device is a single point of failure in both directions: they can move
+   everything alone, and if they lose the device (or are unavailable) nobody
+   can move anything. Multisig or split custody is the ordinary answer for
+   funds that belong to an organisation rather than a person.
+
+**Collecting deposits without bringing the seed online.** Derived deposit
+addresses accumulate tokens and hold no native gas, so a naive sweep would
+require funding each one. The workable shape keeps the seed offline
+throughout:
+
+- the host measures which addresses hold a balance (`sweep_report` reports;
+  it never moves funds — see the D4 note below);
+- the seed holder signs an EIP-3009 `transferWithAuthorization` per address,
+  **offline**, moving the balance to the treasury;
+- a relayer submits those signatures and pays the gas. The relayer is a
+  separate key that holds only gas: it cannot alter the destination (it is
+  inside the signed payload) and cannot touch user funds.
+
+Automating that sweep is a deliberate decision, not a default — it is the one
+component that needs signing authority, and it is the only place where a
+mistake spends money rather than mis-accounting it. Measure first; automate
+when the stranded volume justifies the added surface.
+
+**What a compromised host costs you, stated plainly.** With only the xpub
+present, an attacker who owns the box learns every derived address and every
+balance — a real privacy loss, permanent and unfixable by rotation, since the
+chain code inside an xpub enumerates the whole tree. What they **cannot** do
+is spend a single unit. That guarantee holds only while no xprv and no seed
+has ever been near the host; it is void the moment one is.
+
+**A note on which lane you run.** Deposits routed through the authorization
+lane (entry A) land in the treasury directly and leave nothing to sweep. The
+deposit-address lane exists for payers who can only send to an address (an
+exchange withdrawal, typically) and cannot sign — those balances are what the
+procedure above collects. The more traffic entry A carries, the rarer the
+offline-signing ritual becomes.
+
 ## Gotchas
 
 - **"address not credited"** — check, in order: is the chain in `chains` at
@@ -109,8 +256,84 @@ schema/migrations.
   `{"ok": false, "error": "no_push_methods"}`. Adding a push method means
   implementing `Method.ingest_event/2` with its OWN signature verification —
   the core trusts whatever settlements a method hands back.
+- **`issue_authorization` without `record_issued_authorization/1` is REFUSED,
+  not acked — unconditionally, regardless of chain config or
+  `allow_ephemeral`.** A store not exporting that callback answers
+  `{"ok": false, "error": "no_authorization_store"}`; a store that exports it
+  but errors on the write answers `{"ok": false, "error":
+  "store_unavailable"}`; and a chain with a `treasury_address` whose store is
+  missing any of the five authorization callbacks does not boot at all unless
+  `allow_ephemeral: true` is set. There is **no memory-mode fallback for this
+  one action**, even with `allow_ephemeral: true` — that flag only lets the
+  PROCESS boot with an inert authorization lane (so a hub whose other lanes
+  work fine doesn't crash-loop over one missing registry); it was never meant
+  to let `issue_authorization` lie about success, because unlike the
+  settlement ledger's own ephemeral fallback (loses durability, not
+  correctness), a "memory success" here is a nonce this hub could never look
+  up again even one poll later on the same node. Previously a treasury-less
+  hub (`chains` with no `treasury_address` — the boot gate never even looks)
+  under `allow_ephemeral: true` answered `ok: true` and silently minted an
+  uncreditable nonce; fixed (M1).
+- **`payments_unrecognised_inflow` with `reason: "ambiguous_correlation"` is
+  not routine noise** — it means real money landed in the treasury that the
+  hub refused to attribute because the transaction was undecidable (two
+  authorizations for the same sender, or two treasury Transfers from one
+  sender). Nothing was credited and nothing was lost; an operator decides.
+  Likewise `payments_authorization_overpay`: a `Transfer` moved more than its
+  own authorization allows, which should be impossible — the hub credited only
+  the authorized amount and the gap is a real signal about the correlation or
+  the token contract.
+
+## Adopting in a second host
+
+The whole authorization lane (issue → watch → credit → tell the user →
+dashboard) is host-portable: the package owns the logic, the host owns its
+tables, its transport, and its voice. The first host (wingston) proved every
+step live on Base Sepolia 2026-07; adopting is a recipe with an automatic
+judge at each step — never archaeology of the first host's code:
+
+1. **Schema.** Copy `priv/reference_schema.sql` into your migration system
+   (five tables; the money-bearing column notes are inline). Rename nothing
+   you don't have to.
+
+2. **Store adapter.** Implement the `Genswarms.Payments.Store` callbacks
+   over those tables. The optional groups matter as groups: the six
+   authorization callbacks for the lane, `authorization_by_order_ref/1` +
+   `authorization_by_settlement/2` for the chat presenter, the two
+   `list_*` reads for the dashboard page.
+
+3. **Prove it.** `Genswarms.Payments.StoreConformance.run!(YourStore)`
+   against a throwaway database, inside your own gates. Green with no skips
+   in the sections you adopted = your adapter honors the semantics the hub
+   and presenter rely on. Do NOT trust a hand-rolled fake instead: both
+   real defects this lane ever shipped were store doubles that answered
+   what the test hoped for.
+
+4. **Wire the presenter.** `Genswarms.Payments.TopupAck.result_fn/1` as the
+   keeper's `result_fn` and `.credit_notice_fn/1` as the proxy's credit
+   seam — three injected functions (`:store`, `:conversation_fn`,
+   `:deliver_fn`), zero logic. Default English copy included;
+   `:text_fn`/`:credit_text_fn` override the voice. To get card-editing
+   (one card progressing instead of stacked messages, retiring the payment
+   link on signature), record `card_chat_id`/`card_message_id` from your
+   delivery effect when the top-up card lands.
+
+5. **Register the page.** One probed line in your dashboard source:
+   `Genswarms.Payments.Dashboard.dashboard_extension(store_mod: YourStore)`
+   (guard with `function_exported?`, rescue to `%{}` — the page must never
+   break the feed).
+
+Keeper results vocabulary (wallet-bridge ≥ 0.8.0): `{:refused, reason}` is
+the simulation gate declining pre-broadcast (zero gas; `reason` is the
+contract's decoded revert string) and `{:failed, :reverted}` is an on-chain
+revert after a real broadcast. The default copy distinguishes them; if you
+write your own, do not collapse them — the first host shipped that collapse
+and told a user with insufficient USDC that their payment "didn't go
+through on the chain".
 
 ## Verification
 
 `./checks/run.sh` — every `checks/payments_*.exs` (no Postgres, no network;
 injected seams: fake store, injected `rpc_fn`/`now_fn`/`deliver_fn`).
+Adopting hosts additionally run `StoreConformance.run!/1` against their real
+store (see above) — the first host wires it into its throwaway-PG gate.

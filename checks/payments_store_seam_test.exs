@@ -38,7 +38,8 @@ defmodule ExitingListStore do
   def list_address_bindings, do: exit(:timeout)
 end
 
-state_a1 = Payments.init!(%{xpub: xpub, store_mod: ExitingListStore})
+state_a1 =
+  Payments.init!(%{xpub: xpub, allow_test_xpub: true, store_mod: ExitingListStore})
 
 Check.check(f, "1a: list_address_bindings exiting at boot degrades (not crashes) init/1",
   state_a1.degraded_boot == true)
@@ -59,6 +60,7 @@ end
 state_a2 =
   Payments.init!(%{
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: [],
     targets: ["t"],
     store_mod: ExitingSeenStore,
@@ -99,6 +101,7 @@ state_a3 =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
     namespace: "ns",
@@ -106,7 +109,7 @@ state_a3 =
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -116,10 +119,11 @@ addr_a3 = Jason.decode!(dj)["address"]
 
 logs_a3 = [mk_log.(addr_a3, 1, "0xT1", 0)]
 
-settling_rpc = fn _chain, method, _params ->
+settling_rpc = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, logs_a3}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -158,14 +162,16 @@ state_b1 =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
+    allow_ephemeral: true,
     namespace: "ns",
     store_mod: BindingsOnlyStore,
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -178,10 +184,11 @@ addr_b1 = Jason.decode!(dj_b1)["address"]
 
 logs_b1 = [mk_log.(addr_b1, 1, "0xB1", 0)]
 
-rpc_b1 = fn _chain, method, _params ->
+rpc_b1 = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, logs_b1}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -189,7 +196,9 @@ state_b1 = %{state_b1 | rpc_fn: rpc_b1}
 state_b1 = Payments.poll(state_b1)
 
 Check.check(f, "1b: settlement settles via memory dedup despite non-nil, half-implemented store",
-  MapSet.member?(state_b1.seen_keys, "base:0xB1:0"))
+  MapSet.member?(state_b1.seen_keys, "8453:0xB1:0"))
+Check.check(f, "1b: store without the settlement group uses the memory sequence counter",
+  hd(state_b1.settlement_mirror).outbox_seq == 1 and state_b1.next_outbox_seq == 2)
 Check.check(f, "1b: cursor advances (not frozen) once settled",
   Map.get(state_b1.cursor_mirror, "base") == 200 - 0)
 
@@ -213,6 +222,7 @@ state_c1 =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
     namespace: "ns",
@@ -220,16 +230,17 @@ state_c1 =
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
-counting_rpc = fn _chain, method, _params ->
+counting_rpc = fn chain, method, _params ->
   Agent.update(calls_c1, &[method | &1])
 
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, []}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -265,6 +276,7 @@ state_c2 =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
     namespace: "ns",
@@ -272,16 +284,17 @@ state_c2 =
     auto_tick: false,
     deliver_fn: fn _, _, _ -> :ok end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
-counting_rpc2 = fn _chain, method, _params ->
+counting_rpc2 = fn chain, method, _params ->
   Agent.update(calls_c2, &[method | &1])
 
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, []}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
@@ -327,6 +340,7 @@ state_d1 =
   Payments.init!(%{
     name: :payments,
     xpub: xpub,
+    allow_test_xpub: true,
     trusted_sources: ["ingress"],
     targets: ["t"],
     namespace: "ns",
@@ -334,7 +348,7 @@ state_d1 =
     auto_tick: false,
     deliver_fn: fn t, from, _c -> (Agent.update(delivered_d1, &[{t, from} | &1]); :ok) end,
     chains: [
-      %{name: "base", rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
+      %{name: "base", chain_id: 8453, rpc_url: "injected", usdc_contract: "0xCONTRACT", confirmations: 0, decimals: 6, start_block: 0}
     ]
   })
 
@@ -342,10 +356,11 @@ state_d1 =
   Payments.handle_message("ingress", Jason.encode!(%{action: "deposit_address", beneficiary: "budget:nil"}), state_d1)
 addr_d1 = Jason.decode!(dj_d1)["address"]
 
-rpc_d1 = fn _chain, method, _params ->
+rpc_d1 = fn chain, method, _params ->
   case method do
     "eth_blockNumber" -> {:ok, "0xc8"}
     "eth_getLogs" -> {:ok, [mk_log.(addr_d1, 1, "0xNIL", 0)]}
+    m -> Check.self_check_rpc(chain, m)
   end
 end
 
