@@ -243,8 +243,21 @@ mk_rpc = fn transfer_logs, auth_logs, latest ->
         [%{"topics" => topics}] = params
 
         case topics do
-          [^transfer_sig | _] -> {:ok, transfer_logs}
-          [^auth_sig | _] -> {:ok, auth_logs}
+          [^transfer_sig | _] ->
+            {:ok, transfer_logs}
+
+          [^auth_sig, _, wanted] when is_list(wanted) ->
+            # Fidelity (2026-07-27, the fake-infidelity lesson again): a real
+            # node only returns events whose nonce topic is IN the query's
+            # filter. A canned reply that ignored `wanted` would hide any
+            # live-nonce-filter defect — exactly the class found in the
+            # pre-publish flows review.
+            wanted = Enum.map(wanted, &String.downcase/1)
+
+            {:ok,
+             Enum.filter(auth_logs, fn log ->
+               String.downcase(Enum.at(log["topics"], 2)) in wanted
+             end)}
         end
 
       m ->
@@ -1180,13 +1193,33 @@ Check.check(
 
 _ = i2_state
 
-# ── I4: the bound is real end to end — an expired authorization drops out ──
+# ── I4: the bound is real end to end — but the bound is GRACE, not zero ──
+# (Rewritten 2026-07-27, pre-publish review.) The original I4 pinned "1h
+# past valid_before ⇒ unrecognised", which codified the outage bug: that
+# Transfer was MINED in-window (the chain enforced valid_before at mining)
+# and only SCANNED late, so refusing it broke the durable cursor's recovery
+# promise. The boundedness I4 exists to prove is the 72h scan grace: an
+# authorization expired LONGER than the grace has left the filter set, and
+# its (chain-impossible this late) correlation is refused as unrecognised.
 AuthStore.reset()
 i4_state = Payments.init!(scan_config)
 nonce_i4 = "0x" <> String.duplicate("41", 32)
 i4_state = issue_for.(i4_state, nonce_i4, "order-i4", "user:i4", "10", now_unix + 60)
 
-later = DateTime.add(now, 3600, :second)
+# Within the grace (1h past expiry): the nonce is STILL offered to the
+# correlation — the OUTAGE scenario at the end of this file proves the full
+# credit path; here we pin the filter membership itself.
+within_grace = DateTime.add(now, 3600, :second)
+
+Check.check(
+  f,
+  "I4. 1h past valid_before the nonce is still in the correlation window (grace)",
+  nonce_i4 in AuthStore.live_authorization_nonces(DateTime.to_unix(within_grace) - 72 * 3600)
+)
+
+# Beyond the grace (73h later): out of the set, and a correlation this late
+# settles nothing — held as unrecognised for the operator.
+later = DateTime.add(now, 73 * 3600, :second)
 
 i4_state =
   %{
@@ -1203,13 +1236,13 @@ i4_state =
 
 Check.check(
   f,
-  "I4. an expired authorization has left the live set (the getLogs filter is bounded)",
-  AuthStore.live_authorization_nonces(DateTime.to_unix(later)) == []
+  "I4. beyond the grace the authorization has left the live set (the filter IS bounded)",
+  AuthStore.live_authorization_nonces(DateTime.to_unix(later) - 72 * 3600) == []
 )
 
 Check.check(
   f,
-  "I4. so its late Transfer settles nothing and is held as unrecognised",
+  "I4. so its beyond-grace Transfer settles nothing and is held as unrecognised",
   AuthStore.rows() == [] and Enum.any?(AuthStore.unrecognised(), &(&1.tx_hash == "0xTXJ"))
 )
 
@@ -1650,5 +1683,54 @@ Check.check(
 )
 
 _ = n1f_state
+
+# ─────────────────────────────────────────────────────────────────────────
+# OUTAGE. Mined IN-window, scanned AFTER valid_before — must still credit.
+# The durable cursor's whole promise is that blocks missed during an outage
+# get scanned later; the chain already enforced the validity window AT
+# MINING, so expiry-at-scan-time is not a fact about the payment. Found in
+# the 2026-07-27 pre-publish flows review: the live-nonce filter was
+# anchored to the scan clock, so any outage longer than the remaining
+# window reclassified every in-flight vía-A payment as unrecognised.
+# ─────────────────────────────────────────────────────────────────────────
+AuthStore.reset()
+
+late_nonce = "0x" <> String.duplicate("1a", 32)
+
+:ok =
+  AuthStore.record_issued_authorization(%{
+    nonce_hex: late_nonce,
+    order_ref: "order-late",
+    beneficiary: "user:late",
+    namespace: "hub_ns",
+    amount_usd: Decimal.new("40"),
+    valid_before: now_unix + 3600
+  })
+
+# The rig comes back 8 hours later: window (1h) long gone, blocks unscanned.
+late_now = DateTime.add(now, 8 * 3600, :second)
+late_state = Payments.init!(%{scan_config | now_fn: fn -> late_now end})
+
+late_transfer = mk_transfer_log.(treasury, stranger, 10, "0xTXLATE", 0, 30_000_000)
+late_auth = mk_auth_log.(stranger, late_nonce, 10, "0xTXLATE", 1)
+
+_late_state =
+  %{late_state | rpc_fn: mk_rpc.([late_transfer], [late_auth], 100)}
+  |> Payments.poll()
+
+late_row = row_for.("8453:0xTXLATE:0")
+
+Check.check(
+  f,
+  "OUTAGE. a payment mined in-window but scanned after valid_before still CREDITS",
+  late_row != nil and late_row.beneficiary == "user:late" and
+    Decimal.equal?(late_row.amount_usd, Decimal.new("30"))
+)
+
+Check.check(
+  f,
+  "OUTAGE. …and is never recorded as an unrecognised inflow",
+  not Enum.any?(AuthStore.unrecognised(), &(&1.tx_hash == "0xTXLATE"))
+)
 
 Check.finish(f)

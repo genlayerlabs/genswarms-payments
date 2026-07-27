@@ -122,6 +122,16 @@ defmodule Genswarms.Payments do
   # concurrent hub has just taken, not to walk a large gap.
   @binding_index_attempts 25
 
+  # How far behind the scan clock the live-nonce filter reaches (72h): an
+  # authorization whose valid_before passed up to this long ago is still
+  # offered to the AuthorizationUsed correlation, so payments mined in-window
+  # but scanned late (outage recovery, stuck-relayer retries) still credit.
+  # 72h bounds the filter set against the LIMIT the store applies (expired
+  # never-signed links accumulate as unconsumed rows) while covering any
+  # realistic recovery window; an outage longer than this needs operator
+  # repair anyway.
+  @live_nonce_scan_grace_s 72 * 3600
+
   # Engine contract (Genswarms.Objects.ObjectHandler): init/1 MUST return
   # {:ok, state} — ObjectServer matches on the tuple and a bare map crash-loops
   # the object at swarm boot. init!/1 returns the bare state for tests and
@@ -1844,7 +1854,21 @@ defmodule Genswarms.Payments do
           case store_result(
                  state.store_mod,
                  :live_authorization_nonces,
-                 [DateTime.to_unix(state.now_fn.())],
+                 # Anchored GRACE behind the scan clock, not the clock itself
+                 # (2026-07-27 pre-publish review): the chain enforced
+                 # valid_before AT MINING, so a payment mined in-window but
+                 # SCANNED later — an outage longer than the remaining
+                 # window, a stuck-relayer retry near the window's edge —
+                 # must still correlate. Filtering by `now` alone dropped
+                 # those nonces and reclassified real payments as
+                 # unrecognised, breaking the durable cursor's promise that
+                 # missed blocks are recoverable. The grace is pure
+                 # soundness: no AuthorizationUsed event can exist for an
+                 # out-of-window use, and the credit gate (issued row,
+                 # amount cap, consumed marker, settled dedup) is untouched.
+                 # The set stays bounded — unconsumed nonces fall out once
+                 # expired longer than the grace.
+                 [DateTime.to_unix(state.now_fn.()) - @live_nonce_scan_grace_s],
                  {:error, :store_failed}
                ) do
             list when is_list(list) -> {:ok, list}
