@@ -2,6 +2,22 @@
 
 ## 0.2.0 — Unreleased
 
+- Added `Genswarms.Payments.StoreConformance` — an executable conformance
+  suite a host runs against its REAL store + throwaway database
+  (`StoreConformance.run!(MyStore)`). Pins the semantics the hub and the
+  presenter rely on: issuance idempotent by order_ref echoing the row OF
+  RECORD, exact-hit-plus-honest-miss on every lookup (the
+  answers-anything-store defect class), the live-nonce window, consume
+  idempotence, settlement dedup walls, the settlement→authorization joins,
+  per-chain cursors, and inflow rescan dedupe. Sections skip when their
+  optional callbacks are absent; a host adopting the authorization lane or
+  TopupAck must see no skips in those sections. The first host runs it
+  inside its throwaway-PG gate; mutation-verified (an answers-anything
+  `authorization_by_order_ref` turns it red).
+- Added `priv/reference_schema.sql` — the PostgreSQL DDL the contract's
+  semantics were proven against (all five Store-contract tables, with the
+  money-bearing column notes inline). A reference for host migrations, not
+  a migration runner; the conformance suite remains the authority.
 - Added `Genswarms.Payments.TopupAck` — the presenter half of the
   authorization lane, moved here from the first host so a second host wires
   seams instead of rewriting logic. Owns the orchestration (keeper
