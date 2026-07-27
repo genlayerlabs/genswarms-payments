@@ -320,6 +320,45 @@ defmodule Genswarms.Payments.StoreConformance do
       )
 
       ok("list_deposit_balances: bound addresses with their settled receipts")
+
+      # Address attribution (2026-07-27, found live): a receipt whose facts
+      # name a DIFFERENT receiving address must NOT count toward this
+      # binding. Attribution by beneficiary alone let a re-bound beneficiary
+      # (address migration) inherit the previous address's entire history —
+      # the Deposits page claimed uncollected money at an address holding 0
+      # on chain. Rows WITHOUT `to_address` (scanner rows predating
+      # 2026-07-27) still attach by beneficiary — the assert above pins that
+      # fallback.
+      elsewhere_result =
+        store.record_payment(%{
+          idempotency_key: "conformance-elsewhere-#{u}",
+          beneficiary: beneficiary,
+          namespace: "llm_quota",
+          amount_usd: Decimal.new("7.00"),
+          method: "usdc_base_sepolia",
+          ref: "0xconformance-elsewhere-#{u}:1",
+          status: "settled",
+          at: DateTime.utc_now(),
+          facts: %{"to_address" => "0x" <> String.duplicate("e", 40)}
+        })
+
+      assert!(
+        elsewhere_result == :ok or
+          match?({:ok, seq} when is_integer(seq) and seq > 0, elsewhere_result),
+        "the elsewhere-addressed settlement records, got #{inspect(elsewhere_result)}"
+      )
+
+      {:ok, rows_after} = store.list_deposit_balances(200)
+      mine_after = Enum.find(rows_after, &(stored_field(&1, :beneficiary) == beneficiary))
+      received_after = stored_field(mine_after, :received_usd)
+
+      assert!(
+        Decimal.equal?(Decimal.new(received_after), Decimal.new(received)),
+        "a receipt addressed to a DIFFERENT to_address never counts toward this binding " <>
+          "(got #{inspect(received_after)}, expected unchanged #{inspect(received)})"
+      )
+
+      ok("list_deposit_balances: receipts attribute by ADDRESS when the fact exists")
     else
       skip("deposit collection view not exported (Deposits page absent)")
     end

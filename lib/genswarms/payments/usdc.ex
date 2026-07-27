@@ -368,7 +368,14 @@ defmodule Genswarms.Payments.Usdc do
             build_settlement(log, chain, from_topic, %{
               beneficiary: beneficiary,
               namespace: namespace,
-              method: "usdc_#{chain.name}"
+              method: "usdc_#{chain.name}",
+              # The RECEIVING address is a chain fact exactly like
+              # from_address (2026-07-27, found live): without it a deposit
+              # view can only attribute receipts by beneficiary, so a
+              # re-bound beneficiary (address migration) inherits the old
+              # address's whole history — "uncollected" money at an address
+              # that holds 0 on chain. Lowercase, as topic_address emits.
+              to_address: to_addr
             })
 
           :error ->

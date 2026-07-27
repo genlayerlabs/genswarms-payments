@@ -90,6 +90,14 @@ Check.check(f, "amount converted at 6 decimals", Decimal.equal?(row.amount_usd, 
 Check.check(f, "beneficiary resolved from binding", row.beneficiary == "budget:abc")
 Check.check(f, "method is usdc_<chain>", row.method == "usdc_base")
 Check.check(f, "idempotency key is chain_id:tx:logIndex", row.idempotency_key == "8453:0xT1:0")
+
+# The receiving address is a chain fact like from_address (2026-07-27, found
+# live): without it, a deposit view can only attribute receipts by
+# BENEFICIARY, and a re-bound beneficiary (address migration) inherits the
+# old address's history — the Deposits page showed 1.00 "uncollected" at an
+# address that held 0 on chain. Lowercase, exactly as topic_address emits.
+Check.check(f, "settlement records WHICH address received it (to_address)",
+  Map.get(row, :to_address) == String.downcase(addr))
 facts = Map.take(row, [:raw_amount, :decimals, :token_contract, :chain, :chain_id,
   :block_number, :log_index, :tx_hash, :from_address])
 Check.check(f, "durable row carries every chain fact used to compute money",

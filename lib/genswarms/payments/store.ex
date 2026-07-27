@@ -502,11 +502,21 @@ defmodule Genswarms.Payments.Store do
   when no bindings exist.
 
   Rows carry `beneficiary`, `address`, `hd_index`, `received_usd` (settled
-  entry-B deposits for that beneficiary — authorization-lane settlements go
-  straight to the treasury and are excluded), `swept_usd` (recognized
-  sweeps; 0 until C3 lands), and `last_at`. This is a STORE-derived
-  ESTIMATE of what sits uncollected — the sweep executor reads the chain's
-  own balances before signing anything; the page must label it as such.
+  entry-B deposits — authorization-lane settlements go straight to the
+  treasury and are excluded), `swept_usd` (recognized sweeps; 0 until C3
+  lands), and `last_at`. This is a STORE-derived ESTIMATE of what sits
+  uncollected — the sweep executor reads the chain's own balances before
+  signing anything; the page must label it as such.
+
+  Attribution (2026-07-27, found live): receipts attach by ADDRESS — a
+  settlement whose facts carry `to_address` counts only toward the binding
+  with that exact address (case-insensitive; the scanner stamps it on every
+  deposit settlement). Rows WITHOUT `to_address` (scanner rows predating
+  this fact) fall back to attaching by beneficiary. Beneficiary-only
+  attribution let a re-bound beneficiary (address migration) inherit the
+  previous address's whole history — "uncollected" money at an address
+  holding 0 on chain. Sweeps attach by the sweep's `from` address, which
+  the sweeps ledger always carries.
   """
   @callback list_deposit_balances(limit :: pos_integer()) ::
               {:ok, [map()]} | {:error, term()}
