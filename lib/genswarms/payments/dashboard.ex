@@ -62,6 +62,11 @@ defmodule Genswarms.Payments.Dashboard do
       "id" => "topups",
       "label" => "Top-ups",
       "icon" => "hero-credit-card",
+      # Sidebar section (dashboard ≥ sidebar-groups): the page's natural
+      # home, declared by the producer so a new host needs no stamping.
+      # This declaration WINS — host stamps are fill-nil-only, for pages
+      # whose packages don't declare yet.
+      "group" => "Money",
       "sections" => [
         %{
           "type" => "metrics",
