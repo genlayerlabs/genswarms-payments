@@ -904,7 +904,75 @@ defmodule Genswarms.Payments do
     if MapSet.member?(state.seen_keys, key) do
       {:skipped, state}
     else
-      case authorization_disposition(s, state) do
+      # Plan 3 C3 (spec §7/§4.4): a treasury Transfer whose FROM is one of
+      # OUR OWN deposit addresses is a SWEEP — collection moving money we
+      # already credited when it arrived at the deposit address. Classified
+      # BEFORE the nonce lookup: crediting it again (or burying it as
+      # unrecognised) are both §4.4 money bugs. The classification key is the
+      # binding set the watcher already holds — no new source of truth.
+      case sweep_source(s, state) do
+        {:sweep, beneficiary} ->
+          sweep_inflow(s, state, beneficiary)
+
+        :not_a_sweep ->
+          dispatch_authorization_disposition(s, state)
+      end
+    end
+  end
+
+  defp dispatch_settlement(s, state), do: settle_one(s, state)
+
+  defp sweep_source(s, state) do
+    from = s |> row_get(:from_address) |> to_string() |> String.downcase()
+
+    if from == "" do
+      :not_a_sweep
+    else
+      Enum.find_value(state.bindings, :not_a_sweep, fn {beneficiary, b} ->
+        if to_string(row_get(b, :address)) |> String.downcase() == from,
+          do: {:sweep, beneficiary}
+      end)
+    end
+  end
+
+  # Mirrors ignore_inflow/3: best-effort durable record (the optional
+  # `record_sweep_arrival/1` callback), a characterizing metric, the key
+  # marked seen, the cursor free. NOTHING is credited — the user was credited
+  # when the deposit landed; this is the same money changing pockets.
+  defp sweep_inflow(%{idempotency_key: key} = s, state, beneficiary) do
+    row =
+      unrecognised_row(s, state)
+      |> Map.delete(:nonce_candidates)
+      |> Map.put(:beneficiary, beneficiary)
+
+    if state.store_mod != nil and function_exported?(state.store_mod, :record_sweep_arrival, 1) do
+      case store_write(state.store_mod, :record_sweep_arrival, [row]) do
+        :ok ->
+          :ok
+
+        {:error, why} ->
+          Logger.error(
+            "payments: record_sweep_arrival failed (#{inspect(why)}) for #{key} — logged only; a sweep is never creditable, so the chain's progress is not held on it"
+          )
+      end
+    else
+      Logger.warning(
+        "payments: sweep arrival #{key} observed but the store exports no record_sweep_arrival/1 — visible only in this log line"
+      )
+    end
+
+    emit_metric(state, "payments_sweep_arrival", %{
+      chain: to_string(row_get(s, :chain)),
+      idempotency_key: key,
+      beneficiary: beneficiary,
+      amount_usd: money_text(row_get(s, :amount_usd))
+    })
+
+    {:skipped, %{state | seen_keys: MapSet.put(state.seen_keys, key)}}
+  end
+
+  defp dispatch_authorization_disposition(s, state) do
+    case authorization_disposition(s, state) do
         {:settle, nonce_hex, beneficiary, authorized_usd} ->
           s
           |> Map.put(:beneficiary, beneficiary)
@@ -918,11 +986,8 @@ defmodule Genswarms.Payments do
 
         {:hold, reason} ->
           hold_authorization_lookup(s, state, reason)
-      end
     end
   end
-
-  defp dispatch_settlement(s, state), do: settle_one(s, state)
 
   # (F2, N1) A store FAULT on either the issuance lookup OR the nonce-settled
   # lookup is not the same fact as "this hub never issued it" / "never settled

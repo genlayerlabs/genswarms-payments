@@ -30,12 +30,20 @@ expected = [
   # N1 (re-review fix wave): one-credit-per-nonce as a hub-state fact, not an
   # assumption borrowed from mark_authorization_consumed/1 never failing.
   authorization_settled?: 1,
-  record_unrecognised_inflow: 1
+  record_unrecognised_inflow: 1,
+  # Presenter reads (2026-07-27): the TopupAck chat card resolves the issued
+  # row by the keeper's order_ref and by the landed settlement.
+  authorization_by_order_ref: 1,
+  authorization_by_settlement: 2,
+  # Dashboard reads (2026-07-27): the package's Top-ups and Deposits pages.
+  list_issued_authorizations: 1,
+  list_unrecognised_inflows: 1,
+  list_deposit_balances: 1
 ]
 
 Check.check(
   f,
-  "Store behaviour declares all 18 callbacks",
+  "Store behaviour declares all 23 callbacks",
   Enum.all?(expected, &(&1 in callbacks))
 )
 

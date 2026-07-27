@@ -1452,6 +1452,12 @@ storeless_no_treasury_config = %{
   namespace: "hub_ns",
   auto_tick: false,
   chains: [],
+  # Frozen like every other section's hub: without this the hub reads REAL
+  # time, and this check's `now_unix + 3600` valid_before silently expired
+  # one day after the check was written — expired_valid_before then fired
+  # BEFORE the no-store refusal this check exists to pin (found 2026-07-27,
+  # exactly one day after).
+  now_fn: fn -> now end,
   # The exact gap: allow_ephemeral was set for entirely unrelated reasons (a
   # dev swarm with no durable settlement store either) and, pre-fix, that
   # SAME flag silently let this lane through too.
