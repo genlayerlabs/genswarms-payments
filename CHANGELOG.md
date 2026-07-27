@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — Unreleased
+## 0.2.0 — 2026-07-27
 
 - Added `Genswarms.Payments.Dashboard` — the package's schema-1 dashboard
   page (top-ups + the §4.4 unrecognised-inflow audit trail), read entirely
