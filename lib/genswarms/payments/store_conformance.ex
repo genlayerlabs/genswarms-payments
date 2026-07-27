@@ -299,7 +299,8 @@ defmodule Genswarms.Payments.StoreConformance do
       :ok =
         store.put_address_binding(%{
           beneficiary: beneficiary,
-          hd_index: 1_000_000 + rem(u, 1_000_000),
+          # the contract's key is :index (the HD derivation index)
+          index: 1_000_000 + rem(u, 1_000_000),
           address: address,
           namespace: "llm_quota"
         })
