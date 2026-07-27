@@ -93,6 +93,12 @@ case ext do
     )
 
     check.(
+      "each row shows the signature's own deadline (valid_before as ISO time)",
+      is_binary(row1["expires"]) and String.contains?(row1["expires"], "T") and
+        Enum.any?(topups_table["columns"], &(&1["key"] == "expires"))
+    )
+
+    check.(
       "status derivation: live / consumed / expired",
       Enum.map(topups_table["rows"], & &1["status"]) == ["live", "consumed", "expired"]
     )

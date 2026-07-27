@@ -94,7 +94,12 @@ defmodule Genswarms.Payments.Dashboard do
             %{"key" => "amount_usd", "label" => "USDC", "align" => "right"},
             %{"key" => "status", "label" => "Status"},
             %{"key" => "tx_ref", "label" => "Tx"},
-            %{"key" => "created_at", "label" => "Issued"}
+            %{"key" => "created_at", "label" => "Issued"},
+            # The signature's own on-chain deadline (valid_before). Without
+            # it, a "live" row whose 15-min LINK died reads as a mystery —
+            # the row is live because the SIGNATURE window (1h) still runs
+            # (Albert, first live read of the page, 2026-07-27).
+            %{"key" => "expires", "label" => "Sig. valid until"}
           ],
           "rows" => Enum.map(topups, &topup_row(&1, now))
         },
@@ -123,7 +128,8 @@ defmodule Genswarms.Payments.Dashboard do
       "amount_usd" => money(field(row, :amount_usd)),
       "status" => status(row, now),
       "tx_ref" => row |> field(:tx_ref) |> shorten(14),
-      "created_at" => stamp(field(row, :created_at))
+      "created_at" => stamp(field(row, :created_at)),
+      "expires" => unix_stamp(field(row, :valid_before))
     }
   end
 
@@ -165,4 +171,13 @@ defmodule Genswarms.Payments.Dashboard do
 
   defp stamp(%DateTime{} = dt), do: dt |> DateTime.truncate(:second) |> DateTime.to_iso8601()
   defp stamp(other), do: other && to_string(other)
+
+  defp unix_stamp(seconds) when is_integer(seconds) do
+    case DateTime.from_unix(seconds) do
+      {:ok, dt} -> DateTime.to_iso8601(dt)
+      _ -> nil
+    end
+  end
+
+  defp unix_stamp(_), do: nil
 end
