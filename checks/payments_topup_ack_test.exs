@@ -123,6 +123,7 @@ check.(
 copy_cases = [
   {{:failed, :reverted}, "didn't go through on the chain", nil},
   {{:failed, :rpc_timeout}, "couldn't reach the network", nil},
+  {{:failed, :submit_rejected}, "network fee couldn't be covered", nil},
   {{:refused, "FiatToken: transfer amount exceeds balance"}, "more than that wallet holds",
    "FiatToken"},
   {{:refused, nil}, "refused before sending", nil}

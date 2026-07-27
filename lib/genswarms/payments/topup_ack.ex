@@ -118,6 +118,15 @@ defmodule Genswarms.Payments.TopupAck do
     "❌ #{topup_of(amount)}couldn't reach the network. Nothing was charged — send /topup to retry."
   end
 
+  # The node refused the broadcast — OUR side couldn't pay the network fee
+  # (dry relayer, the 2026-07-27 live test) or the transaction was invalid.
+  # The user's signature cost them nothing and the cause is operator-side,
+  # so the copy points at retrying later, not at anything they did wrong.
+  def default_text({:failed, :submit_rejected}, amount) do
+    "❌ #{topup_of(amount)}couldn't be submitted — the network fee couldn't be covered right now. " <>
+      "Nothing was charged — try /topup again in a few minutes."
+  end
+
   # Refused by the pre-broadcast simulation: nothing was sent at all, and
   # the keeper hands over the contract's own reason. The one reason a person
   # can act on directly — not enough USDC in the signing wallet — gets its
