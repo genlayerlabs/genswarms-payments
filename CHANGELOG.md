@@ -2,6 +2,24 @@
 
 ## 0.2.0 — Unreleased
 
+- Added `Genswarms.Payments.TopupAck` — the presenter half of the
+  authorization lane, moved here from the first host so a second host wires
+  seams instead of rewriting logic. Owns the orchestration (keeper
+  `result_fn` and credit `credit_notice_fn`: order_ref/settlement → issued
+  row → conversation → edit-the-card-or-send) and the default English copy
+  for every terminal, including the two `{:refused, reason}` shapes (the
+  insufficient-balance refusal gets its actionable sentence; the raw
+  contract revert string never reaches a chat). Hosts inject `:store`,
+  `:conversation_fn` and `:deliver_fn`, and may override copy via
+  `:text_fn`/`:credit_text_fn`. Best-effort throughout: any fault costs the
+  one message, never the calling process.
+- `Genswarms.Payments.Store` gains two optional read callbacks the presenter
+  resolves through: `authorization_by_order_ref/1` and
+  `authorization_by_settlement/2` (exact nonce-facts join only; never
+  raises). Issued-authorization rows may now carry the optional
+  `card_chat_id`/`card_message_id` columns recorded by the host's delivery
+  effect — nil means "send, don't edit".
+
 - Documented **key custody** in the usage guide: the seed never touches the
   host, only the xpub is configured, `allow_test_xpub` is a local-rig opt-in
   and never production, physical seed backup, who-may-sign decided in advance,

@@ -442,6 +442,39 @@ defmodule Genswarms.Payments.Store do
   """
   @callback record_unrecognised_inflow(row :: map()) :: :ok | {:error, term()}
 
+  @doc """
+  The issued authorization for an ORDER ref, or nil.
+
+  The nonce-keyed `issued_authorization/1` answers the watcher, which only
+  ever sees nonces on chain. This one answers the keeper's result callback
+  (`Genswarms.Payments.TopupAck`), which knows an order ref and nothing else
+  — it is how a submitted-and-mined (or refused/reverted) order finds the
+  person waiting for it.
+
+  MUST NEVER raise: it runs inside the keeper's own process, on a
+  best-effort acknowledgement path. A store fault must cost a chat message,
+  never the keeper. Return nil on any fault.
+
+  The returned map carries at least `beneficiary` and `amount_usd`, plus
+  the optional card columns `card_chat_id`/`card_message_id` (nil when the
+  original card's delivery never recorded an id — the ack then sends a new
+  message instead of editing).
+  """
+  @callback authorization_by_order_ref(order_ref :: String.t()) :: map() | nil
+
+  @doc """
+  The issued authorization behind a SETTLEMENT (`method` + `ref`), or nil.
+
+  Answers the credit notice: a landed credit knows its settlement, the
+  settlement's facts carry the nonce, the nonce identifies the issued row —
+  and with it the card to edit into its final state. Exact join only (the
+  first host: `topup_authorizations.nonce_hex = settlement facts nonce_hex`);
+  a fuzzy match here could edit a stranger's card. Same never-raise stance
+  as `authorization_by_order_ref/1`.
+  """
+  @callback authorization_by_settlement(method :: String.t(), ref :: String.t()) ::
+              map() | nil
+
   @optional_callbacks put_address_binding: 1,
                       release_quarantined_payment: 2,
                       list_quarantined_payments: 3,
@@ -459,5 +492,7 @@ defmodule Genswarms.Payments.Store do
                       live_authorization_nonces: 1,
                       mark_authorization_consumed: 1,
                       authorization_settled?: 1,
-                      record_unrecognised_inflow: 1
+                      record_unrecognised_inflow: 1,
+                      authorization_by_order_ref: 1,
+                      authorization_by_settlement: 2
 end
