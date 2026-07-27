@@ -2,6 +2,14 @@
 
 ## 0.2.0 — Unreleased
 
+- Added `Genswarms.Payments.Dashboard` — the package's schema-1 dashboard
+  page (top-ups + the §4.4 unrecognised-inflow audit trail), read entirely
+  through the host's Store adapter via two new optional list callbacks
+  (`list_issued_authorizations/1`, `list_unrecognised_inflows/1`). A host
+  opts in with one probed line; no compile dependency in either direction.
+  The inflows table is always present when the page is — an empty audit
+  trail renders as "none seen", never as a hidden section. Conformance
+  covers both reads when exported.
 - Added `Genswarms.Payments.StoreConformance` — an executable conformance
   suite a host runs against its REAL store + throwaway database
   (`StoreConformance.run!(MyStore)`). Pins the semantics the hub and the

@@ -135,6 +135,19 @@ defmodule Genswarms.Payments.StoreConformance do
       end
 
       live_and_consume(store, nonce, u, now)
+
+      if exported?(store, :list_issued_authorizations, 1) do
+        {:ok, listed} = store.list_issued_authorizations(100)
+
+        assert!(
+          Enum.any?(listed, &(stored_field(&1, :order_ref) == order_ref)),
+          "list_issued_authorizations includes a just-issued row"
+        )
+
+        ok("list_issued_authorizations: the dashboard projection sees issued rows")
+      else
+        skip("list_issued_authorizations/1 not exported (dashboard page absent)")
+      end
     else
       skip("record_issued_authorization/1 not exported — authorization lane not adopted")
     end
@@ -359,6 +372,19 @@ defmodule Genswarms.Payments.StoreConformance do
       )
 
       ok("record_unrecognised_inflow: audit row + rescan dedupe")
+
+      if exported?(store, :list_unrecognised_inflows, 1) do
+        {:ok, listed} = store.list_unrecognised_inflows(100)
+
+        assert!(
+          Enum.any?(listed, &(stored_field(&1, :tx_hash) == row.tx_hash)),
+          "list_unrecognised_inflows includes the recorded inflow"
+        )
+
+        ok("list_unrecognised_inflows: the audit trail is visible")
+      else
+        skip("list_unrecognised_inflows/1 not exported (dashboard page absent)")
+      end
     else
       skip("record_unrecognised_inflow/1 not exported")
     end

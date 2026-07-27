@@ -475,6 +475,27 @@ defmodule Genswarms.Payments.Store do
   @callback authorization_by_settlement(method :: String.t(), ref :: String.t()) ::
               map() | nil
 
+  @doc """
+  Most-recent issued authorizations, newest first, for the dashboard page
+  (`Genswarms.Payments.Dashboard`). Read-only projection; `{:ok, []}` when
+  none. Rows carry at least `order_ref`, `beneficiary`, `amount_usd`,
+  `valid_before`, `created_at`, `consumed_at`; a store MAY enrich each row
+  with `tx_ref` (the settlement ref, when the authorization settled) — the
+  page shows it when present and shows nothing when not.
+  """
+  @callback list_issued_authorizations(limit :: pos_integer()) ::
+              {:ok, [map()]} | {:error, term()}
+
+  @doc """
+  Most-recent unrecognised treasury inflows, newest first, for the dashboard
+  page. Read-only projection of the §4.4 audit trail; `{:ok, []}` when none
+  — which the page renders as its own answer (\"none seen\"), never as an
+  absent section. Rows carry `chain`, `tx_hash`, `from_addr`, `amount_usd`,
+  `reason`, `seen_at`.
+  """
+  @callback list_unrecognised_inflows(limit :: pos_integer()) ::
+              {:ok, [map()]} | {:error, term()}
+
   @optional_callbacks put_address_binding: 1,
                       release_quarantined_payment: 2,
                       list_quarantined_payments: 3,
@@ -494,5 +515,7 @@ defmodule Genswarms.Payments.Store do
                       authorization_settled?: 1,
                       record_unrecognised_inflow: 1,
                       authorization_by_order_ref: 1,
-                      authorization_by_settlement: 2
+                      authorization_by_settlement: 2,
+                      list_issued_authorizations: 1,
+                      list_unrecognised_inflows: 1
 end
