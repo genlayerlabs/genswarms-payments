@@ -282,8 +282,45 @@ defmodule Genswarms.Payments.StoreConformance do
       end
 
       totals_section(store, beneficiary, u)
+      deposit_view_section(store, beneficiary, u)
     else
       skip("record_payment/payment_seen? not exported")
+    end
+  end
+
+  # The C1 collection view: a bound deposit address shows its settled
+  # entry-B receipts; authorization-lane settlements never count (they pay
+  # the treasury directly). Requires the binding write to stage the row.
+  defp deposit_view_section(store, beneficiary, u) do
+    if exported?(store, :put_address_binding, 1) and
+         exported?(store, :list_deposit_balances, 1) do
+      address = "0x" <> (Integer.to_string(u, 16) |> String.downcase() |> String.pad_leading(40, "c"))
+
+      :ok =
+        store.put_address_binding(%{
+          beneficiary: beneficiary,
+          hd_index: 1_000_000 + rem(u, 1_000_000),
+          address: address,
+          namespace: "llm_quota"
+        })
+
+      {:ok, rows} = store.list_deposit_balances(200)
+      mine = Enum.find(rows, &(stored_field(&1, :beneficiary) == beneficiary))
+
+      assert!(is_map(mine), "a bound deposit address appears in the collection view")
+
+      # settlement_section settled 2.00 for this beneficiary via method
+      # "usdc_base_sepolia" — an entry-B-shaped method — so it must count
+      received = stored_field(mine, :received_usd)
+
+      assert!(
+        not is_nil(received) and Decimal.compare(Decimal.new(received), Decimal.new("2.00")) != :lt,
+        "the view counts settled entry-B receipts (got #{inspect(received)})"
+      )
+
+      ok("list_deposit_balances: bound addresses with their settled receipts")
+    else
+      skip("deposit collection view not exported (Deposits page absent)")
     end
   end
 

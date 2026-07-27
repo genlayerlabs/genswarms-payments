@@ -496,6 +496,21 @@ defmodule Genswarms.Payments.Store do
   @callback list_unrecognised_inflows(limit :: pos_integer()) ::
               {:ok, [map()]} | {:error, term()}
 
+  @doc """
+  Per-deposit-address collection view for the dashboard's Deposits page and
+  the sweep preparer (plan 3 / spec §7). Newest activity first; `{:ok, []}`
+  when no bindings exist.
+
+  Rows carry `beneficiary`, `address`, `hd_index`, `received_usd` (settled
+  entry-B deposits for that beneficiary — authorization-lane settlements go
+  straight to the treasury and are excluded), `swept_usd` (recognized
+  sweeps; 0 until C3 lands), and `last_at`. This is a STORE-derived
+  ESTIMATE of what sits uncollected — the sweep executor reads the chain's
+  own balances before signing anything; the page must label it as such.
+  """
+  @callback list_deposit_balances(limit :: pos_integer()) ::
+              {:ok, [map()]} | {:error, term()}
+
   @optional_callbacks put_address_binding: 1,
                       release_quarantined_payment: 2,
                       list_quarantined_payments: 3,
@@ -517,5 +532,6 @@ defmodule Genswarms.Payments.Store do
                       authorization_by_order_ref: 1,
                       authorization_by_settlement: 2,
                       list_issued_authorizations: 1,
-                      list_unrecognised_inflows: 1
+                      list_unrecognised_inflows: 1,
+                      list_deposit_balances: 1
 end

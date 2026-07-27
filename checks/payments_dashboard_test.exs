@@ -25,6 +25,20 @@ defmodule DashStore do
 
   def list_issued_authorizations(_limit), do: {:ok, Process.get(:dash_topups, [])}
   def list_unrecognised_inflows(_limit), do: {:ok, Process.get(:dash_inflows, [])}
+
+  def list_deposit_balances(_limit) do
+    {:ok,
+     [
+       %{
+         beneficiary: "user:42",
+         address: "0x" <> String.duplicate("d", 40),
+         hd_index: 0,
+         received_usd: "3.0",
+         swept_usd: "1.0",
+         last_at: DateTime.utc_now()
+       }
+     ]}
+  end
 end
 
 defmodule DashStoreBare do
@@ -75,7 +89,21 @@ end
 ext = Dashboard.dashboard_extension(store_mod: DashStore)
 
 case ext do
-  %{"dashboard_pages" => [page]} ->
+  %{"dashboard_pages" => [page, deposits_page]} ->
+    check.(
+      "the Deposits page rides along (id, group Money, honest estimate meta)",
+      deposits_page["id"] == "deposits" and deposits_page["group"] == "Money" and
+        String.contains?(deposits_page["meta"] || "", "estimate")
+    )
+
+    [_metrics, dep_table] = deposits_page["sections"]
+    [dep_row] = dep_table["rows"]
+
+    check.(
+      "deposit row: received − swept = uncollected estimate, 2-dp",
+      dep_row["received_usd"] == "3.00" and dep_row["swept_usd"] == "1.00" and
+        dep_row["unswept_usd"] == "2.00"
+    )
     check.("one page under the schema-1 contract", page["schema"] == 1 and page["id"] == "topups")
     [metrics, topups_table, inflows_table] = page["sections"]
 

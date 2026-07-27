@@ -28,12 +28,18 @@ defmodule Genswarms.Payments.Dashboard do
 
     topups = list(store, :list_issued_authorizations, 25)
     inflows = list(store, :list_unrecognised_inflows, 25)
+    deposits = list(store, :list_deposit_balances, 50)
 
-    if topups == :absent and inflows == :absent do
-      %{}
-    else
-      %{"dashboard_pages" => [page(rows_or_empty(topups), rows_or_empty(inflows))]}
-    end
+    pages =
+      [
+        if(topups != :absent or inflows != :absent,
+          do: page(rows_or_empty(topups), rows_or_empty(inflows))
+        ),
+        if(deposits != :absent, do: deposits_page(rows_or_empty(deposits)))
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    if pages == [], do: %{}, else: %{"dashboard_pages" => pages}
   rescue
     _ -> %{}
   catch
@@ -119,6 +125,83 @@ defmodule Genswarms.Payments.Dashboard do
         }
       ]
     }
+  end
+
+  # The collection view (plan 3, C1): what sits on deposit addresses,
+  # UNCOLLECTED, per the store's own ledger. Honest labeling is the design:
+  # this is settled-minus-swept from the database — the chain's balance is
+  # read by the sweep executor at signing time, never by a page that
+  # refreshes every second.
+  defp deposits_page(rows) do
+    unswept =
+      rows
+      |> Enum.map(&(field(&1, :unswept_usd) || money_sub(field(&1, :received_usd), field(&1, :swept_usd))))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.reduce(Decimal.new(0), &Decimal.add(dec(&1), &2))
+
+    %{
+      "schema" => 1,
+      "id" => "deposits",
+      "label" => "Deposits",
+      "icon" => "hero-wallet",
+      "group" => "Money",
+      "meta" => "ledger estimate — the sweep executor reads chain truth",
+      "sections" => [
+        %{
+          "type" => "metrics",
+          "title" => "Entry-B deposit addresses",
+          "columns" => 4,
+          "items" => [
+            %{"label" => "addresses", "value" => length(rows)},
+            %{"label" => "unswept (est. USDC)", "value" => money(unswept)},
+            %{
+              "label" => "with activity",
+              "value" => Enum.count(rows, &(not is_nil(field(&1, :last_at))))
+            },
+            %{"label" => "sweep lane", "value" => "manual (plan 3 C2-C4)"}
+          ]
+        },
+        %{
+          "type" => "table",
+          "title" => "Per address (received − swept = est. uncollected)",
+          "columns" => [
+            %{"key" => "beneficiary", "label" => "Beneficiary"},
+            %{"key" => "address", "label" => "Address"},
+            %{"key" => "received_usd", "label" => "Received", "align" => "right"},
+            %{"key" => "swept_usd", "label" => "Swept", "align" => "right"},
+            %{"key" => "unswept_usd", "label" => "Uncollected (est.)", "align" => "right"},
+            %{"key" => "last_at", "label" => "Last activity"}
+          ],
+          "rows" => Enum.map(rows, &deposit_row/1)
+        }
+      ]
+    }
+  end
+
+  defp deposit_row(row) do
+    received = field(row, :received_usd)
+    swept = field(row, :swept_usd)
+
+    %{
+      "beneficiary" => field(row, :beneficiary),
+      "address" => row |> field(:address) |> shorten(14),
+      "received_usd" => money(received),
+      "swept_usd" => money(swept || 0),
+      "unswept_usd" => money(field(row, :unswept_usd) || money_sub(received, swept)),
+      "last_at" => stamp(field(row, :last_at))
+    }
+  end
+
+  defp money_sub(nil, _), do: nil
+  defp money_sub(a, nil), do: dec(a)
+  defp money_sub(a, b), do: Decimal.sub(dec(a), dec(b))
+
+  defp dec(%Decimal{} = d), do: d
+
+  defp dec(other) do
+    Decimal.new(other)
+  rescue
+    _ -> Decimal.new(0)
   end
 
   defp topup_row(row, now) do
