@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-07-29
+
+- Deposits dashboard tile: the "sweep lane" metric now names the real
+  mechanism ("manual — operator /payments sweep") instead of internal
+  plan jargon. Label only; no behavior change.
+
 ## 0.2.0 — 2026-07-27
 
 - Added `Genswarms.Payments.Dashboard` — the package's schema-1 dashboard
