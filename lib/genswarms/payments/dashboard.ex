@@ -158,7 +158,7 @@ defmodule Genswarms.Payments.Dashboard do
               "label" => "with activity",
               "value" => Enum.count(rows, &(not is_nil(field(&1, :last_at))))
             },
-            %{"label" => "sweep lane", "value" => "manual (plan 3 C2-C4)"}
+            %{"label" => "sweep lane", "value" => "manual — operator /payments sweep"}
           ]
         },
         %{
