@@ -150,14 +150,21 @@ defmodule Genswarms.Payments do
   def init!(config) do
     validate_boolean_config!(config, :allow_test_xpub, false)
     validate_boolean_config!(config, :allow_ephemeral, false)
+    validate_boolean_config!(config, :deposit_addresses_enabled, true)
 
-    raw_xpub = Map.fetch!(config, :xpub) |> to_string()
-    validate_test_xpub!(raw_xpub, Map.get(config, :allow_test_xpub, false))
+    deposit_addresses_enabled? = Map.get(config, :deposit_addresses_enabled, true)
 
     xpub =
-      case HD.parse_xpub(raw_xpub) do
-        {:ok, parsed} -> parsed
-        {:error, why} -> raise ArgumentError, "payments: invalid xpub (#{why})"
+      if deposit_addresses_enabled? do
+        raw_xpub = Map.fetch!(config, :xpub) |> to_string()
+        validate_test_xpub!(raw_xpub, Map.get(config, :allow_test_xpub, false))
+
+        case HD.parse_xpub(raw_xpub) do
+          {:ok, parsed} -> parsed
+          {:error, why} -> raise ArgumentError, "payments: invalid xpub (#{why})"
+        end
+      else
+        nil
       end
 
     store_mod = Map.get(config, :store_mod)
@@ -202,7 +209,14 @@ defmodule Genswarms.Payments do
       positive_integer_config!(config, :max_authorization_window_seconds, 3600)
 
     {bindings, degraded_boot?, foreign_namespace_bindings} =
-      init_bindings(store_mod, namespace, metrics_fn)
+      if deposit_addresses_enabled? do
+        init_bindings(store_mod, namespace, metrics_fn)
+      else
+        # Authorization-only deployments deliberately do not load historical
+        # HD bindings. That keeps old/test deposit addresses out of the live
+        # watcher set when the host has explicitly disabled that custody lane.
+        {%{}, false, MapSet.new()}
+      end
 
     validate_treasury_not_bound!(chains, bindings)
 
@@ -213,6 +227,7 @@ defmodule Genswarms.Payments do
       name: Map.get(config, :name, :payments),
       swarm_name: Map.get(config, :swarm_name, "swarm"),
       xpub: xpub,
+      deposit_addresses_enabled: deposit_addresses_enabled?,
       trusted_sources: trusted,
       operator_sources: operator_sources,
       targets: targets,
@@ -825,6 +840,7 @@ defmodule Genswarms.Payments do
          Jason.encode!(%{
            ok: true,
            bindings: map_size(state.bindings),
+           deposit_addresses_enabled: state.deposit_addresses_enabled,
            degraded_boot: state.degraded_boot
          }), state}
 
@@ -983,19 +999,19 @@ defmodule Genswarms.Payments do
 
   defp dispatch_authorization_disposition(s, state) do
     case authorization_disposition(s, state) do
-        {:settle, nonce_hex, beneficiary, authorized_usd} ->
-          s
-          |> Map.put(:beneficiary, beneficiary)
-          |> Map.put(:namespace, state.namespace)
-          |> cap_credit_at_authorized(authorized_usd, state)
-          |> settle_one(state)
-          |> consume_when_resolved(nonce_hex)
+      {:settle, nonce_hex, beneficiary, authorized_usd} ->
+        s
+        |> Map.put(:beneficiary, beneficiary)
+        |> Map.put(:namespace, state.namespace)
+        |> cap_credit_at_authorized(authorized_usd, state)
+        |> settle_one(state)
+        |> consume_when_resolved(nonce_hex)
 
-        {:ignore, reason} ->
-          ignore_inflow(s, state, reason)
+      {:ignore, reason} ->
+        ignore_inflow(s, state, reason)
 
-        {:hold, reason} ->
-          hold_authorization_lookup(s, state, reason)
+      {:hold, reason} ->
+        hold_authorization_lookup(s, state, reason)
     end
   end
 
@@ -2085,6 +2101,15 @@ defmodule Genswarms.Payments do
   defp handle_action(
          "deposit_address",
          %{"beneficiary" => _ben},
+         %{deposit_addresses_enabled: false} = state,
+         _from
+       ) do
+    {:reply, Jason.encode!(%{ok: false, error: "deposit_addresses_disabled"}), state}
+  end
+
+  defp handle_action(
+         "deposit_address",
+         %{"beneficiary" => _ben},
          %{degraded_boot: true} = state,
          _from
        ) do
@@ -2154,7 +2179,8 @@ defmodule Genswarms.Payments do
           reason: to_string(reason)
         })
 
-        {:reply, Jason.encode!(%{action: "issue_authorization", ok: false, error: to_string(reason)}),
+        {:reply,
+         Jason.encode!(%{action: "issue_authorization", ok: false, error: to_string(reason)}),
          state}
     end
   end
@@ -2315,6 +2341,15 @@ defmodule Genswarms.Payments do
   # attached. This hub is watch-only — it holds an xPUB, not an xprv — so
   # there is nothing here that could move a coin even if it wanted to. The
   # only chain traffic is `balanceOf` reads, bounded by `limit`.
+  defp handle_action("sweep_report", _msg, %{deposit_addresses_enabled: false} = state, _from) do
+    {:reply,
+     Jason.encode!(%{
+       action: "sweep_report",
+       ok: false,
+       error: "deposit_addresses_disabled"
+     }), state}
+  end
+
   defp handle_action("sweep_report", _msg, %{degraded_boot: true} = state, _from) do
     {:reply, Jason.encode!(%{action: "sweep_report", ok: false, error: "degraded_boot"}), state}
   end
@@ -3676,8 +3711,7 @@ defmodule Genswarms.Payments do
             {:error, :namespace_mismatch,
              %{
                state
-               | foreign_namespace_bindings:
-                   MapSet.put(state.foreign_namespace_bindings, ben)
+               | foreign_namespace_bindings: MapSet.put(state.foreign_namespace_bindings, ben)
              }}
 
           true ->
@@ -3757,7 +3791,11 @@ defmodule Genswarms.Payments do
   defp release_one(key, state) do
     if exported?(state.store_mod, :release_quarantined_payment, 2) do
       state.store_mod
-      |> store_result(:release_quarantined_payment, [state.namespace, key], {:error, :store_failed})
+      |> store_result(
+        :release_quarantined_payment,
+        [state.namespace, key],
+        {:error, :store_failed}
+      )
       |> release_result(key, state)
     else
       Logger.error(
@@ -4128,12 +4166,17 @@ defmodule Genswarms.Payments do
     end
 
     rows = Enum.sort_by(rows, fn {_ben, _binding, amount} -> Decimal.to_float(amount) end, :desc)
-    total = Enum.reduce(rows, Decimal.new(0), fn {_b, _bi, amount}, acc -> Decimal.add(acc, amount) end)
+
+    total =
+      Enum.reduce(rows, Decimal.new(0), fn {_b, _bi, amount}, acc -> Decimal.add(acc, amount) end)
 
     largest =
       case rows do
-        [{_ben, binding, amount} | _] -> %{address: binding.address, balance_usd: Decimal.to_string(amount)}
-        [] -> nil
+        [{_ben, binding, amount} | _] ->
+          %{address: binding.address, balance_usd: Decimal.to_string(amount)}
+
+        [] ->
+          nil
       end
 
     emit_metric(state, "payments_sweep_report", %{

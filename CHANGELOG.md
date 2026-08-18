@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — 2026-08-18
+
+- Added an explicit authorization-only mode with
+  `deposit_addresses_enabled: false`. In this mode an xpub is not required,
+  historical HD bindings are not loaded or watched, `deposit_address` and
+  `sweep_report` fail closed with `deposit_addresses_disabled`, and the
+  EIP-3009 treasury watcher, issuance registry, reconciliation and settlement
+  paths remain active. The default is still `true`, preserving the existing
+  xpub-required behavior for deposit-address deployments.
+- Health replies now expose `deposit_addresses_enabled`, making custody mode
+  visible without disclosing any key material.
+
 ## 0.2.1 — 2026-07-29
 
 - Deposits dashboard tile: the "sweep lane" metric now names the real
