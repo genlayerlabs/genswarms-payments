@@ -1,8 +1,8 @@
 # genswarms-payments
 
 Payment settlement hub object for [genswarms](https://github.com/genlayerlabs/genswarms)
-swarms. It owns beneficiary identity (a stable HD deposit address per
-beneficiary), the idempotent settlement ledger, and stamped
+swarms. It owns beneficiary identity (optionally a stable HD deposit address
+per beneficiary), the idempotent settlement ledger, and stamped
 `payment_confirmed` delivery to allowlisted downstream targets. Payment
 modalities (in-tree USDC today; Stripe, x402, etc. as sibling packages
 tomorrow) implement `Genswarms.Payments.Method` and plug into the same core —
@@ -55,7 +55,8 @@ push method ships yet; `ingest_event` currently always replies
 %{
   name: :payments,                    # object name, stamped on every delivered message (default :payments)
   swarm_name: "my_swarm",             # used by the default deliver_fn (default "swarm")
-  xpub: System.fetch_env!("PAYMENTS_XPUB"),   # required — watch-only, see Custody below
+  deposit_addresses_enabled: true,    # false = authorization-only; no xpub or HD addresses (default true)
+  xpub: System.fetch_env!("PAYMENTS_XPUB"),   # required only when deposit addresses are enabled
   allow_test_xpub: false,             # explicit opt-out for a publicly known test xpub (default false)
   trusted_sources: ["telegram_ingress", "cron"],  # required for anything to work (default [])
   operator_sources: ["commands"],     # SEPARATE allowlist for value-affecting actions (default [] = nobody)
@@ -226,12 +227,15 @@ interval; this package owns the settlement/watch logic, not the clock.
 ## Object protocol
 
 - `{"action": "health"}` — unauthenticated; `{"ok": true, "bindings": N,
-  "degraded_boot": bool}`.
+  "deposit_addresses_enabled": bool, "degraded_boot": bool}`.
 - `{"action": "tick"}` — trusted only; runs one poll round (every configured
   method scans, settlements settle, cursors advance per the fail-closed rule
   below). No reply. A no-op while `degraded_boot` (see below).
 - `{"action": "deposit_address", "beneficiary": "..."}` — trusted only;
   returns the beneficiary's stable address, minting one on first ask.
+  Refused with `{"ok": false, "error": "deposit_addresses_disabled"}` when
+  the hub is running in authorization-only mode; no xpub is loaded and no
+  historical HD binding is watched in that mode.
   Refused with `{"ok": false, "error": "namespace_mismatch"}` for a
   beneficiary whose binding was loaded under a foreign namespace (its
   settlements would be held — see D2 below).
@@ -308,6 +312,8 @@ interval; this package owns the settlement/watch logic, not the clock.
   balance is reported as `unreadable`, never folded into zero. With several
   chains configured and no `chain` argument it refuses (`chain_required`)
   rather than guessing which token to measure.
+  Authorization-only hubs refuse it with `deposit_addresses_disabled` because
+  no derived-address custody lane exists to inspect.
 
 `payment_status` also gains a held view: alongside `payments` (settled money
 only) it returns `held` (this beneficiary's quarantined rows, capped at 20) and
