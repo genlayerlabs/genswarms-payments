@@ -17,52 +17,93 @@ defmodule Genswarms.Payments.Dashboard do
       an empty audit trail is the answer "none seen", never a hidden
       section. Unauthorized money arriving at the treasury is exactly the
       thing an operator must be able to see is NOT happening.
-    * The page is absent (`%{}`) when the store exports neither list read or
-      both answer errors — no durable data must mean no page, never a
-      zeroed lie.
+    * Headline summaries cover all records independently of bounded detail
+      tables. Failed/unsupported reads are unavailable, never fabricated zeros.
+      The page is absent only when the store exports none of its callbacks.
   """
 
   @doc "Schema-1 dashboard extension. Opts: `store_mod:` (required)."
   def dashboard_extension(opts) do
     store = Keyword.fetch!(opts, :store_mod)
 
-    topups = list(store, :list_issued_authorizations, 25)
-    inflows = list(store, :list_unrecognised_inflows, 25)
-    deposits = list(store, :list_deposit_balances, 50)
+    now = System.os_time(:second)
+    topups = list(store, :list_issued_authorizations, 25, &topup_row(&1, now))
+    inflows = list(store, :list_unrecognised_inflows, 25, &inflow_row/1)
+    deposits = list(store, :list_deposit_balances, 50, &deposit_row/1)
+
+    authorizations =
+      summary(store, :issued_authorizations_summary, [now], [:issued, :live, :consumed])
+
+    inflow_summary = summary(store, :unrecognised_inflows_summary, [], [:count])
+
+    deposit_summary =
+      summary(store, :deposit_balances_summary, [], [:addresses, :with_activity], [:unswept_usd])
 
     pages =
       [
-        if(topups != :absent or inflows != :absent,
-          do: page(rows_or_empty(topups), rows_or_empty(inflows))
+        if(
+          topups != :absent or inflows != :absent or authorizations != :absent or
+            inflow_summary != :absent,
+          do: page(topups, inflows, authorizations, inflow_summary)
         ),
-        if(deposits != :absent, do: deposits_page(rows_or_empty(deposits)))
+        if(deposits != :absent or deposit_summary != :absent,
+          do: deposits_page(deposits, deposit_summary)
+        )
       ]
       |> Enum.reject(&is_nil/1)
 
     if pages == [], do: %{}, else: %{"dashboard_pages" => pages}
-  rescue
-    _ -> %{}
-  catch
-    _, _ -> %{}
   end
 
-  defp list(store, fun, limit) do
-    if Code.ensure_loaded?(store) and function_exported?(store, fun, 1) do
-      case apply(store, fun, [limit]) do
-        {:ok, rows} when is_list(rows) -> rows
-        _ -> :absent
-      end
-    else
-      :absent
+  defp read(store, fun, args) do
+    if Code.ensure_loaded?(store) and function_exported?(store, fun, length(args)),
+      do: apply(store, fun, args),
+      else: :absent
+  rescue
+    _ -> :unavailable
+  catch
+    _, _ -> :unavailable
+  end
+
+  defp list(store, fun, limit, project) do
+    case read(store, fun, [limit]) do
+      {:ok, rows} when is_list(rows) -> Enum.map(Enum.take(rows, limit), project)
+      :absent -> :absent
+      _ -> :unavailable
+    end
+  rescue
+    _ -> :unavailable
+  catch
+    _, _ -> :unavailable
+  end
+
+  defp summary(store, fun, args, counts, amounts \\ []) do
+    case read(store, fun, args) do
+      {:ok, row} when is_map(row) ->
+        if Enum.all?(counts, &(is_integer(row[&1]) and row[&1] >= 0)) and
+             Enum.all?(amounts, &match?(%Decimal{coef: c} when is_integer(c), row[&1])),
+           do: row,
+           else: :unavailable
+
+      :absent ->
+        :absent
+
+      _ ->
+        :unavailable
     end
   end
 
-  defp rows_or_empty(:absent), do: []
-  defp rows_or_empty(rows), do: rows
+  defp value(row, key) when is_map(row), do: Map.fetch!(row, key)
+  defp value(_, _), do: "unavailable"
+  defp rows_or_empty(rows) when is_list(rows), do: rows
+  defp rows_or_empty(_), do: []
 
-  defp page(topups, inflows) do
-    now = System.os_time(:second)
+  defp detail_meta(rows, limit) when is_list(rows),
+    do: "up to #{limit} recent rows; totals cover all records"
 
+  defp detail_meta(_, _), do: "unavailable — detail read failed or unsupported"
+
+  defp page(topups, inflows, authorizations, inflow_summary) do
     %{
       "schema" => 1,
       "id" => "topups",
@@ -79,21 +120,22 @@ defmodule Genswarms.Payments.Dashboard do
           "title" => "Authorization lane",
           "columns" => 4,
           "items" => [
-            %{"label" => "issued (recent)", "value" => length(topups)},
-            %{"label" => "live", "value" => Enum.count(topups, &(status(&1, now) == "live"))},
+            %{"label" => "issued", "value" => value(authorizations, :issued)},
+            %{"label" => "live", "value" => value(authorizations, :live)},
             %{
               "label" => "consumed",
-              "value" => Enum.count(topups, &(status(&1, now) == "consumed"))
+              "value" => value(authorizations, :consumed)
             },
             %{
               "label" => "unrecognised inflows",
-              "value" => length(inflows)
+              "value" => value(inflow_summary, :count)
             }
           ]
         },
         %{
           "type" => "table",
           "title" => "Recent top-ups",
+          "meta" => detail_meta(topups, 25),
           "columns" => [
             %{"key" => "order_ref", "label" => "Order"},
             %{"key" => "beneficiary", "label" => "Beneficiary"},
@@ -107,12 +149,12 @@ defmodule Genswarms.Payments.Dashboard do
             # (Albert, first live read of the page, 2026-07-27).
             %{"key" => "expires", "label" => "Sig. valid until"}
           ],
-          "rows" => Enum.map(topups, &topup_row(&1, now))
+          "rows" => rows_or_empty(topups)
         },
         %{
           "type" => "table",
           "title" => "Unrecognised treasury inflows (§4.4 — never credited)",
-          "meta" => "an empty table means none seen — the healthy state",
+          "meta" => detail_meta(inflows, 25),
           "columns" => [
             %{"key" => "chain", "label" => "Chain"},
             %{"key" => "tx_hash", "label" => "Tx"},
@@ -121,7 +163,7 @@ defmodule Genswarms.Payments.Dashboard do
             %{"key" => "reason", "label" => "Reason"},
             %{"key" => "seen_at", "label" => "Seen"}
           ],
-          "rows" => Enum.map(inflows, &inflow_row/1)
+          "rows" => rows_or_empty(inflows)
         }
       ]
     }
@@ -132,12 +174,8 @@ defmodule Genswarms.Payments.Dashboard do
   # this is settled-minus-swept from the database — the chain's balance is
   # read by the sweep executor at signing time, never by a page that
   # refreshes every second.
-  defp deposits_page(rows) do
-    unswept =
-      rows
-      |> Enum.map(&(field(&1, :unswept_usd) || money_sub(field(&1, :received_usd), field(&1, :swept_usd))))
-      |> Enum.reject(&is_nil/1)
-      |> Enum.reduce(Decimal.new(0), &Decimal.add(dec(&1), &2))
+  defp deposits_page(rows, summary) do
+    unswept = if is_map(summary), do: money(summary.unswept_usd), else: "unavailable"
 
     %{
       "schema" => 1,
@@ -152,11 +190,11 @@ defmodule Genswarms.Payments.Dashboard do
           "title" => "Entry-B deposit addresses",
           "columns" => 4,
           "items" => [
-            %{"label" => "addresses", "value" => length(rows)},
-            %{"label" => "unswept (est. USDC)", "value" => money(unswept)},
+            %{"label" => "addresses", "value" => value(summary, :addresses)},
+            %{"label" => "unswept (est. USDC)", "value" => unswept},
             %{
               "label" => "with activity",
-              "value" => Enum.count(rows, &(not is_nil(field(&1, :last_at))))
+              "value" => value(summary, :with_activity)
             },
             %{"label" => "sweep lane", "value" => "manual — operator /payments sweep"}
           ]
@@ -164,6 +202,7 @@ defmodule Genswarms.Payments.Dashboard do
         %{
           "type" => "table",
           "title" => "Per address (received − swept = est. uncollected)",
+          "meta" => detail_meta(rows, 50),
           "columns" => [
             %{"key" => "beneficiary", "label" => "Beneficiary"},
             %{"key" => "address", "label" => "Address"},
@@ -172,7 +211,7 @@ defmodule Genswarms.Payments.Dashboard do
             %{"key" => "unswept_usd", "label" => "Uncollected (est.)", "align" => "right"},
             %{"key" => "last_at", "label" => "Last activity"}
           ],
-          "rows" => Enum.map(rows, &deposit_row/1)
+          "rows" => rows_or_empty(rows)
         }
       ]
     }
@@ -198,13 +237,11 @@ defmodule Genswarms.Payments.Dashboard do
 
   defp dec(%Decimal{} = d), do: d
 
-  defp dec(other) do
-    Decimal.new(other)
-  rescue
-    _ -> Decimal.new(0)
-  end
+  defp dec(other), do: Decimal.new(other)
 
   defp topup_row(row, now) do
+    true = is_integer(field(row, :valid_before))
+
     %{
       "order_ref" => row |> field(:order_ref) |> shorten(12),
       "beneficiary" => field(row, :beneficiary),
@@ -239,17 +276,16 @@ defmodule Genswarms.Payments.Dashboard do
   defp field(row, key), do: Map.get(row, key) || Map.get(row, to_string(key))
 
   defp shorten(nil, _n), do: nil
+
   defp shorten(value, n) when is_binary(value) and byte_size(value) > n,
     do: String.slice(value, 0, n) <> "…"
 
   defp shorten(value, _n), do: value
 
-  defp money(nil), do: nil
-
   defp money(value) do
-    value |> Decimal.new() |> Decimal.round(2) |> Decimal.to_string(:normal)
-  rescue
-    _ -> to_string(value)
+    %Decimal{coef: coefficient} = amount = dec(value)
+    true = is_integer(coefficient)
+    amount |> Decimal.round(2) |> Decimal.to_string(:normal)
   end
 
   defp stamp(%DateTime{} = dt), do: dt |> DateTime.truncate(:second) |> DateTime.to_iso8601()

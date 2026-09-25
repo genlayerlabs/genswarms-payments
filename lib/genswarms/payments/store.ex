@@ -521,6 +521,26 @@ defmodule Genswarms.Payments.Store do
   @callback list_deposit_balances(limit :: pos_integer()) ::
               {:ok, [map()]} | {:error, term()}
 
+  @doc "Complete authorization counts, independent of recent-table limits; live excludes consumed and expired rows."
+  @callback issued_authorizations_summary(now_unix :: integer()) ::
+              {:ok,
+               %{issued: non_neg_integer(), live: non_neg_integer(), consumed: non_neg_integer()}}
+              | {:error, term()}
+
+  @doc "Complete count of unrecognised inflows, independent of the recent table."
+  @callback unrecognised_inflows_summary() ::
+              {:ok, %{count: non_neg_integer()}} | {:error, term()}
+
+  @doc "Complete per-address ledger estimate using the same attribution as list_deposit_balances/1. Sum exact received minus swept amounts before rounding."
+  @callback deposit_balances_summary() ::
+              {:ok,
+               %{
+                 addresses: non_neg_integer(),
+                 with_activity: non_neg_integer(),
+                 unswept_usd: Decimal.t()
+               }}
+              | {:error, term()}
+
   @optional_callbacks put_address_binding: 1,
                       release_quarantined_payment: 2,
                       list_quarantined_payments: 3,
@@ -543,5 +563,8 @@ defmodule Genswarms.Payments.Store do
                       authorization_by_settlement: 2,
                       list_issued_authorizations: 1,
                       list_unrecognised_inflows: 1,
-                      list_deposit_balances: 1
+                      list_deposit_balances: 1,
+                      issued_authorizations_summary: 1,
+                      unrecognised_inflows_summary: 0,
+                      deposit_balances_summary: 0
 end

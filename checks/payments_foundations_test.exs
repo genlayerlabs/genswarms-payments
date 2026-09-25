@@ -38,12 +38,15 @@ expected = [
   # Dashboard reads (2026-07-27): the package's Top-ups and Deposits pages.
   list_issued_authorizations: 1,
   list_unrecognised_inflows: 1,
-  list_deposit_balances: 1
+  list_deposit_balances: 1,
+  issued_authorizations_summary: 1,
+  unrecognised_inflows_summary: 0,
+  deposit_balances_summary: 0
 ]
 
 Check.check(
   f,
-  "Store behaviour declares all 23 callbacks",
+  "Store behaviour declares all 26 callbacks",
   Enum.all?(expected, &(&1 in callbacks))
 )
 
