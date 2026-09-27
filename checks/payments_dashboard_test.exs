@@ -23,6 +23,22 @@ defmodule DashStore do
     Process.put(:dash_inflows, inflows)
   end
 
+  def issued_authorizations_summary(now) do
+    rows = Process.get(:dash_topups, [])
+
+    {:ok,
+     %{
+       issued: length(rows),
+       consumed: Enum.count(rows, & &1[:consumed_at]),
+       live: Enum.count(rows, &(is_nil(&1[:consumed_at]) and &1.valid_before > now))
+     }}
+  end
+
+  def unrecognised_inflows_summary, do: {:ok, %{count: length(Process.get(:dash_inflows, []))}}
+
+  def deposit_balances_summary,
+    do: {:ok, %{addresses: 1, with_activity: 1, unswept_usd: Decimal.new(2)}}
+
   def list_issued_authorizations(_limit), do: {:ok, Process.get(:dash_topups, [])}
   def list_unrecognised_inflows(_limit), do: {:ok, Process.get(:dash_inflows, [])}
 
@@ -104,6 +120,7 @@ case ext do
       dep_row["received_usd"] == "3.00" and dep_row["swept_usd"] == "1.00" and
         dep_row["unswept_usd"] == "2.00"
     )
+
     check.("one page under the schema-1 contract", page["schema"] == 1 and page["id"] == "topups")
     [metrics, topups_table, inflows_table] = page["sections"]
 
@@ -146,8 +163,12 @@ check.(
 )
 
 check.(
-  "a raising store yields no page, never a crash",
-  Dashboard.dashboard_extension(store_mod: DashStoreRaising) == %{}
+  "a raising store shows unavailable, never a crash or a zero",
+  Dashboard.dashboard_extension(store_mod: DashStoreRaising)["dashboard_pages"]
+  |> hd()
+  |> Map.fetch!("sections")
+  |> hd()
+  |> metric.("live") == "unavailable"
 )
 
 Check.finish(f)

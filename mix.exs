@@ -4,7 +4,7 @@ defmodule GenswarmsPayments.MixProject do
   def project do
     [
       app: :genswarms_payments,
-      version: "0.3.0",
+      version: "0.3.1-dashboard.1",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       source_url: "https://github.com/genlayerlabs/genswarms-payments",
